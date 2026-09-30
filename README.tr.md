@@ -85,7 +85,8 @@ Varsayılan kısayollar:
 | Kalibrasyon | `Ctrl+Alt+Win+C` | `⌃⌥C` | `Ctrl+Alt+Shift+C` |
 
 Varsayılanlar, AltGr'li klavyelerde karakter yazan kombinasyonlardan kaçınır (örneğin Türkçe Q
-klavyede Ctrl+Alt+T `₺` yazar). **Ayarlar → Hotkeys** bölümünden değiştirebilirsiniz.
+klavyede Ctrl+Alt+T `₺` yazar). **Ayarlar → Hotkeys** bölümünden değiştirebilirsiniz. Diğer tüm
+seçenekler [ayar referansında](docs/configuration.md) listelenir.
 
 ## Nasıl çalışır
 

@@ -59,7 +59,11 @@ class GeneralSettings:
     start_paused: bool = _opt(False, doc="Start with tracking paused.")
     first_run_done: bool = _opt(False, doc="Set after the first-run wizard completes.")
     notifications: bool = _opt(True, doc="Show tray notifications.")
-    log_level: str = _opt("INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    log_level: str = _opt(
+        "INFO",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        doc="Log file verbosity. DEBUG helps with bug reports; logs never contain images or keys.",
+    )
 
 
 @dataclass

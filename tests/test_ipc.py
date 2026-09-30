@@ -243,3 +243,13 @@ def test_server_name_ignores_the_runtime_dir_elsewhere(
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     assert ipc.server_name() == ipc.paths.ipc_name()
+
+
+def test_send_command_hands_over_the_foreground_right(
+    qapp: Any, app_dirs: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every request lets the running instance raise its window (Windows focus rules)."""
+    calls: list[int] = []
+    monkeypatch.setattr(ipc, "_allow_foreground_handoff", lambda: calls.append(1))
+    assert ipc.send_command("status", timeout_ms=200) is None  # nothing is listening
+    assert calls == [1]

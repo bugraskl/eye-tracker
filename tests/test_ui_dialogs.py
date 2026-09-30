@@ -1123,3 +1123,19 @@ def test_wizard_frame_conversion_rejects_junk() -> None:
     image = wz.frame_to_image(np.zeros((4, 6, 3), dtype=np.uint8))
     assert image is not None
     assert (image.width(), image.height()) == (6, 4)
+
+
+def test_hotkeys_are_suspended_while_a_shortcut_is_recorded(
+    controller: FakeController, dialog: SettingsDialog
+) -> None:
+    """Registered combinations never reach the dialog, so they are released while recording."""
+    calls: list[bool] = []
+    controller.suspend_hotkeys = calls.append  # type: ignore[attr-defined]
+    edit = next(iter(dialog._hotkey_edits.values()))
+    edit._set_recording(True)
+    edit._set_recording(True)  # no duplicate notification
+    edit._set_recording(False)
+    assert calls == [True, False]
+    edit._set_recording(True)
+    edit.hide()  # closing the dialog mid-recording must restore the hotkeys
+    assert calls == [True, False, True, False]

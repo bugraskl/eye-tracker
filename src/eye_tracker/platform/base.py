@@ -82,6 +82,16 @@ class PlatformServices:
         """
         return None
 
+    def cursor_position_reliable(self) -> bool:
+        """Whether ``QCursor.pos()`` tracks the pointer everywhere on the desktop.
+
+        ``False`` on Wayland: an XWayland client only sees pointer motion over X11
+        windows, so the position it reports can be stale. The controller then
+        stops deriving the current monitor, manual mouse use and learning labels
+        from the cursor position.
+        """
+        return True
+
     def move_cursor(self, x: int, y: int) -> bool | None:
         """Move the pointer. Return ``None`` to let the caller use ``QCursor.setPos``."""
         return None

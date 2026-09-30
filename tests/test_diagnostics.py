@@ -508,3 +508,24 @@ def test_linux_notes_explain_camera_release_and_wayland_cursor(
     assert "hyprctl" in notes["cursor"]
     monkeypatch.setattr(diagnostics.sys, "platform", "win32")
     assert "notes" not in diagnostics._platform_section(_WaylandServices())
+
+
+def test_an_installed_mediapipe_is_reported_as_a_problem(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MediaPipe is not used (its models run in OpenCV) and ships a usage logger."""
+    real_version = diagnostics.importlib.metadata.version
+
+    def version(name: str) -> str:
+        return "0.10.14" if name == "mediapipe" else real_version(name)
+
+    monkeypatch.setattr(diagnostics.importlib.metadata, "version", version)
+    report = diagnostics.collect_report()
+    assert report["libraries"]["unwanted"] == {"mediapipe": "0.10.14"}
+    (problem,) = [p for p in report["problems"] if "mediapipe" in p]
+    assert "does not use it" in problem
+    assert "telemetry" in problem
+    assert "pip uninstall mediapipe" in problem
+    assert problem.isascii()
+    # The text report shows it too.
+    assert "mediapipe" in diagnostics.format_report(report)

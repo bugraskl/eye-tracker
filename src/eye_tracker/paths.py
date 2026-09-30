@@ -21,6 +21,15 @@ def set_base_override(path: Path | None) -> None:
     _override = Path(path).expanduser().resolve() if path else None
 
 
+def base_override() -> Path | None:
+    """The directory set by :func:`set_base_override` (resolved), or ``None``.
+
+    ``None`` means the default per-user profile. Autostart entries and the
+    diagnostics report use it to tell which profile this process runs.
+    """
+    return _override
+
+
 def _dirs() -> PlatformDirs:
     return PlatformDirs(appname=APP_SLUG, appauthor=APP_AUTHOR, roaming=False)
 

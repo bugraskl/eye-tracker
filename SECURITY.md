@@ -43,8 +43,14 @@ use the issue tracker for those.
 
 ## Design safeguards
 
-- **No network code.** `scripts/check_privacy.py` fails CI if any networking module is imported
-  under `src/` or if frame-writing APIs (`imwrite`, `VideoWriter`, `imencode`) are used.
+- **No network code, checked twice.** `scripts/check_privacy.py` fails CI if any networking API
+  (sockets, HTTP clients, Qt network classes, asyncio connections, ctypes loads of network
+  libraries) is used under `src/`, or if frame-writing APIs (`imwrite`, `VideoWriter`, `imencode`)
+  appear. `check_privacy.py --bundle` then scans every native library of every release build for
+  telemetry endpoints and networking imports, against a reviewed allow-list with a reason per
+  entry. Telemetry markers are never allow-listed.
+- **No MediaPipe runtime.** Its native library contains a usage-logging uploader, so the face model
+  runs through OpenCV instead (see [docs/privacy.md](docs/privacy.md)).
 - **Frames stay in memory.** Only numeric features (head angles, iris ratios) are stored in the
   calibration file; never images.
 - **Least privilege.** The app runs as the current user, needs no administrator rights, and uses

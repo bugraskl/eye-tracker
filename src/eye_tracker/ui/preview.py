@@ -323,7 +323,9 @@ class PreviewWindow(QWidget):
         setter = getattr(self._controller, "set_preview", None)
         if callable(setter):
             try:
-                setter(enabled)
+                # This window is one owner among others (the setup assistant):
+                # hiding it must not stop the frames another consumer still wants.
+                setter(enabled, self)
             except Exception:
                 log.exception("controller.set_preview(%s) failed", enabled)
 

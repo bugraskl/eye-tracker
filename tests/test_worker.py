@@ -907,3 +907,157 @@ def test_stats_published_at_most_once_per_second(harness: Harness) -> None:
     assert harness.recorder.wait_for(lambda: len(harness.recorder.observations) >= 12)
     # One forced publish when the camera opened; routine ones are 1 s apart.
     assert len(harness.recorder.stats) <= 2
+
+
+# ------------------------------------------------------------ review hardening
+def test_switching_on_forgets_the_last_error_without_publishing() -> None:
+    """A camera that fails the same way after a pause is reported again."""
+    recorder = Recorder()
+    calls: list[int] = []
+    release = threading.Event()
+    message = "Camera 0 could not be opened"
+
+    def factory() -> FakeSource:
+        calls.append(1)
+        if len(calls) > 1:
+            release.wait(TIMEOUT)  # hold the next attempt until the test is ready
+        raise CameraError(message)
+
+    worker = VisionWorker(factory, FakeBackend, recorder.on_observation, recorder.on_stats)
+    worker.BACKOFF_S = FAST_BACKOFF
+    worker.start()
+    try:
+        assert wait_until(lambda: worker.stats.last_error == message)
+        worker.set_active(False)
+        with recorder.cond:
+            published = len(recorder.stats)
+        worker.set_active(True)
+        assert worker.stats.last_error is None  # forgotten at once ...
+        with recorder.cond:
+            assert len(recorder.stats) == published  # ... without a "healthy" report
+        release.set()
+        # The same failure again is news again.
+        assert recorder.wait_for(lambda: sum(s.last_error == message for s in recorder.stats) >= 2)
+    finally:
+        release.set()
+        worker.stop()
+
+
+def test_reconfigured_backend_identity_is_unknown_until_it_exists(harness: Harness) -> None:
+    harness.worker.start()
+    assert wait_until(lambda: harness.worker.backend_info == ("fake", "fake-1"))
+    release = threading.Event()
+
+    class NewBackend(FakeBackend):
+        name: ClassVar[str] = "new"
+        feature_version: ClassVar[str] = "new-1"
+
+    def factory() -> FakeBackend:
+        release.wait(TIMEOUT)
+        return NewBackend()
+
+    harness.worker.reconfigure(backend_factory=factory)
+    # The old backend's identity must not pass for the new one's meanwhile.
+    assert harness.worker.backend_info is None
+    release.set()
+    assert wait_until(lambda: harness.worker.backend_info == ("new", "new-1"))
+    harness.worker.reconfigure(source_factory=harness.make_source)  # camera only
+    assert harness.worker.backend_info == ("new", "new-1")
+
+
+class _DelayedLock:
+    """A lock whose acquisition by the thread that created it can be delayed.
+
+    Stands in for the worker's statistics lock to widen a race window on purpose.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._owner = threading.get_ident()
+        self.delay = 0.0
+
+    def __enter__(self) -> bool:
+        if self.delay and threading.get_ident() == self._owner:
+            time.sleep(self.delay)
+        return self._lock.acquire()
+
+    def __exit__(self, *exc: object) -> None:
+        self._lock.release()
+
+
+def test_the_worker_wakes_with_the_last_error_already_forgotten() -> None:
+    """Regression: set_active(True) forgot the error only after waking the thread.
+
+    A camera failing at once with the old message was then compared with the old
+    error, found not to be news (nothing published), and erased right after: the
+    failure was lost until the next retry.
+    """
+    recorder = Recorder()
+    message = "Camera 0 could not be opened"
+    seen: list[str | None] = []  # the error the worker compares with, per attempt
+    holder: list[VisionWorker] = []
+
+    def factory() -> FakeSource:
+        seen.append(holder[0]._stats.last_error)
+        raise CameraError(message)
+
+    worker = VisionWorker(factory, FakeBackend, recorder.on_observation, recorder.on_stats)
+    holder.append(worker)
+    slow = _DelayedLock()
+    worker._stats_lock = slow  # type: ignore[assignment]
+    worker.BACKOFF_S = (TIMEOUT * 10,)  # one attempt per activation
+    worker.start()
+    try:
+        assert wait_until(lambda: worker.stats.last_error == message)
+        worker.set_active(False)
+        slow.delay = 0.3  # time enough for the thread to wake and fail again
+        worker.set_active(True)
+        slow.delay = 0.0
+        assert wait_until(lambda: len(seen) >= 2)
+        assert seen[1] is None
+        assert recorder.wait_for(lambda: sum(s.last_error == message for s in recorder.stats) >= 2)
+    finally:
+        worker.stop()
+
+
+def test_a_backend_built_by_a_replaced_factory_does_not_report_its_identity(
+    harness: Harness,
+) -> None:
+    """A creation still running when reconfigure() replaced its factory."""
+
+    class OldBackend(FakeBackend):
+        name: ClassVar[str] = "old"
+        feature_version: ClassVar[str] = "old-1"
+
+    class NewBackend(FakeBackend):
+        name: ClassVar[str] = "new"
+        feature_version: ClassVar[str] = "new-1"
+
+    old_entered, old_release = threading.Event(), threading.Event()
+    new_entered, new_release = threading.Event(), threading.Event()
+
+    def old_factory() -> FakeBackend:
+        old_entered.set()
+        old_release.wait(TIMEOUT)
+        return OldBackend()
+
+    def new_factory() -> FakeBackend:
+        new_entered.set()
+        new_release.wait(TIMEOUT)
+        return NewBackend()
+
+    harness.worker.start()
+    assert wait_until(lambda: harness.worker.backend_info == ("fake", "fake-1"))
+    try:
+        harness.worker.reconfigure(backend_factory=old_factory)
+        assert old_entered.wait(TIMEOUT)
+        harness.worker.reconfigure(backend_factory=new_factory)  # while "old" is built
+        old_release.set()
+        assert new_entered.wait(TIMEOUT)
+        # "old" was built after the second reconfigure: it is not what comes next.
+        assert harness.worker.backend_info is None
+        new_release.set()
+        assert wait_until(lambda: harness.worker.backend_info == ("new", "new-1"))
+    finally:
+        old_release.set()
+        new_release.set()

@@ -110,7 +110,13 @@ class PlatformServices:
         return False
 
     def is_window_valid(self, ref: WindowRef) -> bool:
-        """Window still exists, is visible and not minimised."""
+        """Window still exists, is visible, not minimised, and on the current
+        virtual desktop / Space.
+
+        Activating a window on another virtual desktop (Windows), workspace (X11)
+        or Space (macOS) would make the system switch to it, so such windows are
+        not valid switch targets.
+        """
         return False
 
     def window_rect(self, ref: WindowRef) -> Rect | None:
@@ -126,7 +132,12 @@ class PlatformServices:
 
     # ------------------------------------------------------------------- camera
     def camera_in_use_by_other_app(self) -> bool | None:
-        """Whether another process is currently streaming from a camera. *Any thread.*"""
+        """Whether another process is streaming from a camera, or was just refused
+        one (Linux). *Any thread.*
+
+        Implementations may cache the answer for a few seconds (the check can
+        cost milliseconds). ``None`` means unknown.
+        """
         return None
 
     def running_process_names(self) -> set[str]:
@@ -156,6 +167,23 @@ class PlatformServices:
     def open_permission_settings(self, name: str) -> bool:
         """Open the OS settings page for a permission."""
         return False
+
+    def accessibility_status(self) -> str:
+        """The Accessibility permission (macOS) in more detail than :meth:`permissions`.
+
+        One of ``"granted"``, ``"missing"``, ``"stale"`` (granted to a previous
+        build of the app, which no longer applies) or ``"unknown"`` (not
+        applicable on this system, or cannot be determined).
+        """
+        return "unknown"
+
+    def set_background_activity(self, active: bool) -> bool:
+        """Keep timers unthrottled while tracking (macOS App Nap); a no-op elsewhere.
+
+        ``True`` asks the system not to throttle the process, ``False`` allows it
+        again. Returns whether the requested state is in effect.
+        """
+        return True
 
     # ------------------------------------------------------------------- misc
     @property

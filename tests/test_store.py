@@ -65,8 +65,8 @@ def make_data(
         X, Y, bounds=virtual_bounds(monitors)
     )
     return CalibrationData(
-        backend="mediapipe",
-        feature_version="mp-pose-iris-1",
+        backend="facemesh",
+        feature_version="facemesh-pose-iris-1",
         layout_signature=layout_signature(monitors),
         monitors=list(monitors),
         samples=samples,
@@ -112,8 +112,8 @@ def test_round_trip(tmp_path: Path) -> None:
     save_calibration(path, data)
     loaded = load_calibration(path)
     assert loaded is not None
-    assert loaded.backend == "mediapipe"
-    assert loaded.feature_version == "mp-pose-iris-1"
+    assert loaded.backend == "facemesh"
+    assert loaded.feature_version == "facemesh-pose-iris-1"
     assert loaded.layout_signature == data.layout_signature
     assert loaded.monitors == MONITORS
     assert loaded.created_at == "2026-09-30T08:15:00+00:00"
@@ -129,8 +129,8 @@ def test_round_trip(tmp_path: Path) -> None:
     assert loaded.report["per_monitor_accuracy"] == {"0": 1.0, "1": 0.98}
     assert loaded.report["n_samples"] == 60
     assert loaded.grade == "excellent"
-    assert loaded.is_compatible("mediapipe", "mp-pose-iris-1", MONITORS) == (True, "")
-    assert loaded.is_compatible("mediapipe", "mp-pose-iris-1", MONITORS, "0", (640, 480)) == (
+    assert loaded.is_compatible("facemesh", "facemesh-pose-iris-1", MONITORS) == (True, "")
+    assert loaded.is_compatible("facemesh", "facemesh-pose-iris-1", MONITORS, "0", (640, 480)) == (
         True,
         "",
     )
@@ -187,7 +187,8 @@ def test_defaults_and_created_at_format() -> None:
     assert minimal.report == {}
     assert minimal.grade is None
     assert (minimal.camera, minimal.frame_size) == ("", (0, 0))
-    assert minimal.key == ("abc", "opencv", "yunet-geom-1", "")
+    # The renamed OpenCV backend is keyed by its current name.
+    assert minimal.key == ("abc", "lite", "yunet-geom-1", "")
     parsed = datetime.fromisoformat(minimal.created_at)
     offset = parsed.utcoffset()
     assert offset is not None
@@ -203,7 +204,7 @@ def test_unfitted_model_round_trip(tmp_path: Path) -> None:
     loaded = load_calibration(path)
     assert loaded is not None
     assert not loaded.model.is_fitted
-    ok, reason = loaded.is_compatible("mediapipe", "mp-pose-iris-1", MONITORS)
+    ok, reason = loaded.is_compatible("facemesh", "facemesh-pose-iris-1", MONITORS)
     assert not ok
     assert "no fitted model" in reason
 
@@ -217,7 +218,7 @@ def test_version_1_file_still_loads(tmp_path: Path) -> None:
     assert (loaded.camera, loaded.frame_size) == ("", (0, 0))  # unknown
     assert_samples_close(loaded.samples, data.samples)
     # An unknown camera never makes the calibration unusable.
-    assert loaded.is_compatible("mediapipe", "mp-pose-iris-1", MONITORS, "1", (1280, 720)) == (
+    assert loaded.is_compatible("facemesh", "facemesh-pose-iris-1", MONITORS, "1", (1280, 720)) == (
         True,
         "",
     )
@@ -240,25 +241,70 @@ def test_model_without_nonlinear_key_loads_as_all_features(tmp_path: Path) -> No
 # --------------------------------------------------------------------------- compatibility
 def test_is_compatible_reasons() -> None:
     data = make_data()
-    ok, reason = data.is_compatible("opencv", "mp-pose-iris-1", MONITORS)
+    ok, reason = data.is_compatible("lite", "facemesh-pose-iris-1", MONITORS)
     assert not ok
-    assert "opencv" in reason
-    assert "mediapipe" in reason
-    ok, reason = data.is_compatible("mediapipe", "mp-pose-iris-2", MONITORS)
+    assert "lite" in reason
+    assert "facemesh" in reason
+    ok, reason = data.is_compatible("facemesh", "facemesh-pose-iris-2", MONITORS)
     assert not ok
-    assert "mp-pose-iris-2" in reason
+    assert "facemesh-pose-iris-2" in reason
     moved = [MONITORS[0], Monitor(1, "LG", Rect(-1920, 0, 1920, 1080))]
-    ok, reason = data.is_compatible("mediapipe", "mp-pose-iris-1", moved)
+    ok, reason = data.is_compatible("facemesh", "facemesh-pose-iris-1", moved)
     assert not ok
     assert "layout" in reason
     # Monitor order and names do not matter, only the geometry.
     renamed = [Monitor(5, "x", MONITORS[1].rect), Monitor(6, "y", MONITORS[0].rect)]
-    assert data.is_compatible("mediapipe", "mp-pose-iris-1", renamed) == (True, "")
+    assert data.is_compatible("facemesh", "facemesh-pose-iris-1", renamed) == (True, "")
+
+
+def _legacy_profile(backend: str, feature_version: str) -> CalibrationData:
+    data = make_data()
+    data.backend, data.feature_version = backend, feature_version
+    return data
+
+
+def test_opencv_calibrations_are_valid_for_the_renamed_lite_backend(tmp_path: Path) -> None:
+    """The OpenCV/YuNet backend is now "lite" with unchanged measurements."""
+    old = _legacy_profile("opencv", "yunet-geom-1")
+    assert old.is_compatible("lite", "yunet-geom-1", MONITORS) == (True, "")
+    assert old.key[1] == "lite"
+    # Its measurement version still has to match.
+    ok, reason = old.is_compatible("lite", "yunet-geom-2", MONITORS)
+    assert not ok
+    assert "yunet-geom-2" in reason
+    # The library finds it for "lite", and a new "lite" calibration replaces it.
+    library = CalibrationLibrary([old])
+    assert library.best("lite", "yunet-geom-1", MONITORS) is old
+    new = _legacy_profile("lite", "yunet-geom-1")
+    library.put(new)
+    assert library.profiles == [new]
+    # Loading a file written by the old version stores the current name.
+    path = tmp_path / "calibration.json"
+    save_calibration(path, old)
+    assert json.loads(path.read_text(encoding="utf-8"))["profiles"][0]["backend"] == "opencv"
+    loaded = load_calibration(path)
+    assert loaded is not None
+    assert loaded.backend == "lite"
+    assert loaded.is_compatible("lite", "yunet-geom-1", MONITORS) == (True, "")
+
+
+def test_mediapipe_calibrations_are_not_used_by_facemesh() -> None:
+    """The MediaPipe runtime backend measured differently from its successor."""
+    old = _legacy_profile("mediapipe", "mp-pose-iris-1")
+    ok, reason = old.is_compatible("facemesh", "facemesh-pose-iris-1", MONITORS)
+    assert not ok
+    assert "mediapipe" in reason
+    assert "facemesh" in reason
+    # Even under the same name, the measurement version differs.
+    ok, _ = old.is_compatible("mediapipe", "facemesh-pose-iris-1", MONITORS)
+    assert not ok
+    library = CalibrationLibrary([old])
+    assert library.best("facemesh", "facemesh-pose-iris-1", MONITORS) is None
 
 
 def test_is_compatible_checks_the_camera() -> None:
     data = make_data(camera="0", frame_size=(640, 480))
-    args = ("mediapipe", "mp-pose-iris-1", MONITORS)
+    args = ("facemesh", "facemesh-pose-iris-1", MONITORS)
     assert data.is_compatible(*args, camera="1") == (False, "the camera changed")
     assert data.is_compatible(*args, camera=" 0 ") == (True, "")
     # Unknown on either side: no reason to reject.
@@ -383,7 +429,7 @@ def test_file_with_byte_order_mark_loads(tmp_path: Path) -> None:
     path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
     loaded = load_calibration(path)
     assert loaded is not None
-    assert loaded.backend == "mediapipe"
+    assert loaded.backend == "facemesh"
 
 
 def test_newer_version_is_ignored(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -467,13 +513,13 @@ def test_save_replaces_the_same_setup_and_keeps_others(tmp_path: Path) -> None:
 def test_library_picks_the_profile_for_the_current_desk(tmp_path: Path) -> None:
     office, home = make_data(), make_data(monitors=HOME)
     library = CalibrationLibrary([home, office])
-    args = ("mediapipe", "mp-pose-iris-1")
+    args = ("facemesh", "facemesh-pose-iris-1")
     assert library.best(*args, MONITORS, camera="0") is office
     assert library.best(*args, HOME, camera="0") is home
     assert library.match(*args, HOME) == (home, "")
     # Another backend or camera: nothing fits, and the reason says why.
-    assert library.match("opencv", "yunet-geom-1", HOME)[0] is None
-    assert "opencv" in library.match("opencv", "yunet-geom-1", HOME)[1]
+    assert library.match("lite", "yunet-geom-1", HOME)[0] is None
+    assert "lite" in library.match("lite", "yunet-geom-1", HOME)[1]
     assert library.match(*args, HOME, camera="1") == (None, "the camera changed")
     third = [Monitor(0, "tv", Rect(0, 0, 3840, 2160))]
     assert library.match(*args, third) == (None, "the monitor layout changed")
@@ -485,7 +531,7 @@ def test_library_prefers_a_known_camera_then_the_most_recent() -> None:
     webcam = make_data(camera="1", frame_size=(1280, 720), created_at="webcam")
     builtin = make_data(camera="0", frame_size=(640, 480), created_at="builtin")
     library = CalibrationLibrary([legacy, webcam, builtin])  # legacy most recent
-    args = ("mediapipe", "mp-pose-iris-1", MONITORS)
+    args = ("facemesh", "facemesh-pose-iris-1", MONITORS)
     assert library.best(*args, camera="1") is webcam
     assert library.best(*args, camera="0") is builtin
     assert library.best(*args, camera="2") is legacy  # unknown camera: may be right
@@ -576,7 +622,7 @@ def test_duplicate_keys_in_a_file_keep_the_most_recent(tmp_path: Path) -> None:
 def test_profiles_are_shared_by_reference_so_refits_persist(tmp_path: Path) -> None:
     path = tmp_path / "calibration.json"
     library = CalibrationLibrary([make_data(implicit=0)])
-    data = library.best("mediapipe", "mp-pose-iris-1", MONITORS)
+    data = library.best("facemesh", "facemesh-pose-iris-1", MONITORS)
     assert data is not None
     data.implicit_samples = [CalibrationSample(np.ones(8), 5.0, 6.0, 0, -1, 0.5)]
     library.save(path)

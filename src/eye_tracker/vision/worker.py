@@ -235,11 +235,24 @@ class VisionWorker:
             self._stats.target_fps = 1.0 / value if value > 0 else 0.0
 
     def set_active(self, active: bool) -> None:
-        """``False`` releases the camera and idles; ``True`` (re)opens it."""
+        """``False`` releases the camera and idles; ``True`` (re)opens it.
+
+        Switching on forgets the last error (without publishing anything): it
+        described the camera before the pause, and errors are only published
+        when they change, so a camera that fails the same way again must count
+        as a new failure.
+        """
         with self._cond:
             if self._active == bool(active):
                 return
             self._active = bool(active)
+            if self._active:
+                # Forgotten before the worker thread can wake (it needs this
+                # lock): a failure it reports at once, with the old message,
+                # must be published, not taken for the old news. Lock order:
+                # _cond, then _stats_lock (never the other way round).
+                with self._stats_lock:
+                    self._stats.last_error = None
             self._control_gen += 1
             self._cond.notify_all()
 
@@ -282,6 +295,9 @@ class VisionWorker:
                 self._pending_source = source_factory
             if backend_factory is not None:
                 self._pending_backend = backend_factory
+                # Unknown until the new backend exists: the old identity must not
+                # be taken for the new one's (see backend_info).
+                self._backend_info = None
             self._control_gen += 1
             self._cond.notify_all()
 
@@ -296,7 +312,11 @@ class VisionWorker:
 
     @property
     def backend_info(self) -> tuple[str, str] | None:
-        """``(name, feature_version)`` of the most recently created backend."""
+        """``(name, feature_version)`` of the most recently created backend.
+
+        ``None`` before the first backend exists, and after
+        :meth:`reconfigure` asked for another one until that one is created.
+        """
         return self._backend_info
 
     # ================================================================ thread body
@@ -506,7 +526,11 @@ class VisionWorker:
             return False
         self._backend = backend
         self._backend_failures = 0
-        self._backend_info = (backend.name, backend.feature_version)
+        with self._cond:
+            # Built by a factory that reconfigure() replaced meanwhile: it is
+            # closed before use, and its identity must not pass for the new one's.
+            if self._pending_backend is None:
+                self._backend_info = (backend.name, backend.feature_version)
         self._applied_max_faces = None
         self._apply_config(cfg)
         with self._stats_lock:

@@ -145,6 +145,7 @@ def build(qapp: QApplication, app_dirs: Path) -> Iterator[Callable[..., Harness]
         settings: Settings | None = None,
         monitors: list[Monitor] | None = None,
         controller_factory: Any = None,
+        platform: PlatformServices | None = None,
         **options: Any,
     ) -> Harness:
         if settings is None:
@@ -169,7 +170,7 @@ def build(qapp: QApplication, app_dirs: Path) -> Iterator[Callable[..., Harness]
         args = argparse.Namespace(**{"background": True, "calibrate": False, **options})
         ctx = build_app(
             args,
-            platform=PlatformServices(),
+            platform=platform if platform is not None else PlatformServices(),
             controller_factory=controller_factory,
             controller_kwargs=None if controller_factory else kwargs,
         )
@@ -520,6 +521,11 @@ def test_startup_failure_returns_an_error(
     assert h.ctx.app is None
     assert h.ctx.exec() == 1
     assert not ipc.is_running()
+    # The instance lock was released too: the next launch may become the instance.
+    lock = ipc.InstanceLock()
+    assert lock.acquire()
+    assert lock.is_held
+    lock.release()
 
 
 # -------------------------------------------------------------------- event loop
@@ -752,3 +758,194 @@ def test_a_lock_holder_that_does_not_answer_keeps_other_launches_out(
     assert server.lock.is_held
     h.ctx.shutdown()
     assert not server.lock.is_held  # released for the next launch
+
+
+def test_a_calibration_reminder_after_being_away_is_shown_again(
+    build: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The controller reminds the user on their return, with the same reason."""
+    h = build(monitors=TWO_MONITORS, background=False)
+    titles = _tray_messages(h, monkeypatch)
+    reason = "the monitor layout changed"
+    h.controller.calibration_required.emit(reason)
+    assert titles == ["Calibration needed"]
+    for state in (TrackingState.AWAY, TrackingState.LOCKED, TrackingState.PRIVACY):
+        h.controller.state_changed.emit(state)  # gone for a while ...
+        h.controller.state_changed.emit(TrackingState.NEEDS_CALIBRATION)  # ... and back
+        h.controller.calibration_required.emit(reason)  # the controller's reminder
+    assert titles == ["Calibration needed"] * 4
+    # Other states do not repeat it.
+    h.controller.state_changed.emit(TrackingState.PAUSED)
+    h.controller.calibration_required.emit(reason)
+    assert len(titles) == 4
+
+
+def test_dismissing_the_curtain_tells_the_controller(build: Callable[..., Harness]) -> None:
+    h = build()
+    curtain = h.app.curtain
+    assert curtain is not None
+    h.controller._show_curtain(True)  # what the shoulder guard does
+    assert curtain.is_showing
+    curtain.dismiss()  # Esc or the button
+    assert not curtain.is_showing
+    assert h.controller._curtain is False  # switching resumes
+
+
+class PermissionPlatform(PlatformServices):
+    """Records which privacy settings pages would be opened (none is)."""
+
+    def __init__(self) -> None:
+        self.opened: list[str] = []
+
+    def open_permission_settings(self, name: str) -> bool:
+        self.opened.append(name)
+        return True
+
+
+def test_clicking_a_permission_notification_opens_the_privacy_settings(
+    build: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    platform = PermissionPlatform()
+    h = build(platform=platform, background=False)
+    titles = _tray_messages(h, monkeypatch)
+    h.controller.notify.emit("Camera access blocked", "Allow camera access …")
+    h.controller.permission_needed.emit("camera")
+    assert titles == ["Camera access blocked"]
+    h.tray.tray.messageClicked.emit()
+    assert platform.opened == ["camera"]
+    h.tray.tray.messageClicked.emit()  # a click is used once
+    assert platform.opened == ["camera"]
+
+    # Another notification replaced it: its click does not open the settings.
+    h.controller.notify.emit("Accessibility access needed", "…")
+    h.controller.permission_needed.emit("accessibility")
+    h.controller.notify.emit("Tracking paused", "…")
+    h.tray.tray.messageClicked.emit()
+    assert platform.opened == ["camera"]
+
+
+def test_a_permission_without_a_shown_notification_is_not_clickable(
+    build: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    platform = PermissionPlatform()
+    h = build(monitors=TWO_MONITORS, platform=platform, background=False)
+    _tray_messages(h, monkeypatch)
+    h.controller.calibration_required.emit("the monitor layout changed")
+    # Notifications off: the controller emits permission_needed alone.
+    h.controller.permission_needed.emit("camera")
+    h.tray.tray.messageClicked.emit()  # the calibration notification was clicked
+    assert platform.opened == []
+    window = h.app.calibration_window
+    assert window is not None
+
+
+def test_permission_notifications_muted_after_a_login_start_are_not_clickable(
+    build: Callable[..., Harness],
+) -> None:
+    platform = PermissionPlatform()
+    h = build(platform=platform)  # --background: notifications muted at first
+    assert h.tray.muted_for > 0
+    h.controller.notify.emit("Camera access blocked", "…")
+    h.controller.permission_needed.emit("camera")
+    h.tray.tray.messageClicked.emit()
+    assert platform.opened == []
+
+
+class AccessibilityPlatform(PermissionPlatform):
+    """macOS-like: Accessibility belongs to an earlier build until the test grants it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.accessibility = "stale"
+
+    def accessibility_status(self) -> str:
+        return self.accessibility
+
+
+@pytest.mark.parametrize("granted_meanwhile", [False, True])
+def test_a_permission_notice_muted_after_a_login_start_is_shown_later(
+    build: Callable[..., Harness],
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+    granted_meanwhile: bool,
+) -> None:
+    """journeys-15: the controller says it once, at startup, inside the quiet period."""
+    monkeypatch.setattr(app_module, "STARTUP_QUIET_S", 0.3)
+    platform = AccessibilityPlatform()
+    h = build(platform=platform)  # --background: notifications muted at first
+    titles = _tray_messages(h, monkeypatch)
+    assert h.tray.muted_for > 0
+    h.controller.notify.emit("Accessibility access needed", "Remove it and add it again.")
+    h.controller.permission_needed.emit("accessibility")
+    assert titles == []
+    if granted_meanwhile:
+        platform.accessibility = "granted"  # fixed before the quiet period ended
+    assert _wait_for(qapp, lambda: h.app._deferred_permission is None)
+    if granted_meanwhile:
+        assert titles == []
+        return
+    assert titles == ["Accessibility access needed"]
+    h.tray.tray.messageClicked.emit()
+    assert platform.opened == ["accessibility"]
+
+
+def test_a_muted_notice_is_not_repeated_when_notifications_were_off(
+    build: Callable[..., Harness], qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a notify just before it, permission_needed has nothing to repeat."""
+    monkeypatch.setattr(app_module, "STARTUP_QUIET_S", 0.3)
+    platform = AccessibilityPlatform()
+    h = build(platform=platform)
+    titles = _tray_messages(h, monkeypatch)
+    h.controller.permission_needed.emit("accessibility")
+    assert h.app._deferred_permission is None
+    assert not _wait_for(qapp, lambda: bool(titles), timeout=0.8)
+
+
+def test_the_login_item_is_left_alone_where_unsupported(
+    build: Callable[..., Harness],
+    qapp: QApplication,
+    fake_autostart: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(autostart, "is_supported", lambda: False)
+    build()
+    settle(qapp)
+    assert fake_autostart == []
+
+
+def test_a_failing_login_item_check_does_not_stop_the_app(
+    build: Callable[..., Harness], qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(config_dir: Path | None = None) -> bool:
+        raise autostart.AutostartError("read-only home")
+
+    monkeypatch.setattr(autostart, "refresh", broken)
+    h = build()
+    settle(qapp)
+    assert h.ctx.exit_code is None
+    assert not h.app.closed
+    assert ipc.send_command("status") is not None
+
+
+@pytest.mark.parametrize("failing", ["send_command", "create_app", "server"])
+def test_the_instance_lock_is_released_when_startup_raises(
+    build: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    """windows-09: an unexpected error must not keep every later launch out."""
+
+    def boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(f"{failing} failed")
+
+    if failing == "send_command":
+        monkeypatch.setattr(ipc, "send_command", boom)
+    elif failing == "create_app":
+        monkeypatch.setattr(app_module, "_create_app", boom)
+    else:
+        monkeypatch.setattr(ipc, "InstanceServer", boom)
+    with pytest.raises(RuntimeError, match=failing):
+        build()
+    lock = ipc.InstanceLock()
+    assert lock.acquire()
+    assert lock.is_held
+    lock.release()

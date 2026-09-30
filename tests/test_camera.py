@@ -17,6 +17,7 @@ from eye_tracker.vision.camera import (
     FileSource,
     FrameSource,
     api_preference,
+    device_index,
     list_cameras,
     open_source,
 )
@@ -700,6 +701,26 @@ def test_missing_and_non_video_devices(linux: dict[str, str]) -> None:
     linux["/dev/v4l/by-id/weird"] = "/dev/snd/pcmC0D0c"
     with pytest.raises(CameraError, match="Not a V4L2 video device"):
         open_source("/dev/v4l/by-id/weird", 640, 480, "auto")
+
+
+def test_device_index_follows_stable_links(linux: dict[str, str]) -> None:
+    """What the settings dialog must not probe: the index the device setting leads to."""
+    link = "/dev/v4l/by-id/usb-Logitech_C920_1234-video-index0"
+    linux[link] = "/dev/video3"
+    assert device_index(" 1 ") == 1
+    assert device_index("/dev/video5") == 5
+    assert device_index(link) == 3
+    # Unplugged, or not a camera: no index, and no exception either.
+    assert device_index("/dev/v4l/by-id/usb-unplugged-video-index0") is None
+    linux["/dev/v4l/by-id/weird"] = "/dev/snd/pcmC0D0c"
+    assert device_index("/dev/v4l/by-id/weird") is None
+    assert device_index("clip.mp4") is None  # a video file
+
+
+def test_device_paths_are_files_off_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(camera_mod.sys, "platform", "win32")
+    assert device_index("/dev/video5") is None
+    assert device_index("2") == 2
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux only")

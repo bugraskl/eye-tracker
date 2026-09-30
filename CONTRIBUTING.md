@@ -44,6 +44,13 @@ uv run python scripts/check_privacy.py
 uv run pytest
 ```
 
+After a local PyInstaller build ([docs/building.md](docs/building.md)), also run the bundle privacy
+gate, which scans every bundled native library:
+
+```bash
+uv run python scripts/check_privacy.py --bundle dist/EyeTracker
+```
+
 Tests run Qt on the `offscreen` platform, so they work over SSH and on headless CI. Tests that need a
 real face photo are skipped unless `EYE_TRACKER_TEST_FACE` points to one (face photos are never
 committed).
@@ -65,6 +72,8 @@ docs/         user and developer documentation
 ```
 
 [docs/architecture.md](docs/architecture.md) explains how the pieces fit together.
+
+GitHub Actions are pinned to full commit SHAs; Dependabot proposes updates.
 
 ## Pull requests
 

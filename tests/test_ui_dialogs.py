@@ -101,6 +101,8 @@ class FakeController(QObject):
         self.finished: list[CalibrationData | None] = []
         self.begun = 0
         self.previews: list[bool] = []
+        #: The ``owner`` of every set_preview call.
+        self.preview_owners: list[object | None] = []
         self.notifications: list[tuple[str, str]] = []
         self.is_calibrated = False
         self.calibration_reason = "no calibration yet"
@@ -139,8 +141,9 @@ class FakeController(QObject):
         self.finished.append(data)
         self.state = TrackingState.TRACKING if data is not None else TrackingState.NEEDS_CALIBRATION
 
-    def set_preview(self, enabled: bool) -> None:
+    def set_preview(self, enabled: bool, owner: object | None = None) -> None:
         self.previews.append(bool(enabled))
+        self.preview_owners.append(owner)
 
 
 class FakeClock:
@@ -1025,6 +1028,7 @@ def test_wizard_flow_applies_choices(
     wizard.next()  # the permissions page is skipped off macOS
     assert wizard.currentId() == wz.PAGE_PRESENCE
     assert controller.previews == [True, False]
+    assert controller.preview_owners == [wizard, wizard]  # counted as its own consumer
     wizard.set_presence_choice("display_off")
     wizard.presence_page.timeout.setValue(90)
 
@@ -1323,6 +1327,26 @@ def test_detect_cameras_never_probes_the_camera_in_use(
     dialog.detect_cameras()
     assert _wait_until(dialog._detect_button.isEnabled)
     assert probes[-1] == frozenset()
+
+
+def test_a_linux_device_path_in_use_is_not_probed(
+    controller: FakeController,
+    dialog: SettingsDialog,
+    probes: list[frozenset[int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A /dev/v4l/by-id link (the stable name on Linux) is the index it leads to."""
+    from eye_tracker.vision import camera as camera_mod
+
+    link = "/dev/v4l/by-id/usb-Logitech_C920_1234-video-index0"
+    monkeypatch.setattr(camera_mod, "device_index", lambda device: 3 if device == link else None)
+    settings = controller.settings.copy()
+    settings.camera.device = link
+    controller.apply_settings(settings)
+    dialog.detect_cameras()
+    assert _wait_until(dialog._detect_button.isEnabled)
+    assert probes[-1] == frozenset({3})
+    assert "The camera in use is not probed." in dialog._camera_note.text()
 
 
 def test_the_camera_in_use_stays_selectable_after_detection(

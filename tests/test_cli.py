@@ -76,6 +76,8 @@ class FakeAutostart:
         self.idle_status = autostart.Status.DISABLED
         #: The ``config_dir`` of every status/enable/disable call.
         self.profiles: list[Path | None] = []
+        #: What registered_command() reports (``None``: this copy when enabled).
+        self.registered: list[str] | None = None
         monkeypatch.setattr(autostart, "is_supported", lambda: self.supported)
         monkeypatch.setattr(autostart, "is_enabled", lambda config_dir=None: self.enabled)
         monkeypatch.setattr(autostart, "status", self.status)
@@ -90,6 +92,8 @@ class FakeAutostart:
         return [self.EXE, *profile, *(["--background"] if background else [])]
 
     def registered_command(self) -> list[str] | None:
+        if self.registered is not None:
+            return self.registered
         return self.launch_command() if self.enabled else None
 
     def status(self, config_dir: Path | None = None) -> autostart.Status:
@@ -389,11 +393,17 @@ def test_autostart_status_explains_entries_for_other_copies(
 ) -> None:
     fake = FakeAutostart(monkeypatch)
     fake.idle_status = autostart.Status.STALE
+    fake.registered = ["/opt/old/eye-tracker", "--background"]
     assert cli.main(["autostart"]) == cli.EXIT_OK
-    assert "Start at login: broken" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Start at login: stale\n" in out  # the status value itself
+    assert "Broken" in out
+    assert "Registered: /opt/old/eye-tracker --background" in out
     fake.idle_status = autostart.Status.OTHER_PROFILE
     assert cli.main(["autostart"]) == cli.EXIT_OK
-    assert "another profile" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Start at login: other-profile\n" in out
+    assert "another profile" in out
     assert cli.main(["autostart", "disable"]) == cli.EXIT_OK
     assert "left unchanged" in capsys.readouterr().out
 

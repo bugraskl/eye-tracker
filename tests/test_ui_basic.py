@@ -100,6 +100,8 @@ class FakeController(QObject):
         self.paused = False
         self.privacy = False
         self.preview_enabled = False
+        #: The ``owner`` of every set_preview call.
+        self.preview_owners: list[object | None] = []
         self.hotkey_manager: FakeHotkeyManager | None = None
         self.yield_reason = ""
         self.calibration_reason = ""
@@ -126,8 +128,9 @@ class FakeController(QObject):
     def _derive(self) -> None:
         self._emit(S.PRIVACY if self.privacy else S.PAUSED if self.paused else S.TRACKING)
 
-    def set_preview(self, enabled: bool) -> None:
+    def set_preview(self, enabled: bool, owner: object | None = None) -> None:
         self.calls.append(("set_preview", enabled))
+        self.preview_owners.append(owner)
         self.preview_enabled = enabled
 
     def set_privacy(self, enabled: bool) -> None:
@@ -1413,6 +1416,7 @@ def test_preview_window_lifecycle(controller: FakeController, cleanup: list[Any]
     assert not window.preview_active
     window.show()
     assert controller.calls[-1] == ("set_preview", True)
+    assert controller.preview_owners == [window]  # counted as its own consumer
     assert window.preview_active
     assert controller.preview_enabled
     assert window.values["backend"].text() == "facemesh (facemesh-pose-iris-1)"

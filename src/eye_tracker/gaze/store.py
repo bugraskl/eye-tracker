@@ -66,6 +66,18 @@ _PARSE_ERRORS = (ValueError, TypeError, KeyError, AttributeError, OverflowError,
 #: ``CalibrationData.key``: (layout signature, backend, feature version, camera).
 ProfileKey = tuple[str, str, str, str]
 
+#: Backend names of earlier versions whose measurements did not change with the
+#: new name: the OpenCV/YuNet backend is now called ``lite`` (same features, same
+#: ``feature_version``), so its calibrations stay valid. The MediaPipe backend's
+#: successor, ``facemesh``, measures differently (another ``feature_version``),
+#: so ``mediapipe`` calibrations are deliberately not carried over.
+BACKEND_ALIASES: dict[str, str] = {"opencv": "lite"}
+
+
+def canonical_backend(name: str) -> str:
+    """The current name of a vision backend (see :data:`BACKEND_ALIASES`)."""
+    return BACKEND_ALIASES.get(name, name)
+
 
 def utc_now_iso() -> str:
     """Current time as ISO 8601 UTC with second precision, e.g. ``2026-09-30T12:00:00+00:00``."""
@@ -99,8 +111,17 @@ class CalibrationData:
 
     @property
     def key(self) -> ProfileKey:
-        """The setup this calibration belongs to; a library keeps one profile per key."""
-        return (self.layout_signature, self.backend, self.feature_version, self.camera.strip())
+        """The setup this calibration belongs to; a library keeps one profile per key.
+
+        The backend is given by its current name (:func:`canonical_backend`), so a
+        profile of the renamed ``opencv`` backend and a new ``lite`` one are the same.
+        """
+        return (
+            self.layout_signature,
+            canonical_backend(self.backend),
+            self.feature_version,
+            self.camera.strip(),
+        )
 
     def is_compatible(
         self,
@@ -116,11 +137,13 @@ class CalibrationData:
 
         ``camera`` and ``frame_size`` are the current camera device setting and
         frame size; ``None``, ``""`` or ``(0, 0)`` (here or stored) skip that check.
+        Backend names are compared by their current names (:func:`canonical_backend`).
         """
-        if backend_name != self.backend:
+        current, stored = canonical_backend(backend_name), canonical_backend(self.backend)
+        if current != stored:
             return (
                 False,
-                f"calibrated with the {self.backend} backend, but {backend_name} is in use",
+                f"calibrated with the {stored} backend, but {current} is in use",
             )
         if feature_version != self.feature_version:
             return False, (
@@ -406,7 +429,8 @@ def _profile_from_doc(doc: Any) -> CalibrationData:
 
     report = doc.get("report", {})
     return CalibrationData(
-        backend=_str(doc["backend"], "backend"),
+        # Stored under the current name, so the next save writes that.
+        backend=canonical_backend(_str(doc["backend"], "backend")),
         feature_version=_str(doc["feature_version"], "feature_version"),
         layout_signature=_str(doc["layout_signature"], "layout_signature"),
         monitors=[_monitor_from_dict(m) for m in _list(doc["monitors"], "monitors")],

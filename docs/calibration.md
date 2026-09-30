@@ -50,7 +50,7 @@ the model has not memorised.
 
 After calibration, Eye Tracker quietly learns from how you use the mouse: when you move the pointer
 somewhere and stop, you are almost always looking there. These samples refine the calibration over
-time (turn this off under **Settings → Switching → Learn from mouse use**). If the app notices that
+time (turn this off under **Settings → Switching → Learn from how I use the mouse**). If the app notices that
 you often correct it by hand, it suggests a recalibration.
 
 ## When to recalibrate

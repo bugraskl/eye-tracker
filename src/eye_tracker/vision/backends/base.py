@@ -26,6 +26,11 @@ class VisionBackend(ABC):
     #: Changes whenever feature semantics change; calibrations with another
     #: version are rejected.
     feature_version: ClassVar[str]
+    #: The subset of ``feature_names`` that encodes where the user looks (head
+    #: rotation and eye direction, as opposed to head position or roll). The gaze
+    #: model applies nonlinear terms only to these, and a value far outside its
+    #: calibrated range means the user looks away from every monitor.
+    gaze_features: ClassVar[tuple[str, ...]] = ()
 
     @abstractmethod
     def process(self, frame_bgr: np.ndarray, timestamp: float) -> Observation:

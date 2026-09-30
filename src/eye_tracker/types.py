@@ -159,10 +159,14 @@ class Observation:
     skipped: bool = False
     inference_ms: float = 0.0
     frame_size: tuple[int, int] = (0, 0)
+    #: The frame is too dark or uniform to judge (lens covered, shutter closed,
+    #: unlit room). ``face_count`` is then meaningless: presence and the
+    #: shoulder guard must treat the frame as "cannot tell", not "nobody here".
+    blind: bool = False
 
     @property
     def face_present(self) -> bool:
-        return self.face_count > 0
+        return self.face_count > 0 and not self.blind
 
     @property
     def usable(self) -> bool:

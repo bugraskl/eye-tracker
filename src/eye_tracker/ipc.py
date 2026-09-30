@@ -100,6 +100,7 @@ def send_command(command: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> str | No
     text = command.strip().lower()
     if not text or "\n" in text or "\r" in text:
         raise ValueError(f"invalid command {command!r}")
+    _allow_foreground_handoff()
     connected, data = _exchange(server_name(), (text + "\n").encode("utf-8"), timeout_ms)
     if not connected:
         return None

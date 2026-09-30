@@ -1368,6 +1368,7 @@ class SettingsDialog(QDialog):
             key = f"hotkeys.{action}"
             edit = HotkeyEdit()
             edit.setToolTip(f"{_doc(key)}\nClick, then press the shortcut. Backspace clears it.")
+            edit.recording_changed.connect(self._on_hotkey_recording)
             self._hotkey_edits[action] = edit
             self._register(
                 _Binding(key, edit, edit.hotkey, _hotkey_writer(edit), edit.hotkey),

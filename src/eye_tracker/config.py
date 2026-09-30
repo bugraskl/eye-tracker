@@ -39,9 +39,10 @@ def _opt(
 class GeneralSettings:
     backend: str = _opt(
         "auto",
-        choices=("auto", "mediapipe", "opencv"),
-        doc="Vision backend. 'auto' prefers MediaPipe (head pose + iris) and falls back to "
-        "the lightweight OpenCV backend.",
+        choices=("auto", "facemesh", "lite"),
+        doc="Vision backend. 'facemesh' tracks 478 face landmarks including the irises "
+        "(head pose + eye direction); 'lite' uses 5 landmarks (head pose only, lowest CPU). "
+        "'auto' picks facemesh.",
     )
     start_paused: bool = _opt(False, doc="Start with tracking paused.")
     first_run_done: bool = _opt(False, doc="Set after the first-run wizard completes.")

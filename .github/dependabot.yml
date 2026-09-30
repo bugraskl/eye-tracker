@@ -1,0 +1,49 @@
+# Keep GitHub Actions and Python dependencies (uv.lock) up to date.
+# https://docs.github.com/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: ci
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: deps
+    labels:
+      - dependencies
+      - python
+    groups:
+      # Linters, type checker, test runner and packaging tools move together.
+      dev-tools:
+        dependency-type: development
+        update-types:
+          - minor
+          - patch
+      # Qt, OpenCV and MediaPipe are updated one at a time on purpose: each can
+      # change behaviour, bundle size or supported OS versions.
+      runtime-patches:
+        dependency-type: production
+        exclude-patterns:
+          - pyside6*
+          - shiboken6
+          - opencv*
+          - mediapipe
+        update-types:
+          - patch

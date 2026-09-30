@@ -1,0 +1,505 @@
+name: Release
+
+# Tag vX.Y.Z (matching __version__ in src/eye_tracker/__init__.py and a
+# "## [X.Y.Z] - YYYY-MM-DD" section in CHANGELOG.md) to build all packages and
+# publish a GitHub release. Run it manually to build the packages without
+# publishing (they are kept as workflow artifacts).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_COLOR: "1"
+  PYTHONUTF8: "1"
+  PYTHON_VERSION: "3.12"
+  # Release builds use the python.org / distro-style CPython from setup-python
+  # (a shared libpython everywhere), never a downloaded one.
+  UV_PYTHON_DOWNLOADS: never
+  UV_NO_PROGRESS: "1"
+  # The icon renderer and the frozen smoke tests run Qt headless.
+  QT_QPA_PLATFORM: offscreen
+
+jobs:
+  prepare:
+    name: Version and release notes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      numeric: ${{ steps.version.outputs.numeric }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Read the version
+        id: version
+        run: |
+          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/eye_tracker/__init__.py)"
+          if [[ -z "$version" ]]; then
+            echo "::error file=src/eye_tracker/__init__.py::cannot read __version__"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match __version__ \"$version\" (expected v$version)"
+            exit 1
+          fi
+          # Windows file versions and CFBundleVersion must be purely numeric.
+          numeric="$(grep -oE '^[0-9]+(\.[0-9]+){0,2}' <<<"$version")"
+          prerelease=false
+          if [[ "$version" =~ [a-zA-Z] ]]; then
+            prerelease=true
+          fi
+          {
+            echo "version=$version"
+            echo "numeric=$numeric"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "Version $version (numeric $numeric, prerelease $prerelease)"
+
+      - name: Extract the release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          import textwrap
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          is_tag = os.environ.get("GITHUB_REF_TYPE") == "tag"
+          text = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          # Keep a Changelog: the section starts at "## [X.Y.Z] - date" and ends at the
+          # next "## " heading or at the link reference definitions ("[X.Y.Z]: url").
+          section = re.compile(
+              rf"^## \[{re.escape(version)}\][^\n]*\n(?P<body>.*?)(?=^## |^\[[^\]\n]+\]:|\Z)",
+              re.MULTILINE | re.DOTALL,
+          )
+          match = section.search(text)
+          body = match.group("body").strip() if match else ""
+          if not body:
+              message = f"CHANGELOG.md has no non-empty '## [{version}] - YYYY-MM-DD' section"
+              if is_tag:
+                  print(f"::error file=CHANGELOG.md::{message}")
+                  sys.exit(1)
+              print(f"::warning file=CHANGELOG.md::{message}")
+              body = "Development build."
+
+          v = version
+          footer = f"""
+          ### Downloads
+
+          | Platform | File |
+          |---|---|
+          | Windows 10/11 (x64), installer | `EyeTracker-{v}-windows-x64-setup.exe` |
+          | Windows 10/11 (x64), portable | `EyeTracker-{v}-windows-x64-portable.zip` |
+          | macOS (Apple silicon) | `EyeTracker-{v}-macos-arm64.dmg` |
+          | Linux (x86_64), AppImage | `EyeTracker-{v}-linux-x86_64.AppImage` |
+          | Linux (x86_64), tarball | `EyeTracker-{v}-linux-x86_64.tar.gz` |
+
+          Verify a download with `SHA256SUMS.txt`, e.g. `sha256sum -c SHA256SUMS.txt --ignore-missing`.
+
+          The builds are not signed with a paid certificate: Windows SmartScreen may ask you to
+          confirm ("More info" → "Run anyway"), and on macOS the first launch needs
+          "Open Anyway" in System Settings → Privacy & Security.
+          """
+          notes = body + "\n\n" + textwrap.dedent(footer).strip() + "\n"
+          Path("release-notes.md").write_text(notes, encoding="utf-8")
+          PY
+          cat release-notes.md
+
+      - name: Upload the release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    name: Windows x64
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      VERSION_NUMERIC: ${{ needs.prepare.outputs.numeric }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --python "${{ steps.python.outputs.python-path }}"
+
+      - name: Verify the face models
+        run: uv run --no-sync python scripts/fetch_models.py --check
+
+      - name: Render the icons
+        run: uv run --no-sync python scripts/make_icons.py
+
+      - name: Build with PyInstaller
+        run: uv run --no-sync pyinstaller packaging/pyinstaller/eye-tracker.spec --noconfirm --clean
+
+      - name: Smoke-test the frozen CLI
+        run: |
+          set -euo pipefail
+          cli="dist/EyeTracker/eye-tracker-cli.exe"
+          cfg="$RUNNER_TEMP/eye-tracker-smoke"
+          test -f dist/EyeTracker/EyeTracker.exe
+          "$cli" --version | tee version.txt
+          grep -qF "$VERSION" version.txt
+          "$cli" --config-dir "$cfg" doctor --json > doctor.json
+          "$cli" --config-dir "$cfg" doctor
+          for backend in mediapipe opencv; do
+            "$cli" --config-dir "$cfg" bench --camera packaging/linux/eye-tracker.png \
+              --backend "$backend" --seconds 1 --json > "bench-$backend.json"
+          done
+          uv run --no-sync python - "$VERSION" <<'PY'
+          import json
+          import sys
+
+          report = json.load(open("doctor.json", encoding="utf-8"))
+          assert report["app"]["version"] == sys.argv[1], report["app"]
+          assert report["app"]["frozen"] is True, report["app"]
+          for name, model in report["backends"]["models"].items():
+              assert model["sha256_ok"], (name, model)
+          for backend in ("mediapipe", "opencv"):
+              bench = json.load(open(f"bench-{backend}.json", encoding="utf-8"))
+              assert bench["backend"] == backend, bench
+              assert bench["modes"]["max"]["analysed"] > 0, bench["modes"]
+          print("smoke test passed")
+          PY
+
+      - name: Create the portable ZIP
+        run: |
+          cd dist
+          7z a -tzip -mx=9 -bd "EyeTracker-$VERSION-windows-x64-portable.zip" EyeTracker
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) {
+            $iscc = @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+              "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed" }
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc "/DAppVersion=$env:VERSION" "/DAppVersionNumeric=$env:VERSION_NUMERIC" packaging\windows\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+      - name: Smoke-test the installer (install, run, uninstall)
+        shell: pwsh
+        run: |
+          $setup = "dist\EyeTracker-$env:VERSION-windows-x64-setup.exe"
+          $install = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/MERGETASKS=!startup,!desktopicon",
+            "/LOG=$env:RUNNER_TEMP\install.log")
+          if ($install.ExitCode -ne 0) {
+            Get-Content "$env:RUNNER_TEMP\install.log"
+            throw "setup failed with exit code $($install.ExitCode)"
+          }
+          $app = Join-Path $env:LOCALAPPDATA "Programs\Eye Tracker"
+          & "$app\eye-tracker-cli.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "the installed CLI failed" }
+          $uninstall = Start-Process -FilePath "$app\unins000.exe" -Wait -PassThru -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART")
+          if ($uninstall.ExitCode -ne 0) { throw "uninstall failed with exit code $($uninstall.ExitCode)" }
+          # The uninstaller finishes in a copy of itself; wait for it to remove the folder.
+          for ($i = 0; $i -lt 30 -and (Test-Path "$app\eye-tracker-cli.exe"); $i++) { Start-Sleep 1 }
+          if (Test-Path "$app\eye-tracker-cli.exe") { throw "uninstall left files behind in $app" }
+
+      - name: Upload the packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            dist/EyeTracker-${{ env.VERSION }}-windows-x64-setup.exe
+            dist/EyeTracker-${{ env.VERSION }}-windows-x64-portable.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  build-macos:
+    name: macOS arm64
+    needs: prepare
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --python "${{ steps.python.outputs.python-path }}"
+
+      - name: Verify the face models
+        run: uv run --no-sync python scripts/fetch_models.py --check
+
+      - name: Render the icons
+        run: uv run --no-sync python scripts/make_icons.py
+
+      - name: Build with PyInstaller
+        run: uv run --no-sync pyinstaller packaging/pyinstaller/eye-tracker.spec --noconfirm --clean
+
+      - name: Sign ad hoc and create the disk image
+        run: |
+          bash packaging/macos/make_dmg.sh --app "dist/Eye Tracker.app" --version "$VERSION" \
+            --out "dist/EyeTracker-$VERSION-macos-arm64.dmg"
+
+      - name: Smoke-test the app inside the disk image
+        run: |
+          set -euo pipefail
+          mnt="$RUNNER_TEMP/dmg"
+          mkdir -p "$mnt"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "dist/EyeTracker-$VERSION-macos-arm64.dmg"
+          trap 'hdiutil detach "$mnt" -force || true' EXIT
+          app="$mnt/Eye Tracker.app"
+          test -L "$mnt/Applications"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          plist="$app/Contents/Info.plist"
+          plutil -p "$plist"
+          test "$(plutil -extract CFBundleIdentifier raw "$plist")" = "io.github.bugraskl.eyetracker"
+          test "$(plutil -extract LSUIElement raw "$plist")" = "true"
+          test "$(plutil -extract CFBundleShortVersionString raw "$plist")" = "$VERSION"
+          plutil -extract NSCameraUsageDescription raw "$plist" > /dev/null
+          test -x "$app/Contents/MacOS/Eye Tracker"
+          cli="$app/Contents/MacOS/eye-tracker-cli"
+          cfg="$RUNNER_TEMP/eye-tracker-smoke"
+          "$cli" --version | tee version.txt
+          grep -qF "$VERSION" version.txt
+          "$cli" --config-dir "$cfg" doctor --json > doctor.json
+          "$cli" --config-dir "$cfg" doctor
+          for backend in mediapipe opencv; do
+            "$cli" --config-dir "$cfg" bench --camera packaging/linux/eye-tracker.png \
+              --backend "$backend" --seconds 1 --json > "bench-$backend.json"
+          done
+          uv run --no-sync python - "$VERSION" <<'PY'
+          import json
+          import sys
+
+          report = json.load(open("doctor.json", encoding="utf-8"))
+          assert report["app"]["version"] == sys.argv[1], report["app"]
+          assert report["app"]["frozen"] is True, report["app"]
+          for name, model in report["backends"]["models"].items():
+              assert model["sha256_ok"], (name, model)
+          for backend in ("mediapipe", "opencv"):
+              bench = json.load(open(f"bench-{backend}.json", encoding="utf-8"))
+              assert bench["backend"] == backend, bench
+              assert bench["modes"]["max"]["analysed"] > 0, bench["modes"]
+          print("smoke test passed")
+          PY
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: dist/EyeTracker-${{ env.VERSION }}-macos-arm64.dmg
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  build-linux:
+    name: Linux x86_64
+    needs: prepare
+    # The oldest supported runner: the bundle works on distributions with the
+    # same or a newer glibc (2.35).
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      # appimagetool (and the smoke test) run without FUSE.
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install system libraries
+        # Qt's xcb platform plugin and its helpers; PyInstaller bundles what it finds,
+        # and libxcb-cursor0 in particular is missing on many desktops.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 libfontconfig1 libdbus-1-3 \
+            libglib2.0-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-xinerama0 \
+            libxcb-xkb1 desktop-file-utils
+
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --python "${{ steps.python.outputs.python-path }}"
+
+      - name: Verify the face models
+        run: uv run --no-sync python scripts/fetch_models.py --check
+
+      - name: Render the icons
+        run: uv run --no-sync python scripts/make_icons.py
+
+      - name: Build with PyInstaller
+        run: uv run --no-sync pyinstaller packaging/pyinstaller/eye-tracker.spec --noconfirm --clean
+
+      - name: Check that libxcb-cursor was bundled
+        run: find dist/eye-tracker -name 'libxcb-cursor.so.0*' | grep .
+
+      - name: Create the AppImage and the tarball
+        run: bash packaging/linux/build_appimage.sh --version "$VERSION"
+
+      - name: Smoke-test the AppImage and the tarball
+        run: |
+          set -euo pipefail
+          appimage="dist/EyeTracker-$VERSION-linux-x86_64.AppImage"
+          cfg="$RUNNER_TEMP/eye-tracker-smoke"
+          "$appimage" --version | tee version.txt
+          grep -qF "$VERSION" version.txt
+          "$appimage" --config-dir "$cfg" doctor --json > doctor.json
+          "$appimage" --config-dir "$cfg" doctor
+          for backend in mediapipe opencv; do
+            "$appimage" --config-dir "$cfg" bench --camera packaging/linux/eye-tracker.png \
+              --backend "$backend" --seconds 1 --json > "bench-$backend.json"
+          done
+          tar -xzf "dist/EyeTracker-$VERSION-linux-x86_64.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/eye-tracker/eye-tracker" --version
+          test -f "$RUNNER_TEMP/eye-tracker/eye-tracker.desktop"
+          find "$RUNNER_TEMP/eye-tracker" -name 'libxcb-cursor.so.0*' | grep .
+          uv run --no-sync python - "$VERSION" <<'PY'
+          import json
+          import sys
+
+          report = json.load(open("doctor.json", encoding="utf-8"))
+          assert report["app"]["version"] == sys.argv[1], report["app"]
+          assert report["app"]["frozen"] is True, report["app"]
+          for name, model in report["backends"]["models"].items():
+              assert model["sha256_ok"], (name, model)
+          for backend in ("mediapipe", "opencv"):
+              bench = json.load(open(f"bench-{backend}.json", encoding="utf-8"))
+              assert bench["backend"] == backend, bench
+              assert bench["modes"]["max"]["analysed"] > 0, bench["modes"]
+          print("smoke test passed")
+          PY
+
+      - name: Upload the packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            dist/EyeTracker-${{ env.VERSION }}-linux-x86_64.AppImage
+            dist/EyeTracker-${{ env.VERSION }}-linux-x86_64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    name: Publish the GitHub release
+    if: github.ref_type == 'tag'
+    needs:
+      - prepare
+      - build-windows
+      - build-macos
+      - build-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Download the packages and the release notes
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compute checksums
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          expected=(
+            "EyeTracker-$VERSION-windows-x64-setup.exe"
+            "EyeTracker-$VERSION-windows-x64-portable.zip"
+            "EyeTracker-$VERSION-macos-arm64.dmg"
+            "EyeTracker-$VERSION-linux-x86_64.AppImage"
+            "EyeTracker-$VERSION-linux-x86_64.tar.gz"
+          )
+          for file in "${expected[@]}"; do
+            test -s "$file" || { echo "::error::missing $file"; exit 1; }
+          done
+          sha256sum "${expected[@]}" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          ls -l
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Eye Tracker ${{ env.VERSION }}
+          tag_name: ${{ github.ref_name }}
+          body_path: artifacts/release-notes.md
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/EyeTracker-${{ env.VERSION }}-windows-x64-setup.exe
+            artifacts/EyeTracker-${{ env.VERSION }}-windows-x64-portable.zip
+            artifacts/EyeTracker-${{ env.VERSION }}-macos-arm64.dmg
+            artifacts/EyeTracker-${{ env.VERSION }}-linux-x86_64.AppImage
+            artifacts/EyeTracker-${{ env.VERSION }}-linux-x86_64.tar.gz
+            artifacts/SHA256SUMS.txt

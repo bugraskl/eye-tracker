@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security or privacy vulnerability
+    url: https://github.com/bugraskl/eye-tracker/security/advisories/new
+    about: Please report security and privacy problems privately, not in a public issue.
+  - name: Questions and help
+    url: https://github.com/bugraskl/eye-tracker/discussions
+    about: Ask how to set things up, share tips and show your setup.
+  - name: Documentation
+    url: https://github.com/bugraskl/eye-tracker/tree/main/docs
+    about: Installation, calibration, troubleshooting and platform notes.

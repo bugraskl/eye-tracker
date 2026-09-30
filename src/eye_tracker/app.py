@@ -1,0 +1,819 @@
+"""The tray application: startup sequence, single instance and window management.
+
+:func:`run_app` is what ``eye-tracker`` (``run``) executes. It is split into
+:func:`build_app`, which creates everything, and :meth:`AppContext.exec`, which
+runs the Qt event loop, so tests can build the whole app without entering the
+loop. The startup order matters:
+
+1. logging (console only for now), so native libraries are quietened before
+   they load;
+2. ``PlatformServices.prepare_process`` before the ``QApplication`` exists
+   (DPI awareness and Qt environment variables), then the ``QApplication``;
+3. the single-instance check: if the app already runs, it is asked to show
+   itself (or to calibrate) and this process exits without touching the log
+   file or the settings;
+4. file logging, settings, the command socket, the
+   :class:`~eye_tracker.engine.controller.Controller` and the UI.
+
+:class:`EyeTrackerApp` owns the controller and every window. The windows talk to
+the controller themselves (the tray, the gaze overlay, the countdown toast and
+the privacy curtain follow its signals on their own); this class opens windows
+on request (tray menu, IPC, hotkeys) and keeps at most one of each.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import functools
+import logging
+import signal
+import sys
+import threading
+import time
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from PySide6.QtCore import QObject, Qt, QTimer
+from PySide6.QtGui import QCursor
+from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
+
+from . import APP_AUTHOR, APP_NAME, APP_SLUG, __version__, ipc, paths
+from .config import Settings
+from .logging_setup import install_qt_message_handler, set_level, setup_logging
+from .platform import get_platform
+from .platform.base import PlatformServices
+
+if TYPE_CHECKING:
+    from .engine.controller import Controller
+    from .ui.about import AboutDialog
+    from .ui.calibration_window import CalibrationWindow
+    from .ui.countdown import CountdownToast
+    from .ui.curtain import PrivacyCurtain
+    from .ui.overlay import GazeOverlay
+    from .ui.preview import PreviewWindow
+    from .ui.settings_dialog import SettingsDialog
+    from .ui.tray import TrayIcon
+    from .ui.wizard import FirstRunWizard
+
+    ControllerFactory = Callable[[Settings, PlatformServices], Controller]
+
+__all__ = ["AppContext", "AppOptions", "EyeTrackerApp", "build_app", "run_app"]
+
+log = logging.getLogger(__name__)
+
+#: ``calibration_required`` reasons that are explicit user requests (the
+#: recalibrate hotkey, ``eye-tracker ctl calibrate``): the calibration opens at
+#: once. Any other reason (a changed monitor layout, another vision backend) only
+#: produces a notification that opens it when clicked: covering every screen
+#: unannounced could hide a dialog the user is working with, such as the
+#: operating system's "keep these display settings?" countdown.
+EXPLICIT_CALIBRATION_REASONS = frozenset({"hotkey", "ipc", "user"})
+#: With ``--background`` (login start) notifications stay quiet this long.
+STARTUP_QUIET_S = 20.0
+#: Clicking the "calibration needed" notification later than this does nothing.
+PROMPT_CLICK_WINDOW_S = 600.0
+#: How often Python gets control during the event loop, so Ctrl+C is handled.
+SIGNAL_POLL_MS = 500
+#: Delay before quitting on an IPC ``quit``, so the reply reaches the client.
+_QUIT_DELAY_MS = 100
+#: Settings that ``--camera`` / ``--backend`` override for one session.
+_OVERRIDABLE = {"camera": "camera.device", "backend": "general.backend"}
+
+
+@dataclass(frozen=True, slots=True)
+class AppOptions:
+    """Command-line switches that change how the app starts."""
+
+    #: Started at login: no first-run wizard, no startup notifications.
+    background: bool = False
+    #: Open the calibration right after start.
+    calibrate: bool = False
+    #: ``--log-level`` was given, so the settings' level is ignored.
+    log_level_locked: bool = False
+
+
+# ============================================================================ run
+def run_app(args: argparse.Namespace) -> int:
+    """Start the tray app and run the Qt event loop. Returns the exit code.
+
+    Honours ``args.background``, ``args.calibrate``, ``args.camera``,
+    ``args.backend``, ``args.config_dir`` and ``args.log_level``; missing
+    attributes mean "not given".
+    """
+    return build_app(args).exec()
+
+
+@dataclass(slots=True)
+class AppContext:
+    """What :func:`build_app` created. :meth:`exec` runs it.
+
+    ``exit_code`` is set when there is nothing to run: the request was handed to
+    an instance that is already running, or startup failed.
+    """
+
+    qt_app: QApplication
+    app: EyeTrackerApp | None = None
+    server: ipc.InstanceServer | None = None
+    exit_code: int | None = None
+
+    @property
+    def controller(self) -> Controller | None:
+        return self.app.controller if self.app is not None else None
+
+    def exec(self) -> int:
+        """Run the event loop until the app quits, then shut down. Returns the exit code."""
+        if self.app is None or self.exit_code is not None:
+            return self.exit_code if self.exit_code is not None else 0
+        with _quit_on_signals(self.app.quit):
+            code = int(self.qt_app.exec())
+        self.shutdown()
+        log.info("%s exited (code %s)", APP_NAME, code)
+        return code
+
+    def shutdown(self) -> None:
+        """Stop accepting commands, close every window and release the camera. Idempotent."""
+        if self.server is not None:
+            self.server.close()
+        if self.app is not None:
+            self.app.shutdown()
+
+
+def build_app(
+    args: argparse.Namespace,
+    *,
+    platform: PlatformServices | None = None,
+    controller_factory: ControllerFactory | None = None,
+    controller_kwargs: Mapping[str, Any] | None = None,
+) -> AppContext:
+    """Create the ``QApplication`` (unless one exists), check for a running
+    instance, then create and start the controller, the command socket and the UI.
+
+    Args:
+        args: Parsed command line (see :func:`run_app`).
+        platform: OS integration; defaults to :func:`~eye_tracker.platform.get_platform`.
+        controller_factory: ``(settings, platform) -> Controller``; defaults to
+            :class:`~eye_tracker.engine.controller.Controller`.
+        controller_kwargs: Extra keyword arguments for the default controller
+            (its test seams: ``worker_factory``, ``monitors_provider``, ``cursor``,
+            ``hotkey_manager_factory``, ``clock``).
+    """
+    options = AppOptions(
+        background=bool(getattr(args, "background", False)),
+        calibrate=bool(getattr(args, "calibrate", False)),
+        log_level_locked=bool(getattr(args, "log_level", None)),
+    )
+    config_dir = getattr(args, "config_dir", None)
+    if config_dir:
+        paths.set_base_override(Path(config_dir))
+    level = getattr(args, "log_level", None) or "INFO"
+    console = _isatty(sys.stderr)
+    # The log file belongs to the running instance; a process that only hands a
+    # request over to it must not write (or rotate) it, so file logging starts
+    # after the single-instance check.
+    setup_logging(level, console=console, log_to_file=False)
+
+    services = platform if platform is not None else get_platform()
+    existing = QApplication.instance()
+    if existing is None:
+        # Must happen before the QApplication exists (DPI awareness, Qt env vars).
+        services.prepare_process()
+        qt_app = QApplication([sys.argv[0] if sys.argv and sys.argv[0] else APP_SLUG])
+    elif isinstance(existing, QApplication):
+        qt_app = existing
+    else:
+        raise RuntimeError("A non-GUI Qt application already exists; cannot start the tray app")
+    _configure_qt_app(qt_app)
+    # macOS: no Dock icon or application menu for a tray app. The .app bundle's
+    # LSUIElement does this too; this covers running from source.
+    accessory = getattr(services, "set_accessory_app", None)
+    if callable(accessory):
+        try:
+            accessory()
+        except Exception:
+            log.debug("set_accessory_app failed", exc_info=True)
+
+    # Single instance: hand the request to the running app and leave.
+    request = "calibrate" if options.calibrate else "show"
+    reply = ipc.send_command(request)
+    if reply is not None:
+        if reply.startswith("error"):
+            log.warning("The running instance refused %r: %s", request, reply)
+            return AppContext(qt_app, exit_code=1)
+        log.info("%s is already running; asked it to %s", APP_NAME, request)
+        return AppContext(qt_app, exit_code=0)
+
+    setup_logging(level, console=console)
+    install_qt_message_handler()
+    settings = Settings.load(paths.settings_file())
+    if not options.log_level_locked:
+        set_level(settings.general.log_level)
+    overrides = _apply_overrides(settings, args)
+    log.info(
+        "%s %s starting (Python %s, %s)",
+        APP_NAME,
+        __version__,
+        sys.version.split()[0],
+        sys.platform,
+    )
+
+    trace = getattr(args, "trace", None)
+    if trace:
+        controller_kwargs = {**dict(controller_kwargs or {}), "trace_path": trace}
+    if controller_factory is None and controller_kwargs:
+        controller_factory = _controller_factory(dict(controller_kwargs))
+    app = EyeTrackerApp(
+        qt_app,
+        settings,
+        services,
+        options,
+        controller_factory=controller_factory,
+        session_overrides=overrides,
+    )
+    server = ipc.InstanceServer(app.handle_command, app)
+    if not server.listen():
+        if server.another_instance_running:
+            # Another instance claimed the socket after our check, or it hangs.
+            log.error("Another instance is running but does not answer; exiting")
+            _show_error(qt_app, f"{APP_NAME} is already running but does not respond.")
+            app.shutdown()
+            return AppContext(qt_app, exit_code=1)
+        log.warning("Command socket unavailable; 'eye-tracker ctl' will not work")
+
+    try:
+        app.start()
+    except Exception as exc:
+        log.exception("%s could not start", APP_NAME)
+        server.close()
+        app.shutdown()
+        _show_error(
+            qt_app,
+            f"{APP_NAME} could not start:\n\n{exc}\n\n"
+            f"Details are in the log file:\n{paths.log_file()}",
+        )
+        return AppContext(qt_app, exit_code=1)
+    return AppContext(qt_app, app, server)
+
+
+def _controller_factory(kwargs: dict[str, Any]) -> ControllerFactory:
+    def factory(settings: Settings, services: PlatformServices) -> Controller:
+        from .engine.controller import Controller
+
+        return Controller(settings, services, **kwargs)
+
+    return factory
+
+
+# ========================================================================= the app
+class EyeTrackerApp(QObject):
+    """Owns the controller, the tray icon and the windows of the running app.
+
+    Args:
+        qt_app: The ``QApplication``.
+        settings: Settings to start with (command-line overrides applied).
+        services: OS integration.
+        options: Startup switches.
+        controller_factory: ``(settings, services) -> Controller``; defaults to
+            :class:`~eye_tracker.engine.controller.Controller`.
+        session_overrides: ``{"section.field": (saved value, session value)}`` for
+            settings overridden on the command line. The session value stays out
+            of the settings file when other settings are saved.
+        clock: Monotonic time source (notification click window).
+    """
+
+    def __init__(
+        self,
+        qt_app: QApplication,
+        settings: Settings,
+        services: PlatformServices,
+        options: AppOptions | None = None,
+        *,
+        controller_factory: ControllerFactory | None = None,
+        session_overrides: Mapping[str, tuple[str, str]] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__()
+        self._qt_app = qt_app
+        self._settings = settings
+        self._services = services
+        self._options = options or AppOptions()
+        self._controller_factory = controller_factory
+        self._overrides = dict(session_overrides or {})
+        self._clock = clock
+        self._controller: Controller | None = None
+        self._started = False
+        self._closed = False
+        self._quit_hooked = False
+
+        self._tray: TrayIcon | None = None
+        self._overlay: GazeOverlay | None = None
+        self._countdown: CountdownToast | None = None
+        self._curtain: PrivacyCurtain | None = None
+        self._settings_dialog: SettingsDialog | None = None
+        self._calibration: CalibrationWindow | None = None
+        self._preview: PreviewWindow | None = None
+        self._about: AboutDialog | None = None
+        self._wizard: FirstRunWizard | None = None
+        #: Reasons already announced with a "calibration needed" notification.
+        self._announced: set[str] = set()
+        #: When the last "calibration needed" notification was shown.
+        self._prompt_at: float | None = None
+
+    # ---------------------------------------------------------------- accessors
+    @property
+    def controller(self) -> Controller | None:
+        return self._controller
+
+    @property
+    def tray(self) -> TrayIcon | None:
+        return self._tray
+
+    @property
+    def overlay(self) -> GazeOverlay | None:
+        return self._overlay
+
+    @property
+    def countdown(self) -> CountdownToast | None:
+        return self._countdown
+
+    @property
+    def curtain(self) -> PrivacyCurtain | None:
+        return self._curtain
+
+    @property
+    def settings_dialog(self) -> SettingsDialog | None:
+        return self._settings_dialog
+
+    @property
+    def calibration_window(self) -> CalibrationWindow | None:
+        return self._calibration
+
+    @property
+    def preview(self) -> PreviewWindow | None:
+        return self._preview
+
+    @property
+    def wizard(self) -> FirstRunWizard | None:
+        return self._wizard
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    # ---------------------------------------------------------------- lifecycle
+    def start(self) -> None:
+        """Create the controller and the UI, start tracking and open startup windows."""
+        if self._started or self._closed:
+            return
+        self._started = True
+        controller = self._make_controller()
+        self._controller = controller
+        controller.calibration_required.connect(self._on_calibration_required)
+        controller.settings_changed.connect(self._on_settings_changed)
+        controller.ui_requested.connect(self._on_ui_requested)
+
+        from .ui.countdown import CountdownToast
+        from .ui.curtain import PrivacyCurtain
+        from .ui.overlay import GazeOverlay
+        from .ui.tray import TrayIcon
+
+        # These follow the controller's signals by themselves: the toast
+        # away_warning/away_cancelled, the curtain guard_changed, the overlay
+        # gaze_changed and settings.ui.show_gaze_overlay.
+        tray = TrayIcon(controller, self)
+        self._tray = tray
+        self._overlay = GazeOverlay(controller, self)
+        self._countdown = CountdownToast(controller)
+        self._curtain = PrivacyCurtain(controller, self)
+        # Connected after the tray: any other notification replaces ours.
+        controller.notify.connect(self._on_controller_notify)
+
+        tray.open_settings.connect(self.open_settings)
+        tray.open_calibration.connect(self._on_tray_calibrate)
+        tray.open_preview.connect(self.open_preview)
+        tray.open_about.connect(self.open_about)
+        tray.quit_requested.connect(self.quit)
+        tray.tray.messageClicked.connect(self._on_message_clicked)
+        if self._options.background:
+            tray.mute_notifications(STARTUP_QUIET_S)
+        tray.show()
+        self._qt_app.aboutToQuit.connect(self.shutdown)
+        self._quit_hooked = True
+
+        controller.start()
+        # Windows open once the event loop runs, so the tray is already in place.
+        QTimer.singleShot(0, self, self._after_start)
+
+    def shutdown(self) -> None:
+        """Close every window, then stop tracking (releases the camera). Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._quit_hooked:
+            self._quit_hooked = False
+            with contextlib.suppress(RuntimeError, TypeError):
+                self._qt_app.aboutToQuit.disconnect(self.shutdown)
+        # Windows first, while the controller still runs: an open calibration
+        # reports its cancellation, the preview turns the preview stream off.
+        calibration, self._calibration = self._calibration, None
+        if calibration is not None:
+            with contextlib.suppress(Exception):
+                calibration.cancel()
+            calibration.deleteLater()
+        widgets: list[QWidget | None] = [
+            self._wizard,
+            self._settings_dialog,
+            self._about,
+            self._preview,
+            self._countdown,
+        ]
+        self._wizard = self._settings_dialog = self._about = self._preview = None
+        self._countdown = None
+        for widget in widgets:
+            if widget is not None:
+                _dispose_widget(widget)
+        for helper in (self._overlay, self._curtain):
+            if helper is not None:
+                with contextlib.suppress(Exception):
+                    helper.close()
+        if self._controller is not None:
+            try:
+                self._controller.shutdown()
+            except Exception:
+                log.exception("Controller shutdown failed")
+        if self._tray is not None:
+            with contextlib.suppress(Exception):
+                self._tray.dispose()
+
+    def quit(self) -> None:
+        """Leave the event loop (shutdown follows via ``aboutToQuit``)."""
+        log.info("Quit requested")
+        self._qt_app.quit()
+
+    # ----------------------------------------------------------------- commands
+    def handle_command(self, command: str) -> str:
+        """IPC entry point: :meth:`Controller.handle_command` executes it (UI
+        commands come back through ``ui_requested``)."""
+        controller = self._controller
+        if controller is None or self._closed:
+            return f"error: {APP_NAME} is starting or shutting down; try again"
+        return str(controller.handle_command(command))
+
+    def present(self) -> None:
+        """Answer a second launch or ``ctl show``: bring up whatever needs attention.
+
+        An open calibration, wizard or settings window is raised; otherwise the
+        tray menu pops up next to the tray icon. Without a system tray (e.g. GNOME
+        without an AppIndicator extension) the settings window opens instead.
+        """
+        if self._closed:
+            return
+        calibration = self._calibration
+        if calibration is not None and calibration.is_active:
+            calibration.start()  # raises the existing windows
+            return
+        for window in (self._wizard, self._settings_dialog):
+            if window is not None and window.isVisible():
+                _present(window)
+                return
+        if not self._popup_tray_menu():
+            self.open_settings()
+
+    # ------------------------------------------------------------------ windows
+    def open_settings(self) -> None:
+        """Show the settings window (a fresh one unless it is already open)."""
+        if self._closed or self._controller is None:
+            return
+        if self._wizard is not None and self._wizard.isVisible():
+            _present(self._wizard)
+            return
+        dialog = self._settings_dialog
+        if dialog is None or not dialog.isVisible():
+            from .ui.settings_dialog import SettingsDialog
+
+            if dialog is not None:
+                dialog.deleteLater()
+            dialog = SettingsDialog(self._controller)
+            dialog.calibration_requested.connect(self._on_settings_calibrate)
+            dialog.finished.connect(functools.partial(self._on_settings_closed, dialog))
+            self._settings_dialog = dialog
+        _present(dialog)
+
+    def open_calibration(self, reason: str = "user") -> None:
+        """Open the calibration on every monitor, or raise it if it is already open."""
+        if self._closed or self._controller is None:
+            return
+        window = self._calibration
+        if window is not None and window.is_active:
+            window.start()  # raises the existing windows
+            return
+        from .ui.calibration_window import CalibrationWindow
+
+        log.info("Opening the calibration (%s)", reason)
+        self._prompt_at = None
+        window = CalibrationWindow(self._controller, self)
+        window.finished.connect(functools.partial(self._on_calibration_finished, window))
+        # Assigned before start(): start() emits finished(False) at once when
+        # there is no monitor, and the slot clears this reference.
+        self._calibration = window
+        window.start()
+
+    def open_preview(self) -> None:
+        """Show the camera preview (one instance; closing only hides it)."""
+        if self._closed or self._controller is None:
+            return
+        if self._preview is None:
+            from .ui.preview import PreviewWindow
+
+            self._preview = PreviewWindow(self._controller)
+        _present(self._preview)
+
+    def open_about(self) -> None:
+        """Show the About dialog."""
+        if self._closed:
+            return
+        if self._about is None or not self._about.isVisible():
+            from .ui.about import AboutDialog
+
+            if self._about is not None:
+                self._about.deleteLater()
+            self._about = AboutDialog()
+        _present(self._about)
+
+    def open_wizard(self) -> None:
+        """Show the first-run wizard."""
+        if self._closed or self._controller is None:
+            return
+        if self._wizard is not None:
+            _present(self._wizard)
+            return
+        from .ui.wizard import FirstRunWizard
+
+        wizard = FirstRunWizard(self._controller)
+        wizard.calibration_requested.connect(self._on_wizard_calibrate)
+        wizard.finished.connect(functools.partial(self._on_wizard_finished, wizard))
+        self._wizard = wizard
+        _present(wizard)
+
+    # -------------------------------------------------------------------- slots
+    def _after_start(self) -> None:
+        controller = self._controller
+        if self._closed or controller is None:
+            return
+        if not controller.settings.general.first_run_done and not self._options.background:
+            try:
+                self.open_wizard()
+            except Exception:
+                log.exception("The first-run wizard could not be opened")
+            else:
+                return  # the wizard offers the calibration itself
+        if self._options.calibrate:
+            self.open_calibration("cli")
+        elif not self._options.background:
+            self._suggest_calibration(controller.calibration_reason)
+
+    def _on_calibration_required(self, reason: str) -> None:
+        if reason in EXPLICIT_CALIBRATION_REASONS:
+            self.open_calibration(reason)
+        else:
+            self._suggest_calibration(reason)
+
+    def _on_tray_calibrate(self) -> None:
+        self.open_calibration("tray")
+
+    def _on_settings_calibrate(self) -> None:
+        self.open_calibration("settings")
+
+    def _on_wizard_calibrate(self) -> None:
+        self.open_calibration("wizard")
+
+    def _on_calibration_finished(self, window: CalibrationWindow, saved: bool) -> None:
+        if self._calibration is window:
+            self._calibration = None
+        window.deleteLater()
+        log.info("Calibration %s", "saved" if saved else "closed without saving")
+
+    def _on_settings_closed(self, dialog: SettingsDialog, _result: int) -> None:
+        if self._settings_dialog is dialog:
+            self._settings_dialog = None
+        dialog.deleteLater()
+
+    def _on_wizard_finished(self, wizard: FirstRunWizard, _result: int) -> None:
+        if self._wizard is wizard:
+            self._wizard = None
+        wizard.deleteLater()
+        controller = self._controller
+        if self._closed or controller is None or wizard.wants_calibration:
+            return
+        # Finished (or cancelled) without calibrating: say why switching is off.
+        self._suggest_calibration(controller.calibration_reason)
+
+    def _on_settings_changed(self, settings: object) -> None:
+        if not isinstance(settings, Settings):
+            return
+        self._settings = settings
+        if not self._options.log_level_locked:
+            set_level(settings.general.log_level)
+        self._save_without_overrides(settings)
+
+    def _on_ui_requested(self, command: str) -> None:
+        if command == "show":
+            self.present()
+        elif command == "settings":
+            self.open_settings()
+        elif command == "quit":
+            QTimer.singleShot(_QUIT_DELAY_MS, self, self.quit)
+        else:
+            log.debug("Ignoring unknown UI request %r", command)
+
+    def _on_controller_notify(self, _title: str, _message: str) -> None:
+        # The tray shows one message at a time; ours has been replaced.
+        self._prompt_at = None
+
+    def _on_message_clicked(self) -> None:
+        prompt, self._prompt_at = self._prompt_at, None
+        controller = self._controller
+        if prompt is None or controller is None or controller.is_calibrated:
+            return
+        if self._clock() - prompt <= PROMPT_CLICK_WINDOW_S:
+            self.open_calibration("notification")
+
+    # ------------------------------------------------------------------ helpers
+    def _make_controller(self) -> Controller:
+        if self._controller_factory is not None:
+            return self._controller_factory(self._settings, self._services)
+        from .engine.controller import Controller
+
+        return Controller(self._settings, self._services)
+
+    def _popup_tray_menu(self) -> bool:
+        tray = self._tray
+        if tray is None or not tray.available or not tray.tray.isVisible():
+            return False
+        geometry = tray.tray.geometry()
+        # The icon may sit in an overflow area without a geometry.
+        point = geometry.center() if geometry.isValid() and geometry.width() > 0 else None
+        tray.menu.popup(point if point is not None else QCursor.pos())
+        tray.menu.activateWindow()
+        return True
+
+    def _suggest_calibration(self, reason: str) -> None:
+        """Tell the user (once per reason) that switching needs a calibration."""
+        controller = self._controller
+        if controller is None or self._tray is None or controller.is_calibrated:
+            return
+        if self._calibration is not None and self._calibration.is_active:
+            return
+        if len(controller.monitors()) < 2 or reason in self._announced:
+            return  # with one monitor there is nothing to switch between
+        self._announced.add(reason)
+        detail = f" ({reason})" if reason else ""
+        shown = self._tray.notify(
+            "Calibration needed",
+            f"Switching monitors is off until you calibrate{detail}. "
+            "Click here or choose “Calibrate now…” in the tray menu.",
+        )
+        if shown:
+            self._prompt_at = self._clock()
+
+    def _save_without_overrides(self, settings: Settings) -> None:
+        """The controller saved ``settings``; keep command-line overrides out of the file."""
+        restore = {
+            key: saved
+            for key, (saved, session) in self._overrides.items()
+            if _get_setting(settings, key) == session and saved != session
+        }
+        if not restore:
+            return
+        on_disk = settings.copy()
+        for key, value in restore.items():
+            _set_setting(on_disk, key, value)
+        try:
+            on_disk.save(paths.settings_file())
+        except OSError as exc:
+            log.warning("Could not save the settings: %s", exc)
+
+
+# ======================================================================= helpers
+def _apply_overrides(settings: Settings, args: argparse.Namespace) -> dict[str, tuple[str, str]]:
+    """Apply ``--camera`` / ``--backend`` for this session.
+
+    Returns ``{"section.field": (saved value, session value)}``.
+    """
+    overrides: dict[str, tuple[str, str]] = {}
+    for option, key in _OVERRIDABLE.items():
+        value = getattr(args, option, None)
+        if not value:
+            continue
+        value = str(value).strip()
+        saved = str(_get_setting(settings, key))
+        _set_setting(settings, key, value)
+        overrides[key] = (saved, value)
+        # Camera values can be file paths; keep them out of the log.
+        shown = value if option == "backend" else "(from the command line)"
+        log.info("Setting %s overridden for this session: %s", key, shown)
+    return overrides
+
+
+def _get_setting(settings: Settings, key: str) -> Any:
+    section, _, name = key.partition(".")
+    return getattr(getattr(settings, section), name)
+
+
+def _set_setting(settings: Settings, key: str, value: Any) -> None:
+    section, _, name = key.partition(".")
+    setattr(getattr(settings, section), name, value)
+
+
+def _configure_qt_app(qt_app: QApplication) -> None:
+    qt_app.setApplicationName(APP_NAME)
+    qt_app.setApplicationDisplayName(APP_NAME)
+    qt_app.setApplicationVersion(__version__)
+    qt_app.setOrganizationName(APP_AUTHOR)
+    # Wayland app id / .desktop association (packaging/linux/eye-tracker.desktop).
+    qt_app.setDesktopFileName(APP_SLUG)
+    # A tray app keeps running when its last window closes.
+    qt_app.setQuitOnLastWindowClosed(False)
+    try:
+        from .ui.icons import app_icon
+
+        qt_app.setWindowIcon(app_icon())
+    except Exception:
+        log.warning("Could not create the application icon", exc_info=True)
+
+
+def _present(widget: QWidget) -> None:
+    if widget.isMinimized():
+        widget.setWindowState(widget.windowState() & ~Qt.WindowState.WindowMinimized)
+    widget.show()
+    widget.raise_()
+    widget.activateWindow()
+
+
+def _dispose_widget(widget: QWidget) -> None:
+    with contextlib.suppress(Exception):
+        widget.close()
+    with contextlib.suppress(RuntimeError):
+        widget.deleteLater()
+
+
+def _noop() -> None:
+    """Timer slot that only hands control to the Python interpreter."""
+
+
+@contextlib.contextmanager
+def _quit_on_signals(request_quit: Callable[[], None]) -> Iterator[None]:
+    """Quit cleanly on Ctrl+C (and SIGTERM outside Windows) while the event loop runs.
+
+    Python runs signal handlers only between bytecodes, which never happens while
+    Qt's C++ event loop waits. A timer that calls a Python no-op hands control
+    back regularly so the handler gets a chance to run.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    wanted: list[signal.Signals] = [signal.SIGINT]
+    if sys.platform != "win32":
+        wanted.append(signal.SIGTERM)
+    previous: dict[signal.Signals, Any] = {}
+
+    def handler(signum: int, _frame: object) -> None:
+        log.info("Received signal %s; quitting", signum)
+        QTimer.singleShot(0, request_quit)
+
+    for sig in wanted:
+        try:
+            if signal.getsignal(sig) is signal.SIG_IGN:
+                continue  # e.g. started in the background by a shell, or with nohup
+            previous[sig] = signal.signal(sig, handler)
+        except (OSError, ValueError):
+            log.debug("Cannot handle signal %s", sig, exc_info=True)
+    ticker = QTimer()
+    ticker.setInterval(SIGNAL_POLL_MS)
+    ticker.timeout.connect(_noop)
+    ticker.start()
+    try:
+        yield
+    finally:
+        ticker.stop()
+        for sig, old in previous.items():
+            with contextlib.suppress(OSError, ValueError, TypeError):
+                signal.signal(sig, old)
+
+
+def _show_error(qt_app: QApplication, text: str) -> None:
+    """Tell a user without a console that startup failed (the log has details)."""
+    if qt_app.platformName() in ("offscreen", "minimal"):
+        return
+    QMessageBox.critical(None, APP_NAME, text)
+
+
+def _isatty(stream: Any) -> bool:
+    if stream is None:
+        return False
+    try:
+        return bool(stream.isatty())
+    except Exception:
+        return False

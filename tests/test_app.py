@@ -1,0 +1,583 @@
+"""Smoke tests for eye_tracker.app: the whole tray app built offscreen.
+
+``build_app`` creates the real controller and UI, but the vision worker, the
+cursor, the hotkey manager and the platform services are fakes: no camera is
+opened, no thread started, the pointer never moves, no global hotkey is
+registered and nothing is locked. Autostart is faked as well.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import signal
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import pytest
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication
+
+from eye_tracker import app as app_module
+from eye_tracker import ipc, paths
+from eye_tracker.app import AppContext, build_app, run_app
+from eye_tracker.config import Settings
+from eye_tracker.logging_setup import shutdown_logging
+from eye_tracker.platform import autostart
+from eye_tracker.platform.base import PlatformServices
+from eye_tracker.platform.hotkeys import HotkeyManager
+from eye_tracker.types import Monitor, Rect, TrackingState, WorkerStats
+from eye_tracker.ui.tray import TrayIcon
+
+TWO_MONITORS = [
+    Monitor(0, "left", Rect(0, 0, 800, 600), primary=True),
+    Monitor(1, "right", Rect(800, 0, 800, 600)),
+]
+
+
+# -------------------------------------------------------------------------- fakes
+class FakeWorker:
+    """Stands in for VisionWorker: no thread, no camera, calls are recorded."""
+
+    def __init__(self, *callbacks: Any) -> None:
+        self.callbacks = callbacks
+        self.started = False
+        self.stopped = False
+        self.active: list[bool] = []
+        self.previews: list[bool] = []
+        self.backend_info: tuple[str, str] | None = ("fake", "fake-1")
+        self.stats = WorkerStats(fps=4.0, camera_open=True)
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self, timeout: float = 3.0) -> None:
+        self.stopped = True
+
+    def set_interval(self, seconds: float) -> None:
+        pass
+
+    def set_active(self, active: bool) -> None:
+        self.active.append(active)
+
+    def set_max_faces(self, n: int) -> None:
+        pass
+
+    def set_motion_gate(self, enabled: bool, threshold: float) -> None:
+        pass
+
+    def set_preview(self, enabled: bool) -> None:
+        self.previews.append(enabled)
+
+    def reconfigure(self, source_factory: Any = None, backend_factory: Any = None) -> None:
+        pass
+
+
+class FakeCursor:
+    def __init__(self) -> None:
+        self.moves: list[tuple[int, int]] = []
+
+    def pos(self) -> tuple[int, int]:
+        return (100, 100)
+
+    def set_pos(self, x: int, y: int) -> bool:
+        self.moves.append((x, y))
+        return True
+
+
+@dataclass
+class Harness:
+    ctx: AppContext
+    workers: list[FakeWorker] = field(default_factory=list)
+    cursor: FakeCursor = field(default_factory=FakeCursor)
+
+    @property
+    def app(self) -> app_module.EyeTrackerApp:
+        assert self.ctx.app is not None
+        return self.ctx.app
+
+    @property
+    def controller(self) -> Any:
+        assert self.ctx.controller is not None
+        return self.ctx.controller
+
+    @property
+    def tray(self) -> TrayIcon:
+        assert self.app.tray is not None
+        return self.app.tray
+
+    @property
+    def worker(self) -> FakeWorker:
+        (worker,) = self.workers
+        return worker
+
+
+@pytest.fixture(autouse=True)
+def fake_autostart(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The tray, wizard and settings window read (and could change) the login item."""
+    calls: list[str] = []
+    monkeypatch.setattr(autostart, "is_supported", lambda: True)
+    monkeypatch.setattr(autostart, "is_enabled", lambda: False)
+    monkeypatch.setattr(autostart, "enable", lambda background=True: calls.append("enable"))
+    monkeypatch.setattr(autostart, "disable", lambda: calls.append("disable"))
+    return calls
+
+
+@pytest.fixture
+def build(qapp: QApplication, app_dirs: Path) -> Iterator[Callable[..., Harness]]:
+    harnesses: list[Harness] = []
+
+    def make(
+        *,
+        settings: Settings | None = None,
+        monitors: list[Monitor] | None = None,
+        controller_factory: Any = None,
+        **options: Any,
+    ) -> Harness:
+        if settings is None:
+            settings = Settings()
+            settings.general.first_run_done = True
+        settings.save(paths.settings_file())
+        workers: list[FakeWorker] = []
+        cursor = FakeCursor()
+
+        def worker_factory(*callbacks: Any) -> FakeWorker:
+            worker = FakeWorker(*callbacks)
+            workers.append(worker)
+            return worker
+
+        kwargs: dict[str, Any] = {
+            "worker_factory": worker_factory,
+            "cursor": cursor,
+            "hotkey_manager_factory": lambda: HotkeyManager(note="tests"),
+        }
+        if monitors is not None:
+            kwargs["monitors_provider"] = lambda: list(monitors)
+        args = argparse.Namespace(**{"background": True, "calibrate": False, **options})
+        ctx = build_app(
+            args,
+            platform=PlatformServices(),
+            controller_factory=controller_factory,
+            controller_kwargs=None if controller_factory else kwargs,
+        )
+        harness = Harness(ctx, workers, cursor)
+        harnesses.append(harness)
+        return harness
+
+    yield make
+    for harness in harnesses:
+        harness.ctx.shutdown()
+    shutdown_logging()
+    qapp.processEvents()
+
+
+def settle(qapp: QApplication, rounds: int = 3) -> None:
+    """Run pending zero-timeout timers and deferred deletions."""
+    for _ in range(rounds):
+        qapp.processEvents()
+
+
+# ----------------------------------------------------------------------- building
+def test_build_app_creates_and_wires_everything(
+    build: Callable[..., Harness], qapp: QApplication
+) -> None:
+    h = build()
+    ctx = h.ctx
+    assert ctx.exit_code is None
+    assert ctx.server is not None
+    assert ctx.server.is_listening
+    assert isinstance(h.app.tray, TrayIcon)
+    assert h.app.overlay is not None
+    assert h.app.countdown is not None
+    assert h.app.curtain is not None
+    assert h.worker.started
+    assert not h.worker.stopped
+    assert qapp.applicationName() == "Eye Tracker"
+    assert not qapp.quitOnLastWindowClosed()
+
+    # The command socket reaches the controller.
+    reply = ipc.send_command("status")
+    assert reply is not None
+    status = json.loads(reply)
+    assert status["state"] == TrackingState.NEEDS_CALIBRATION.value
+    assert status["calibrated"] is False
+    assert ipc.send_command("pause") == "ok"
+    assert h.controller.state is TrackingState.PAUSED
+    assert h.tray.state is TrackingState.PAUSED
+
+    settle(qapp)
+    # --background: no first-run wizard, no startup windows.
+    assert h.app.wizard is None
+    assert h.app.calibration_window is None
+    assert h.app.settings_dialog is None
+    assert h.cursor.moves == []
+
+
+def test_ui_requests_open_single_windows(
+    build: Callable[..., Harness], qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = build()
+    h.controller.ui_requested.emit("settings")
+    dialog = h.app.settings_dialog
+    assert dialog is not None
+    assert dialog.isVisible()
+    assert ipc.send_command("settings") == "ok"
+    assert h.app.settings_dialog is dialog
+
+    # "show" raises an open window instead of opening another one.
+    h.controller.ui_requested.emit("show")
+    assert h.app.settings_dialog is dialog
+    dialog.reject()
+    settle(qapp)
+    assert h.app.settings_dialog is None
+
+    # Offscreen there is no system tray: "show" falls back to the settings.
+    h.controller.ui_requested.emit("show")
+    assert h.app.settings_dialog is not None
+    h.app.settings_dialog.reject()
+    settle(qapp)
+
+    # With a tray, "show" pops up the tray menu instead.
+    monkeypatch.setattr(TrayIcon, "available", property(lambda self: True))
+    monkeypatch.setattr(h.tray.tray, "isVisible", lambda: True)
+    h.controller.ui_requested.emit("show")
+    assert h.tray.menu.isVisible()
+    assert h.app.settings_dialog is None
+    h.tray.menu.hide()
+
+    h.tray.open_about.emit()
+    assert h.app._about is not None
+    assert h.app._about.isVisible()
+    h.tray.open_preview.emit()
+    preview = h.app.preview
+    assert preview is not None
+    assert preview.isVisible()
+    assert h.worker.previews[-1] is True
+    h.tray.open_preview.emit()
+    assert h.app.preview is preview
+    preview.close()
+    assert h.worker.previews[-1] is False
+
+
+def test_calibration_opens_once(build: Callable[..., Harness], qapp: QApplication) -> None:
+    h = build()
+    h.controller.calibration_required.emit("hotkey")
+    window = h.app.calibration_window
+    assert window is not None
+    assert window.is_active
+    assert h.controller.state is TrackingState.CALIBRATING
+
+    h.controller.calibration_required.emit("ipc")
+    h.tray.open_calibration.emit()
+    assert ipc.send_command("calibrate") == "ok"
+    assert h.app.calibration_window is window
+
+    window.cancel()
+    settle(qapp)
+    assert h.app.calibration_window is None
+    assert h.controller.state is TrackingState.NEEDS_CALIBRATION
+
+    h.tray.open_calibration.emit()
+    second = h.app.calibration_window
+    assert second is not None
+    assert second is not window
+    assert second.is_active
+
+
+def test_automatic_calibration_reasons_only_notify(
+    build: Callable[..., Harness], qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = build(monitors=TWO_MONITORS)
+    shown: list[tuple[str, str]] = []
+
+    def notify(title: str, message: str, **kwargs: Any) -> bool:
+        shown.append((title, message))
+        return True
+
+    monkeypatch.setattr(h.tray, "notify", notify)
+    h.controller.calibration_required.emit("the monitor layout changed")
+    h.controller.calibration_required.emit("the monitor layout changed")
+    assert h.app.calibration_window is None
+    assert len(shown) == 1
+    assert shown[0][0] == "Calibration needed"
+    assert "the monitor layout changed" in shown[0][1]
+
+    # Another notification replaced ours: clicking it must not calibrate.
+    h.controller.calibration_required.emit("another reason")
+    h.controller.notify.emit("Camera", "Camera unavailable")
+    h.tray.tray.messageClicked.emit()
+    assert h.app.calibration_window is None
+
+    h.controller.calibration_required.emit("a third reason")
+    h.tray.tray.messageClicked.emit()
+    window = h.app.calibration_window
+    assert window is not None
+    assert window.is_active
+
+
+def test_single_monitor_gets_no_calibration_nag(
+    build: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = build(monitors=TWO_MONITORS[:1])
+    shown: list[str] = []
+
+    def notify(title: str, message: str, **kwargs: Any) -> bool:
+        shown.append(title)
+        return True
+
+    monkeypatch.setattr(h.tray, "notify", notify)
+    h.controller.calibration_required.emit("the monitor layout changed")
+    assert shown == []
+
+
+def test_helpers_follow_the_controller(build: Callable[..., Harness]) -> None:
+    h = build()
+    curtain, countdown, overlay = h.app.curtain, h.app.countdown, h.app.overlay
+    assert curtain is not None
+    assert countdown is not None
+    assert overlay is not None
+
+    h.controller.guard_changed.emit(True)
+    assert curtain.is_showing
+    h.controller.guard_changed.emit(False)
+    assert not curtain.is_showing
+
+    h.controller.away_warning.emit(8.0)
+    assert countdown.active
+    assert countdown.isVisible()
+    h.controller.away_cancelled.emit()
+    assert not countdown.active
+
+    assert not overlay.enabled
+    updated = h.controller.settings.copy()
+    updated.ui.show_gaze_overlay = True
+    h.controller.apply_settings(updated)
+    assert overlay.enabled
+    assert Settings.load(paths.settings_file()).ui.show_gaze_overlay
+
+
+def test_first_run_wizard_then_calibration(
+    build: Callable[..., Harness], qapp: QApplication, fake_autostart: list[str]
+) -> None:
+    h = build(settings=Settings(), background=False)
+    settle(qapp)
+    wizard = h.app.wizard
+    assert wizard is not None
+    assert wizard.isVisible()
+
+    # While the wizard is open, "settings" raises the wizard.
+    h.controller.ui_requested.emit("settings")
+    assert h.app.settings_dialog is None
+
+    wizard.accept()  # "Calibrate now" is ticked by default
+    settle(qapp)
+    assert h.app.wizard is None
+    assert h.controller.settings.general.first_run_done
+    assert Settings.load(paths.settings_file()).general.first_run_done
+    window = h.app.calibration_window
+    assert window is not None
+    assert window.is_active
+    assert fake_autostart == []  # "Start at login" was left unticked
+
+
+def test_background_start_skips_the_wizard(
+    build: Callable[..., Harness], qapp: QApplication
+) -> None:
+    h = build(settings=Settings(), background=True)
+    settle(qapp)
+    assert h.app.wizard is None
+
+
+def test_calibrate_option_opens_the_calibration(
+    build: Callable[..., Harness], qapp: QApplication
+) -> None:
+    h = build(calibrate=True)
+    assert h.app.calibration_window is None  # opens once the event loop runs
+    settle(qapp)
+    window = h.app.calibration_window
+    assert window is not None
+    assert window.is_active
+
+
+def test_second_instance_hands_over_and_exits(
+    build: Callable[..., Harness], qapp: QApplication
+) -> None:
+    first = build()
+    second = build()
+    assert second.ctx.exit_code == 0
+    assert second.ctx.app is None
+    assert second.workers == []
+    # The first instance was asked to show itself (no tray offscreen: settings).
+    assert first.app.settings_dialog is not None
+
+    third = build(calibrate=True)
+    assert third.ctx.exit_code == 0
+    assert first.app.calibration_window is not None
+    assert third.ctx.exec() == 0
+
+    # run_app returns the hand-over result without entering the event loop.
+    assert run_app(argparse.Namespace(background=True)) == 0
+
+
+def test_session_overrides_stay_out_of_the_settings_file(
+    build: Callable[..., Harness],
+) -> None:
+    h = build(camera="clip.mp4", backend="opencv")
+    assert h.controller.settings.camera.device == "clip.mp4"
+    assert h.controller.settings.general.backend == "opencv"
+    updated = h.controller.settings.copy()
+    updated.general.notifications = False
+    h.controller.apply_settings(updated)
+    on_disk = Settings.load(paths.settings_file())
+    assert on_disk.general.notifications is False
+    assert on_disk.camera.device == "0"
+    assert on_disk.general.backend == "auto"
+
+    # A value the user picks explicitly is saved.
+    updated = h.controller.settings.copy()
+    updated.camera.device = "1"
+    h.controller.apply_settings(updated)
+    assert Settings.load(paths.settings_file()).camera.device == "1"
+
+
+def test_log_level_follows_settings_unless_given(build: Callable[..., Harness]) -> None:
+    settings = Settings()
+    settings.general.first_run_done = True
+    settings.general.log_level = "DEBUG"
+    h = build(settings=settings)
+    root = logging.getLogger()
+    assert root.level == logging.DEBUG
+    updated = h.controller.settings.copy()
+    updated.general.log_level = "WARNING"
+    h.controller.apply_settings(updated)
+    assert root.level == logging.WARNING
+    h.ctx.shutdown()
+
+    locked = build(settings=settings, log_level="ERROR")
+    assert root.level == logging.ERROR
+    updated = locked.controller.settings.copy()
+    updated.general.log_level = "INFO"
+    locked.controller.apply_settings(updated)
+    assert root.level == logging.ERROR
+    assert paths.log_file().is_file()
+
+
+def test_shutdown_is_clean_and_idempotent(
+    build: Callable[..., Harness], qapp: QApplication
+) -> None:
+    h = build()
+    h.app.open_settings()
+    h.app.open_about()
+    h.app.open_preview()
+    h.app.open_calibration()
+    h.controller.guard_changed.emit(True)
+    h.controller.away_warning.emit(5.0)
+    assert h.controller.state is TrackingState.CALIBRATING
+
+    h.ctx.shutdown()
+    assert h.app.closed
+    assert h.worker.stopped
+    assert h.ctx.server is not None
+    assert not h.ctx.server.is_listening
+    assert not ipc.is_running()
+    assert h.app.settings_dialog is None
+    assert h.app.calibration_window is None
+    assert h.app.preview is None
+    assert h.app.curtain is not None
+    assert not h.app.curtain.is_showing
+    assert not h.tray.tray.isVisible()
+    # The open calibration was cancelled before the controller stopped.
+    assert h.controller.state is not TrackingState.CALIBRATING
+    assert h.app.handle_command("status").startswith("error:")
+
+    h.ctx.shutdown()  # idempotent
+    h.app.open_settings()  # ignored after shutdown
+    assert h.app.settings_dialog is None
+    settle(qapp)
+
+
+def test_startup_failure_returns_an_error(
+    build: Callable[..., Harness], qapp: QApplication
+) -> None:
+    def broken(settings: Settings, services: PlatformServices) -> Any:
+        raise RuntimeError("no controller today")
+
+    h = build(controller_factory=broken)
+    assert h.ctx.exit_code == 1
+    assert h.ctx.app is None
+    assert h.ctx.exec() == 1
+    assert not ipc.is_running()
+
+
+# -------------------------------------------------------------------- event loop
+def _run_with_safety_net(qapp: QApplication, ctx: AppContext, action: Callable[[], None]) -> int:
+    safety = QTimer()
+    safety.setSingleShot(True)
+    safety.timeout.connect(lambda: qapp.exit(99))
+    safety.start(10_000)
+    QTimer.singleShot(20, action)
+    try:
+        return ctx.exec()
+    finally:
+        safety.stop()
+
+
+def test_exec_quits_on_ipc_quit(build: Callable[..., Harness], qapp: QApplication) -> None:
+    h = build()
+    replies: list[str | None] = []
+    code = _run_with_safety_net(qapp, h.ctx, lambda: replies.append(ipc.send_command("quit")))
+    assert code == 0
+    assert replies == ["ok"]
+    assert h.app.closed
+    assert h.worker.stopped
+    assert not ipc.is_running()
+
+
+def test_exec_quits_on_tray_quit(build: Callable[..., Harness], qapp: QApplication) -> None:
+    h = build()
+    code = _run_with_safety_net(qapp, h.ctx, h.tray.quit_requested.emit)
+    assert code == 0
+    assert h.app.closed
+
+
+sigint_ignored = pytest.mark.skipif(
+    signal.getsignal(signal.SIGINT) is signal.SIG_IGN,
+    reason="SIGINT is ignored in this process (started in the background)",
+)
+
+
+@sigint_ignored
+def test_exec_quits_on_ctrl_c(build: Callable[..., Harness], qapp: QApplication) -> None:
+    h = build()
+    before = signal.getsignal(signal.SIGINT)
+    code = _run_with_safety_net(qapp, h.ctx, lambda: signal.raise_signal(signal.SIGINT))
+    assert code == 0
+    assert h.app.closed
+    assert signal.getsignal(signal.SIGINT) is before
+
+
+@sigint_ignored
+def test_signal_handler_is_installed_only_inside_the_block(qapp: QApplication) -> None:
+    before = signal.getsignal(signal.SIGINT)
+    requested: list[bool] = []
+    with app_module._quit_on_signals(lambda: requested.append(True)):
+        handler = signal.getsignal(signal.SIGINT)
+        assert handler is not before
+        assert callable(handler)
+        handler(signal.SIGINT, None)
+        assert requested == []  # deferred to the event loop
+        qapp.processEvents()
+        assert requested == [True]
+    assert signal.getsignal(signal.SIGINT) is before
+
+
+def test_ignored_signals_stay_ignored(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> None:
+    installed: list[Any] = []
+    monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_IGN)
+    monkeypatch.setattr(signal, "signal", lambda sig, handler: installed.append(handler))
+    with app_module._quit_on_signals(lambda: None):
+        pass
+    assert installed == []

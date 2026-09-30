@@ -16,7 +16,7 @@ import sys
 import threading
 import types
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -86,7 +86,7 @@ def hk(text: str) -> Hotkey:
         ("ctrl+alt+/", "ctrl+alt+slash"),
         ("ctrl+alt+comma", "ctrl+alt+comma"),
         ("shift+f5", "shift+f5"),  # Shift alone is fine for non-typing keys
-        ("shift+pageup", "shift+pageup"),
+        ("shift+escape", "shift+escape"),
         ("⌃⌥P", "ctrl+alt+p"),
         ("⌃⌥⇧⌘F24", "ctrl+alt+shift+meta+f24"),
         ("⌘⇧G", "shift+meta+g"),
@@ -161,6 +161,15 @@ def test_duplicate_modifiers_are_merged() -> None:
         "shift+tab",
         "shift+enter",
         "shift+/",
+        # Shift+navigation extends selections (and scrolls terminals) everywhere.
+        "shift+left",
+        "shift+right",
+        "shift+up",
+        "shift+down",
+        "shift+home",
+        "shift+end",
+        "shift+pageup",
+        "shift+pagedown",
     ],
 )
 def test_parse_invalid_raises(text: str) -> None:
@@ -195,12 +204,57 @@ def test_str_is_canonical_and_round_trips() -> None:
     assert parse_hotkey(str(parsed)) == parsed
 
 
-def test_default_settings_hotkeys_parse() -> None:
+@pytest.mark.parametrize(
+    ("platform", "modifiers"),
+    [
+        # Windows: Ctrl+Alt is AltGr, so the Win key keeps the defaults from typing.
+        ("win32", {"ctrl", "alt", "meta"}),
+        # Linux: Ctrl+Alt+T opens a terminal; Ctrl+Alt+Shift is free and never types.
+        ("linux", {"ctrl", "alt", "shift"}),
+        ("freebsd14", {"ctrl", "alt", "shift"}),
+        ("darwin", {"ctrl", "alt"}),
+    ],
+)
+def test_default_settings_hotkeys_per_platform(
+    monkeypatch: pytest.MonkeyPatch, platform: str, modifiers: set[str]
+) -> None:
+    from eye_tracker.config import HotkeySettings, Settings
+
+    monkeypatch.setattr(sys, "platform", platform)
+    defaults = HotkeySettings()
+    parsed = [
+        parse_hotkey(text)
+        for text in (defaults.toggle_tracking, defaults.toggle_privacy, defaults.recalibrate)
+    ]
+    assert [p.key for p in parsed] == ["t", "p", "c"]
+    assert all(p.modifiers == frozenset(modifiers) for p in parsed)
+    assert Settings().hotkeys == defaults
+    # Loading a file that lacks the hotkeys keeps the platform defaults.
+    assert Settings.from_dict({"hotkeys": {"enabled": True}}).hotkeys == defaults
+
+
+def test_windows_defaults_never_collide_with_altgr(monkeypatch: pytest.MonkeyPatch) -> None:
     from eye_tracker.config import HotkeySettings
 
+    monkeypatch.setattr(sys, "platform", "win32")
     defaults = HotkeySettings()
+    probe = FakeLayoutProbe(everything="x")  # a layout on which every AltGr key types
     for text in (defaults.toggle_tracking, defaults.toggle_privacy, defaults.recalibrate):
-        assert parse_hotkey(text).modifiers == frozenset({"ctrl", "alt"})
+        hotkey = parse_hotkey(text)
+        vk = hotkeys._win_virtual_key(hotkey.key)
+        assert vk is not None
+        assert hotkeys._win_altgr_conflict(hotkey, vk, probe) is None, text
+    assert probe.queries == []  # never even asked: Win+AltGr is not a typing chord
+
+
+def test_linux_defaults_avoid_desktop_shortcuts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from eye_tracker.config import HotkeySettings
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    defaults = HotkeySettings()
+    taken = {parse_hotkey("ctrl+alt+t")} | {parse_hotkey(f"ctrl+alt+f{n}") for n in range(1, 13)}
+    for text in (defaults.toggle_tracking, defaults.toggle_privacy, defaults.recalibrate):
+        assert parse_hotkey(text) not in taken
 
 
 def test_key_table_is_complete() -> None:
@@ -354,16 +408,224 @@ def test_windows_virtual_key_table() -> None:
 def test_windows_virtual_key_prefers_active_layout_for_punctuation() -> None:
     # Unshifted mapping from the layout wins …
     assert hotkeys._win_virtual_key("period", lambda ch: 0xBF) == 0xBF
-    # … a mapping that needs Shift/AltGr, or none at all, falls back to the US table.
-    assert hotkeys._win_virtual_key("period", lambda ch: 0x0137) == 0xBE
+    # … a character the layout only types with Shift/AltGr has no key of its own:
+    # the US virtual key would be another key (Turkish Q: 0xDB is 'ğ', not '[').
+    assert hotkeys._win_virtual_key("period", lambda ch: 0x0137) is None
+    assert hotkeys._win_virtual_key("bracketleft", lambda ch: 0x0638) is None  # AltGr+8
+    # A character missing from the layout (Cyrillic) falls back to the US position …
     assert hotkeys._win_virtual_key("period", lambda ch: -1) == 0xBE
+    assert hotkeys._win_virtual_key("period", lambda ch: -1, lambda vk: 0x34) == 0xBE
+    # … unless no physical key produces that virtual key on this layout.
+    assert hotkeys._win_virtual_key("equal", lambda ch: -1, lambda vk: 0) is None
+    # A failing layout query is treated like "not on the layout".
+    assert hotkeys._win_virtual_key("period", _raise_os_error, lambda vk: 0x34) == 0xBE
     # Letters never consult the layout.
-    assert hotkeys._win_virtual_key("q", lambda ch: 0x99) == ord("Q")
+    assert hotkeys._win_virtual_key("q", lambda ch: 0x99, lambda vk: 0) == ord("Q")
+
+
+def _raise_os_error(*_args: Any) -> int:
+    raise OSError("layout query failed")
 
 
 def test_windows_modifier_mask() -> None:
     assert hotkeys._win_modifiers({"ctrl", "alt"}) == 0x0003
     assert hotkeys._win_modifiers({"shift", "meta"}) == 0x000C
+
+
+# ================================================== Windows AltGr (Ctrl+Alt) collisions
+TURKISH_Q, POLISH_PROGRAMMERS, US = 0x041F041F, 0x04150415, 0x04090409
+VK_T, VK_P, VK_C, VK_A, VK_8, VK_OEM_1 = 0x54, 0x50, 0x43, 0x41, 0x38, 0xBA
+
+# What AltGr(+Shift) types, as read from the layout DLL tables (kbdtuq.dll,
+# kbdpl1.dll) and confirmed with ToUnicodeEx on an installed Turkish Q layout.
+LAYOUT_TABLES: dict[int, dict[tuple[int, bool], tuple[str, bool]]] = {
+    TURKISH_Q: {
+        (VK_T, False): ("₺", False),
+        (VK_8, False): ("[", False),
+        (VK_A, True): ("Æ", False),
+        (VK_OEM_1, False): ("´", True),  # dead key
+    },
+    POLISH_PROGRAMMERS: {(VK_C, False): ("ć", False), (VK_C, True): ("Ć", False)},
+    US: {},
+}
+
+
+class FakeLayoutProbe:
+    """Installed keyboard layouts as data (the real probe asks user32)."""
+
+    NAMES: ClassVar[dict[int, str]] = {
+        TURKISH_Q: "Turkish Q",
+        POLISH_PROGRAMMERS: "Polish (Programmers)",
+        US: "US",
+    }
+
+    def __init__(
+        self,
+        tables: dict[int, dict[tuple[int, bool], tuple[str, bool]]] | None = None,
+        everything: str | None = None,
+    ) -> None:
+        self.tables = tables if tables is not None else {US: {}}
+        self.everything = everything
+        self.queries: list[tuple[int, bool, int]] = []
+
+    def layouts(self) -> list[int]:
+        return list(self.tables)
+
+    def altgr_text(self, vk: int, shift: bool, hkl: int) -> tuple[str, bool] | None:
+        self.queries.append((vk, shift, hkl))
+        if self.everything is not None:
+            return self.everything, False
+        return self.tables[hkl].get((vk, shift))
+
+    def layout_name(self, hkl: int) -> str:
+        return self.NAMES.get(hkl, hex(hkl))
+
+
+def altgr_conflict(text: str, probe: FakeLayoutProbe) -> str | None:
+    hotkey = parse_hotkey(text)
+    vk = hotkeys._win_virtual_key(hotkey.key)
+    assert vk is not None
+    return hotkeys._win_altgr_conflict(hotkey, vk, probe)
+
+
+def test_altgr_conflict_catches_the_old_defaults() -> None:
+    probe = FakeLayoutProbe(LAYOUT_TABLES)
+    assert altgr_conflict("ctrl+alt+t", probe) == (
+        "Ctrl+Alt+T is AltGr+T, which types '₺' on the Turkish Q keyboard layout"
+    )
+    assert altgr_conflict("ctrl+alt+c", probe) == (
+        "Ctrl+Alt+C is AltGr+C, which types 'ć' on the Polish (Programmers) keyboard layout"
+    )
+    assert altgr_conflict("ctrl+alt+p", probe) is None  # nothing on these three layouts
+    # Every installed layout is asked, because RegisterHotKey fires on any of them.
+    assert {hkl for _vk, _shift, hkl in probe.queries} == set(LAYOUT_TABLES)
+
+
+def test_altgr_conflict_with_shift_and_dead_keys() -> None:
+    probe = FakeLayoutProbe(LAYOUT_TABLES)
+    message = altgr_conflict("ctrl+alt+shift+c", probe)
+    assert message is not None
+    assert "AltGr+Shift+C" in message
+    assert "'Ć'" in message
+    assert all(shift for _vk, shift, _hkl in probe.queries)
+    message = altgr_conflict("ctrl+alt+8", probe)
+    assert message is not None
+    assert "'['" in message
+    dead = hotkeys._win_altgr_conflict(parse_hotkey("ctrl+alt+semicolon"), VK_OEM_1, probe)
+    assert dead is not None
+    assert "the dead key '´'" in dead
+
+
+@pytest.mark.parametrize(
+    "text", ["alt+t", "ctrl+t", "ctrl+shift+t", "ctrl+alt+meta+t", "alt+shift+meta+c"]
+)
+def test_altgr_conflict_only_checks_ctrl_alt_without_win(text: str) -> None:
+    probe = FakeLayoutProbe(everything="x")
+    assert altgr_conflict(text, probe) is None
+    assert probe.queries == []
+
+
+def test_altgr_conflict_function_keys_never_type() -> None:
+    probe = FakeLayoutProbe(LAYOUT_TABLES)
+    assert altgr_conflict("ctrl+alt+f9", probe) is None
+    assert altgr_conflict("ctrl+alt+shift+f24", probe) is None
+
+
+def test_windows_manager_layout_conflict_uses_probe() -> None:
+    manager = WindowsHotkeyManager(layout_probe=FakeLayoutProbe(LAYOUT_TABLES))
+    conflict = manager.layout_conflict("ctrl+alt+t")
+    assert conflict is not None
+    assert "Turkish Q" in conflict
+    assert manager.layout_conflict(parse_hotkey("ctrl+alt+meta+t")) is None
+    with pytest.raises(ValueError, match="unsupported key"):
+        manager.layout_conflict("ctrl+alt+nosuchkey")
+
+    class BrokenProbe(FakeLayoutProbe):
+        def layouts(self) -> list[int]:
+            raise OSError("user32 is gone")
+
+    # Advisory only: a failing query never breaks the caller.
+    assert WindowsHotkeyManager(layout_probe=BrokenProbe()).layout_conflict("ctrl+alt+t") is None
+
+
+def test_base_manager_layout_conflict() -> None:
+    manager = HotkeyManager()
+    assert manager.layout_conflict("ctrl+alt+t") is None
+    with pytest.raises(ValueError, match="needs a key"):
+        manager.layout_conflict("ctrl+alt")
+
+
+class FakeUser32:
+    """Just enough of :class:`hotkeys._Win32Api` for :class:`hotkeys._Win32LayoutProbe`."""
+
+    def __init__(self, results: dict[tuple[int, int, bool], tuple[int, str]]) -> None:
+        import ctypes
+
+        self.HKL = ctypes.c_void_p
+        self.c_ubyte = ctypes.c_ubyte
+        self.create_unicode_buffer = ctypes.create_unicode_buffer
+        self.results = results  # (hkl, vk, shift) → (ToUnicodeEx result, buffer text)
+        self.flags: list[int] = []
+        self.hkls = [TURKISH_Q, US]
+
+    def GetKeyboardLayoutList(self, count: int, handles: Any) -> int:
+        if not count:
+            return len(self.hkls)
+        for index, hkl in enumerate(self.hkls[:count]):
+            handles[index] = hkl
+        return min(count, len(self.hkls))
+
+    def MapVirtualKeyExW(self, vk: int, kind: int, hkl: int) -> int:
+        assert kind == 0  # MAPVK_VK_TO_VSC
+        return 0 if vk == 0xFF else 0x14
+
+    def ToUnicodeEx(
+        self, vk: int, scan: int, state: Any, buf: Any, size: int, flags: int, hkl: int
+    ) -> int:
+        self.flags.append(flags)
+        assert scan == 0x14
+        assert size == len(buf)
+        for held in (0x11, 0xA2, 0x12, 0xA5):  # VK_CONTROL, VK_LCONTROL, VK_MENU, VK_RMENU
+            assert state[held] == 0x80
+        shift = state[0x10] == 0x80
+        assert (state[0xA0] == 0x80) is shift
+        count, text = self.results.get((hkl, vk, shift), (0, ""))
+        for index, char in enumerate(text):
+            buf[index] = char
+        return count
+
+    def GetLocaleInfoW(self, lcid: int, kind: int, buf: Any, size: int) -> int:
+        assert kind == 0x72  # LOCALE_SENGLISHDISPLAYNAME
+        if lcid != 0x041F:
+            return 0
+        buf.value = "Turkish (Türkiye)"
+        return len(buf.value) + 1
+
+
+def test_win32_layout_probe_queries(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = FakeUser32(
+        {
+            (TURKISH_Q, VK_T, False): (1, "₺"),
+            (TURKISH_Q, VK_OEM_1, False): (-1, "´"),
+            (TURKISH_Q, 0x0D, False): (1, "\r"),  # control characters are not typing
+            (TURKISH_Q, VK_A, True): (1, "Æ"),
+        }
+    )
+    probe = hotkeys._Win32LayoutProbe(api)  # type: ignore[arg-type]
+    assert probe.layouts() == [TURKISH_Q, US]
+    assert probe.altgr_text(VK_T, False, TURKISH_Q) == ("₺", False)
+    assert probe.altgr_text(VK_T, False, US) is None
+    assert probe.altgr_text(VK_OEM_1, False, TURKISH_Q) == ("´", True)
+    assert probe.altgr_text(0x0D, False, TURKISH_Q) is None
+    assert probe.altgr_text(VK_A, True, TURKISH_Q) == ("Æ", False)
+    assert probe.altgr_text(0xFF, False, TURKISH_Q) is None  # no key makes this VK
+    # Flag 0x4: the query never changes the keyboard state (no dead key is armed).
+    assert set(api.flags) == {0x4}
+    monkeypatch.setattr(hotkeys, "_win_layout_text", lambda hkl: None)
+    assert probe.layout_name(TURKISH_Q) == "Turkish (Türkiye)"
+    assert probe.layout_name(0x12345678) == "0x12345678"
+    monkeypatch.setattr(hotkeys, "_win_layout_text", lambda hkl: "Turkish Q")
+    assert probe.layout_name(TURKISH_Q) == "Turkish Q"
 
 
 # ======================================================== generic threaded machinery
@@ -377,6 +639,7 @@ class LoopbackManager(hotkeys._ThreadedHotkeyManager):
         self._wake_event = threading.Event()
         self.os_registered: dict[int, Hotkey] = {}
         self.taken: set[Hotkey] = set()
+        self.reasons: dict[Hotkey, str] = {}  # taken combos that explain themselves
         self.native_threads: set[str] = set()
         self.block: threading.Event | None = None
 
@@ -406,6 +669,8 @@ class LoopbackManager(hotkeys._ThreadedHotkeyManager):
         self.native_threads.add(threading.current_thread().name)
         if self.block is not None:
             self.block.wait(1.0)
+        if binding.hotkey in self.reasons:
+            return self._reject(binding, self.reasons[binding.hotkey])
         if binding.hotkey in self.taken:
             return False
         self.os_registered[binding.id] = binding.hotkey
@@ -456,6 +721,42 @@ def test_os_rejection_leaves_no_trace(loopback: LoopbackManager) -> None:
     assert not loopback.register("t", COMBO, lambda: None)
     assert loopback.registered == {}
     assert loopback._by_id == {}
+
+
+def test_last_error_explains_failures(
+    loopback: LoopbackManager, caplog: pytest.LogCaptureFixture
+) -> None:
+    assert loopback.last_error("t") is None  # never registered
+    assert not loopback.register("t", "ctrl+alt+nosuchkey", lambda: None)
+    error = loopback.last_error("t")
+    assert error is not None
+    assert "unsupported key" in error
+    # A native hook that explains itself (e.g. an AltGr collision) wins …
+    reason = "Ctrl+Alt+T is AltGr+T, which types '₺' on the Turkish Q keyboard layout"
+    loopback.reasons[parse_hotkey("ctrl+alt+t")] = reason
+    with caplog.at_level(logging.WARNING, logger="eye_tracker.platform.hotkeys"):
+        assert not loopback.register("t", "ctrl+alt+t", lambda: None)
+    assert loopback.last_error("t") == reason
+    assert reason in caplog.text
+    # … otherwise a generic message is recorded.
+    loopback.taken.add(parse_hotkey(COMBO))
+    assert not loopback.register("t", COMBO, lambda: None)
+    assert loopback.last_error("t") == "Ctrl+Alt+Shift+F24 could not be registered"
+    # A clash inside this manager names the other action.
+    assert loopback.register("a", COMBO_2, lambda: None)
+    assert not loopback.register("b", COMBO_2, lambda: None)
+    assert loopback.last_error("b") == "Ctrl+Alt+Shift+F21 is already used for a"
+    # Success clears the error.
+    assert loopback.register("t", "ctrl+alt+shift+f20", lambda: None)
+    assert loopback.last_error("t") is None
+    assert loopback.last_error("a") is None
+
+
+def test_unsupported_manager_last_error() -> None:
+    manager = HotkeyManager(note="Wayland does not allow global hotkeys.")
+    assert not manager.register("t", COMBO, lambda: None)
+    assert manager.last_error("t") == "Wayland does not allow global hotkeys."
+    assert not HotkeyManager().register("t", COMBO, lambda: None)
 
 
 def test_invalid_register_arguments(loopback: LoopbackManager) -> None:
@@ -532,16 +833,92 @@ def test_dispatch_ignores_unknown_ids(loopback: LoopbackManager) -> None:
 
 
 # ============================================================================== macOS
+def _mac_layout(**overrides: str) -> dict[int, str]:
+    """A Mac layout's base layer ``{keycode: char}``: US plus ``overrides`` by US key name."""
+    layout = {code: char for char, code in hotkeys._MAC_ANSI_CHARS.items()}
+    for key, char in overrides.items():
+        layout[hotkeys._MAC_KEYCODES[key]] = char
+    return layout
+
+
+def _without(layout: dict[int, str], *chars: str) -> dict[int, str]:
+    return {code: char for code, char in layout.items() if char not in chars}
+
+
+MAC_US = _mac_layout()
+# French AZERTY: A/Q, Z/W and M swapped around; the number row types &é"'(§è!çà.
+MAC_AZERTY = _mac_layout(
+    a="q", q="a", w="z", z="w", semicolon="m", m=",", comma=";", period=":", slash="=",
+    **{"1": "&", "2": "é", "3": '"', "4": "'", "5": "(", "6": "§", "7": "è", "8": "!",
+       "9": "ç", "0": "à"},
+    minus=")", equal="-", bracketleft="^", bracketright="$", quote="ù", backslash="`", grave="<",
+)  # fmt: skip
+# Dvorak: the default ⌃⌥T/P/C sit on the keys at the US K, R and I positions.
+MAC_DVORAK = _mac_layout(
+    q="'", w=",", e=".", r="p", t="y", y="f", u="g", i="c", o="r", p="l", bracketleft="/",
+    bracketright="=", s="o", d="e", f="u", g="i", h="d", j="h", k="t", l="n", semicolon="s",
+    quote="-", z=";", x="q", c="j", v="k", b="x", n="b", comma="w", period="v", slash="z",
+    equal="]", minus="[",
+)  # fmt: skip
+# Russian: Cyrillic letters, so Latin shortcuts come from the ASCII-capable layout.
+MAC_RUSSIAN = _mac_layout(
+    a="ф", s="ы", d="в", f="а", t="е", p="з", c="с", k="л", comma="б", period="ю", slash="."
+)
+
+
 class FakeCarbon:
     """Stand-in for the ctypes Carbon binding."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        layout: dict[int, str] | None = None,
+        ascii_layout: dict[int, str] | None = None,
+        modified: dict[int, dict[int, str]] | None = None,
+    ) -> None:
         self.handler: Callable[[Any], int] | None = None
         self.install_calls = 0
         self.removed: list[Any] = []
         self.registered: dict[str, tuple[int, int, int, int]] = {}
         self.reject: dict[tuple[int, int], int] = {}
         self._next = 0
+        # Keyboard layout: base layer of the current / ASCII-capable layout and the
+        # layers typed with Option(+Shift), keyed by Carbon modifier mask.
+        self.layout = layout
+        self.ascii_layout = ascii_layout if ascii_layout is not None else layout
+        self.modified = modified or {}
+        self.layout_callback: Callable[[], None] | None = None
+        self.stopped_observing = 0
+
+    def layout_characters(
+        self, modifiers: int = 0, *, ascii_capable: bool = False
+    ) -> dict[int, str] | None:
+        if modifiers:
+            return self.modified.get(modifiers, {})
+        return self.ascii_layout if ascii_capable else self.layout
+
+    def observe_layout_changes(self, callback: Callable[[], None]) -> bool:
+        self.layout_callback = callback
+        return True
+
+    def stop_observing_layout_changes(self) -> None:
+        self.layout_callback = None
+        self.stopped_observing += 1
+
+    def switch_layout(
+        self, layout: dict[int, str], ascii_layout: dict[int, str] | None = None
+    ) -> None:
+        self.layout = layout
+        self.ascii_layout = ascii_layout if ascii_layout is not None else layout
+        assert self.layout_callback is not None
+        self.layout_callback()
+
+    def keycode_for(self, hotkey_id: int) -> int | None:
+        """Key code at which Carbon currently holds the hot key ``hotkey_id``."""
+        codes = [
+            code for code, _mods, _sig, hk_id in self.registered.values() if hk_id == hotkey_id
+        ]
+        assert len(codes) <= 1
+        return codes[0] if codes else None
 
     def install_handler(self, handler: Callable[[Any], int]) -> tuple[int, Any]:
         self.install_calls += 1
@@ -632,8 +1009,172 @@ def test_mac_double_registration_and_rebinding(mac: MacHotkeyManager, carbon: Fa
 def test_mac_rejections(mac: MacHotkeyManager, carbon: FakeCarbon) -> None:
     carbon.reject[(0x23, 0x1800)] = -9878  # eventHotKeyExistsErr
     assert not mac.register("t", "ctrl+alt+p", lambda: None)
+    # Registered exclusively, so this means another application owns it.
+    assert mac.last_error("t") == "⌃⌥P is already in use by another application"
     assert not mac.register("t", "ctrl+alt+f24", lambda: None)  # no F24 on a Mac
+    assert mac.last_error("t") == "⌃⌥F24: Mac keyboards have no F24"
+    carbon.reject[(0x23, 0x1800)] = -50
+    assert not mac.register("t", "ctrl+alt+p", lambda: None)
+    assert mac.last_error("t") == "RegisterEventHotKey(⌃⌥P) failed (OSStatus -50)"
     assert mac.registered == {}
+
+
+def mac_keycode(mac: MacHotkeyManager, carbon: FakeCarbon, name: str) -> int | None:
+    return carbon.keycode_for(mac._bindings[name].id)
+
+
+def test_mac_letters_follow_the_keyboard_layout() -> None:
+    carbon = FakeCarbon(MAC_AZERTY)
+    mac = MacHotkeyManager(carbon=carbon)
+    try:
+        for name, text in [("a", "ctrl+alt+a"), ("m", "ctrl+alt+m"), ("comma", "ctrl+alt+,")]:
+            assert mac.register(name, text, lambda: None)
+        assert mac.register("one", "ctrl+alt+1", lambda: None)
+        assert mac.register("t", "ctrl+alt+t", lambda: None)
+        codes = {name: mac_keycode(mac, carbon, name) for name in mac.registered}
+        # The key labelled A on AZERTY is at the US Q position, and so on.
+        assert codes["a"] == hotkeys._MAC_KEYCODES["q"]
+        assert codes["m"] == hotkeys._MAC_KEYCODES["semicolon"]
+        assert codes["comma"] == hotkeys._MAC_KEYCODES["m"]
+        # Digits need Shift on AZERTY: the number row keeps its (labelled) US position.
+        assert codes["one"] == hotkeys._MAC_KEYCODES["1"]
+        assert codes["t"] == hotkeys._MAC_KEYCODES["t"]
+        # '/' needs modifiers on AZERTY: no key is "the / key", so nothing is guessed.
+        assert not mac.register("slash", "ctrl+alt+/", lambda: None)
+        assert mac.last_error("slash") == (
+            "⌃⌥/: no key types '/' without modifiers on the current keyboard layout"
+        )
+    finally:
+        mac.stop()
+    assert carbon.stopped_observing == 1
+
+
+def test_mac_default_hotkeys_on_dvorak_use_the_labelled_keys() -> None:
+    carbon = FakeCarbon(MAC_DVORAK)
+    mac = MacHotkeyManager(carbon=carbon)
+    try:
+        for name, key in [("toggle_tracking", "t"), ("toggle_privacy", "p"), ("recalibrate", "c")]:
+            assert mac.register(name, f"ctrl+alt+{key}", lambda: None)
+        assert mac_keycode(mac, carbon, "toggle_tracking") == hotkeys._MAC_KEYCODES["k"]
+        assert mac_keycode(mac, carbon, "toggle_privacy") == hotkeys._MAC_KEYCODES["r"]
+        assert mac_keycode(mac, carbon, "recalibrate") == hotkeys._MAC_KEYCODES["i"]
+    finally:
+        mac.stop()
+
+
+def test_mac_non_latin_layout_uses_the_ascii_capable_layout() -> None:
+    carbon = FakeCarbon(MAC_RUSSIAN, ascii_layout=MAC_DVORAK)
+    mac = MacHotkeyManager(carbon=carbon)
+    try:
+        assert mac.register("t", "ctrl+alt+t", lambda: None)
+        assert mac_keycode(mac, carbon, "t") == hotkeys._MAC_KEYCODES["k"]  # Dvorak 't'
+        assert mac.register("period", "ctrl+alt+.", lambda: None)
+        # The current layout wins where it has the character (Russian '.' at US '/').
+        assert mac_keycode(mac, carbon, "period") == hotkeys._MAC_KEYCODES["slash"]
+    finally:
+        mac.stop()
+
+
+def test_mac_without_layout_data_uses_us_positions() -> None:
+    carbon = FakeCarbon(layout=None)
+    mac = MacHotkeyManager(carbon=carbon)
+    try:
+        assert mac.register("a", "ctrl+alt+a", lambda: None)
+        assert mac.register("slash", "ctrl+alt+/", lambda: None)
+        assert mac_keycode(mac, carbon, "a") == 0x00
+        assert mac_keycode(mac, carbon, "slash") == 0x2C
+    finally:
+        mac.stop()
+
+
+def test_mac_registrations_follow_layout_switches() -> None:
+    carbon = FakeCarbon(MAC_US)
+    mac = MacHotkeyManager(carbon=carbon)
+    fired: list[str] = []
+    try:
+        assert mac.register("a", "ctrl+alt+a", lambda: fired.append("a"))
+        assert mac.register("t", "ctrl+alt+t", lambda: None)
+        assert mac.register("slash", "ctrl+alt+/", lambda: None)
+        t_ref = next(ref for ref, v in carbon.registered.items() if v[3] == mac._bindings["t"].id)
+        carbon.switch_layout(MAC_AZERTY)
+        assert mac_keycode(mac, carbon, "a") == hotkeys._MAC_KEYCODES["q"]
+        assert t_ref in carbon.registered  # unchanged key: registration left alone
+        # '/' has no key of its own on AZERTY: the hotkey is inactive, not forgotten.
+        assert set(mac.registered) == {"a", "t"}
+        assert mac_keycode(mac, carbon, "slash") is None
+        error = mac.last_error("slash")
+        assert error is not None
+        assert "no key types '/'" in error
+        assert carbon.press(hotkeys._MAC_KEYCODES["q"], 0x1800) == 0
+        assert fired == ["a"]
+        carbon.switch_layout(MAC_US)  # back again: everything is restored
+        assert set(mac.registered) == {"a", "t", "slash"}
+        assert mac_keycode(mac, carbon, "slash") == 0x2C
+        assert mac_keycode(mac, carbon, "a") == 0x00
+        assert mac.last_error("slash") is None
+        # Re-registering the inactive-then-restored name is a no-op like any other.
+        assert mac.register("slash", "ctrl+alt+/", lambda: None)
+        assert len(carbon.registered) == 3
+    finally:
+        mac.stop()
+    assert carbon.registered == {}
+
+
+def test_mac_register_retries_an_inactive_binding() -> None:
+    carbon = FakeCarbon(MAC_US)
+    mac = MacHotkeyManager(carbon=carbon)
+    try:
+        assert mac.register("slash", "ctrl+alt+/", lambda: None)
+        carbon.switch_layout(MAC_AZERTY)
+        assert mac.registered == {}
+        carbon.layout = carbon.ascii_layout = MAC_US  # changed without a notification
+        mac._keymap = mac._read_keymap()
+        assert mac.register("slash", "ctrl+alt+/", lambda: None)  # not the no-op path
+        assert mac.registered == {"slash": parse_hotkey("ctrl+alt+/")}
+    finally:
+        mac.stop()
+
+
+def test_mac_option_combinations_that_type_are_refused() -> None:
+    option, shift = 0x0800, 0x0200
+    e_code = hotkeys._MAC_KEYCODES["e"]
+    carbon = FakeCarbon(MAC_US, modified={option: {e_code: "´"}, option | shift: {e_code: "´"}})
+    mac = MacHotkeyManager(carbon=carbon)
+    try:
+        assert not mac.register("e", "alt+e", lambda: None)
+        assert mac.last_error("e") == "⌥E types '´' on the current keyboard layout"
+        assert not mac.register("e", "alt+shift+e", lambda: None)
+        assert mac.layout_conflict("alt+e") == "⌥E types '´' on the current keyboard layout"
+        # Control or Command switch the typing layer off.
+        assert mac.layout_conflict("ctrl+alt+e") is None
+        assert mac.register("e", "ctrl+alt+e", lambda: None)
+        assert mac.register("f5", "alt+f5", lambda: None)  # types nothing
+        assert mac.layout_conflict("alt+r") is None  # nothing on this fake's Option+R
+    finally:
+        mac.stop()
+
+
+def test_mac_layout_conflict_before_start_and_off_main_thread() -> None:
+    e_code = hotkeys._MAC_KEYCODES["e"]
+    carbon = FakeCarbon(MAC_US, modified={0x0800: {e_code: "´"}})
+    mac = MacHotkeyManager(carbon=carbon)
+    assert mac.layout_conflict("alt+e") is not None  # reads the layout on demand
+    assert carbon.install_calls == 0
+    result: list[str | None] = []
+    worker = threading.Thread(target=lambda: result.append(mac.layout_conflict("alt+e")))
+    worker.start()
+    worker.join(2)
+    assert result == [None]  # TIS calls are main-thread only: no answer, no crash
+
+
+def test_mac_char_keymap_prefers_us_position_for_duplicates() -> None:
+    chars = {0x0A: "<", 0x32: "<", 0x2B: ",", 0x31: " ", 0x24: "ab", 0x00: "Q"}
+    keymap = hotkeys._mac_char_keymap(chars)
+    assert keymap == {"<": 0x0A, ",": 0x2B, "q": 0x00}
+    assert hotkeys._mac_char_keymap({0x05: "x", 0x07: "x"}) == {"x": 0x07}  # US 'x' is 0x07
+    assert hotkeys._mac_keycode("f5", {"f": 0x03}) == 0x60  # non-character keys: fixed codes
+    assert hotkeys._mac_keycode("minus", {}) is None
+    assert hotkeys._mac_keycode("minus", None) == 0x1B
 
 
 def test_mac_stop_is_idempotent_and_restartable(mac: MacHotkeyManager, carbon: FakeCarbon) -> None:
@@ -705,12 +1246,16 @@ class FakeCarbonLib:
         self.removed: list[int] = []
         self.GetApplicationEventTarget = _Fn(lambda: self.TARGET)
         self.InstallEventHandler = _Fn(self._install)
-        self.RemoveEventHandler = _Fn(lambda ref: self.removed.append(_value(ref)) or 0)
+        self.RemoveEventHandler = _Fn(self._remove_handler)
         self.RegisterEventHotKey = _Fn(self._register)
         self.UnregisterEventHotKey = _Fn(
             lambda ref: 0 if self.hotkeys.pop(_value(ref), None) else -50
         )
         self.GetEventParameter = _Fn(self._get_parameter)
+
+    def _remove_handler(self, ref: Any) -> int:
+        self.removed.append(_value(ref))
+        return 0
 
     def _install(self, target: int, proc: Any, count: int, spec: Any, user: Any, out: Any) -> int:
         assert target == self.TARGET
@@ -724,7 +1269,7 @@ class FakeCarbonLib:
         self, code: int, mods: int, hk_id: Any, target: int, options: int, out: Any
     ) -> int:
         assert target == self.TARGET
-        assert options == 0
+        assert options == 1  # kEventHotKeyExclusive: other apps' combos are reported
         ref = 0x5000 + hk_id.id
         self.hotkeys[ref] = (code, mods, hk_id.signature, hk_id.id)
         out._obj.value = ref
@@ -768,6 +1313,110 @@ def test_mac_ctypes_binding_with_fake_library(
     finally:
         manager.stop()
     assert lib.removed == [0x1234]
+
+
+class FakeLayoutLib(FakeCarbonLib):
+    """:class:`FakeCarbonLib` plus Text Input Sources, UCKeyTranslate and the
+    distributed notification center (one object stands in for every framework)."""
+
+    CURRENT, ASCII = 0x7001, 0x7002
+    LAYOUT_KEY, CHANGED = 0xA1, 0xA2
+    CENTER = 0xCE
+
+    def __init__(self, current: dict[int, str], ascii_capable: dict[int, str]) -> None:
+        super().__init__()
+        self.sources = {self.CURRENT: current, self.ASCII: ascii_capable}
+        self.option_layer: dict[int, str] = {}
+        self.released: list[int] = []
+        self.observers: list[tuple[Any, Any, Any]] = []
+        self.removed_observers: list[Any] = []
+        self.TISCopyCurrentKeyboardLayoutInputSource = _Fn(lambda: self.CURRENT)
+        self.TISCopyCurrentASCIICapableKeyboardLayoutInputSource = _Fn(lambda: self.ASCII)
+        self.TISGetInputSourceProperty = _Fn(
+            lambda source, key: source + 0x1000 if key == self.LAYOUT_KEY else None
+        )
+        self.CFDataGetBytePtr = _Fn(lambda data: data + 0x1000)  # "layout" = source + 0x2000
+        self.CFRelease = _Fn(self.released.append)
+        self.LMGetKbdType = _Fn(lambda: 40)
+        self.UCKeyTranslate = _Fn(self._translate)
+        self.CFNotificationCenterGetDistributedCenter = _Fn(lambda: self.CENTER)
+        self.CFNotificationCenterAddObserver = _Fn(self._add_observer)
+        self.CFNotificationCenterRemoveObserver = _Fn(
+            lambda center, observer, name, obj: self.removed_observers.append((center, name))
+        )
+
+    def _translate(
+        self,
+        layout: int,
+        keycode: int,
+        action: int,
+        state: int,
+        kbd_type: int,
+        options: int,
+        dead: Any,
+        max_length: int,
+        length: Any,
+        buf: Any,
+    ) -> int:
+        assert (action, kbd_type, options, max_length) == (0, 40, 1, len(buf))
+        source = layout - 0x2000
+        chars = self.option_layer if state == 0x08 else self.sources[source]
+        text = chars.get(keycode, "")
+        for index, char in enumerate(text):
+            buf[index] = ord(char)
+        length._obj.value = len(text)
+        return 0
+
+    def _add_observer(
+        self, center: int, observer: Any, proc: Any, name: int, obj: Any, behaviour: int
+    ) -> None:
+        assert (center, name, obj, behaviour) == (self.CENTER, self.CHANGED, None, 4)
+        self.observers.append((observer, proc, name))
+
+
+def test_mac_ctypes_layout_binding_with_fake_library(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ctypes
+
+    lib = FakeLayoutLib(MAC_AZERTY, MAC_AZERTY)
+    lib.option_layer = {hotkeys._MAC_KEYCODES["e"]: "´"}
+    monkeypatch.setattr(ctypes, "CDLL", lambda path: lib)
+    constants = {
+        "kTISPropertyUnicodeKeyLayoutData": FakeLayoutLib.LAYOUT_KEY,
+        "kTISNotifySelectedKeyboardInputSourceChanged": FakeLayoutLib.CHANGED,
+    }
+    monkeypatch.setattr(hotkeys, "_cf_global", lambda _lib, name: constants[name])
+    manager = MacHotkeyManager()
+    try:
+        assert manager.register("a", "ctrl+alt+a", lambda: None)
+        ((code, _mods, _sig, _id),) = lib.hotkeys.values()
+        assert code == hotkeys._MAC_KEYCODES["q"]  # AZERTY A, read through UCKeyTranslate
+        assert manager.layout_conflict("alt+e") == "⌥E types '´' on the current keyboard layout"
+        # Every copied input source is released again.
+        assert lib.released
+        assert set(lib.released) <= {FakeLayoutLib.CURRENT, FakeLayoutLib.ASCII}
+        # The user switches to US: the distributed notification moves the hotkey.
+        ((_observer, proc, _name),) = lib.observers
+        lib.sources = {FakeLayoutLib.CURRENT: MAC_US, FakeLayoutLib.ASCII: MAC_US}
+        proc(FakeLayoutLib.CENTER, None, FakeLayoutLib.CHANGED, None, None)
+        ((code, _mods, _sig, _id),) = lib.hotkeys.values()
+        assert code == hotkeys._MAC_KEYCODES["a"]
+    finally:
+        manager.stop()
+    assert lib.removed_observers == [(FakeLayoutLib.CENTER, FakeLayoutLib.CHANGED)]
+
+
+def test_mac_layout_api_missing_falls_back_to_us_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+
+    lib = FakeCarbonLib()  # hot-key functions only: no TIS / UCKeyTranslate
+    monkeypatch.setattr(ctypes, "CDLL", lambda path: lib)
+    carbon = hotkeys._Carbon()
+    assert carbon.layout_characters() is None
+    assert carbon.observe_layout_changes(lambda: None) is False
+    carbon.stop_observing_layout_changes()  # nothing to stop: no error
+    assert carbon._layout_api is False  # the failed lookup is not repeated
 
 
 def test_mac_carbon_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1007,6 +1656,102 @@ def test_x11_timestamp_wraparound(x11: tuple[X11HotkeyManager, FakeDisplay]) -> 
     assert fired == [1, 1]
 
 
+@pytest.mark.parametrize("release_state", [0, 8, 4, 12 | 2 | 16])
+def test_x11_releasing_modifiers_first_rearms_the_hotkey(
+    x11: tuple[X11HotkeyManager, FakeDisplay], release_state: int
+) -> None:
+    # A KeyRelease reports the modifiers held just before it: lifting Ctrl/Alt first
+    # gives state 0 (or Mod1/Control only). The hotkey must fire on every press.
+    manager, _display = x11
+    fired: list[int] = []
+    binding = bind_x11(manager, "t", "ctrl+alt+p", lambda: fired.append(1))
+    assert manager._grab_binding(binding)
+    code = keycode_of("p")
+    for n in range(1, 6):
+        manager._handle_event(key_event(hotkeys._X_KEY_PRESS, code, 12, 1000 * n))
+        manager._handle_event(key_event(hotkeys._X_KEY_RELEASE, code, release_state, 1000 * n + 90))
+    assert fired == [1] * 5
+
+
+def test_x11_release_of_another_key_keeps_the_hotkey_held(
+    x11: tuple[X11HotkeyManager, FakeDisplay],
+) -> None:
+    manager, _display = x11
+    fired: list[str] = []
+    p = bind_x11(manager, "p", "ctrl+alt+p", lambda: fired.append("p"))
+    k = bind_x11(manager, "k", "ctrl+alt+shift+k", lambda: fired.append("k"))
+    assert manager._grab_binding(p)
+    assert manager._grab_binding(k)
+    press, release = hotkeys._X_KEY_PRESS, hotkeys._X_KEY_RELEASE
+    manager._handle_event(key_event(press, keycode_of("p"), 12, 100))
+    manager._handle_event(key_event(release, keycode_of("k"), 0, 200))  # not P's release
+    manager._handle_event(key_event(press, keycode_of("p"), 12, 300))  # P still held
+    assert fired == ["p"]
+    manager._handle_event(key_event(release, keycode_of("p"), 0, 400))
+    manager._handle_event(key_event(press, keycode_of("k"), 13, 500))
+    manager._handle_event(key_event(press, keycode_of("p"), 12, 600))
+    assert fired == ["p", "k", "p"]
+
+
+def test_x11_hotkey_lost_by_a_layout_change_comes_back(
+    x11: tuple[X11HotkeyManager, FakeDisplay],
+) -> None:
+    manager, display = x11
+    fired: list[int] = []
+    binding = bind_x11(manager, "t", "ctrl+alt+p", lambda: fired.append(1))
+    assert manager._grab_binding(binding)
+    mapping = types.SimpleNamespace(type=hotkeys._X_MAPPING_NOTIFY, request=1)
+    code = display.keymap.pop(KEYSYMS["p"])  # e.g. `setxkbmap ru`: no Latin keysyms
+    manager._handle_event(mapping)
+    assert display.root.grabs == set()
+    assert manager.registered == {}  # not shown as working any more …
+    error = manager.last_error("t")
+    assert error is not None
+    assert "not on the current keyboard layout" in error
+    display.keymap[KEYSYMS["p"]] = code  # `setxkbmap us`
+    manager._handle_event(mapping)  # … but retried on the next change
+    assert (code, 12) in display.root.grabs
+    assert manager.registered == {"t": parse_hotkey("ctrl+alt+p")}
+    assert manager.last_error("t") is None
+    manager._handle_event(key_event(hotkeys._X_KEY_PRESS, code, 12, 10))
+    assert fired == [1]
+
+
+def test_x11_regrab_keeps_in_flight_and_drops_removed_bindings(
+    x11: tuple[X11HotkeyManager, FakeDisplay],
+) -> None:
+    manager, display = x11
+    # Registration in flight: published in _by_id and grabbed on the hotkey thread,
+    # but register() has not added it to _bindings yet.
+    in_flight = hotkeys._Binding(manager._allocate_id(), "new", hk("ctrl+alt+k"), lambda: None)
+    manager._by_id[in_flight.id] = in_flight
+    assert manager._grab_binding(in_flight)
+    # Removal in flight: _remove() forgot the binding, its ungrab is still queued.
+    removed = hotkeys._Binding(manager._allocate_id(), "old", hk("ctrl+alt+j"), lambda: None)
+    assert manager._grab_binding(removed)
+    manager._handle_event(types.SimpleNamespace(type=hotkeys._X_MAPPING_NOTIFY, request=0))
+    assert {code for code, _mods in display.root.grabs} == {keycode_of("k")}
+    assert set(manager._grabs) == {in_flight.id}
+
+
+def test_x11_loop_waits_without_timeout(
+    x11: tuple[X11HotkeyManager, FakeDisplay], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import select
+
+    manager, _display = x11
+    timeouts: list[float | None] = []
+
+    def fake_select(read: Any, write: Any, error: Any, timeout: float | None = None) -> Any:
+        timeouts.append(timeout)
+        raise OSError("end of test")  # ends the loop
+
+    monkeypatch.setattr(select, "select", fake_select)
+    manager._thread_loop()
+    # No periodic wake-ups while idle: only events and the wake pipe end the wait.
+    assert timeouts == [None]
+
+
 def test_x11_mapping_notify_regrabs(x11: tuple[X11HotkeyManager, FakeDisplay]) -> None:
     manager, display = x11
     fired: list[int] = []
@@ -1193,6 +1938,8 @@ def test_windows_combo_taken_by_another_owner() -> None:
         # The OS refuses a combination that another thread/app already registered.
         assert not second.register("t", COMBO, lambda: None)
         assert second.registered == {}
+        taken = "Ctrl+Alt+Shift+F24 is already in use by another application"
+        assert second.last_error("t") == taken
         first.stop()
         assert second.register("t", COMBO, lambda: None)  # released by stop()
     finally:
@@ -1273,3 +2020,59 @@ def test_windows_start_prewarms_thread(win: WindowsHotkeyManager) -> None:
     assert thread.is_alive()
     win.stop()
     assert not thread.is_alive()
+
+
+@windows_only
+def test_windows_altgr_collision_is_refused_before_registering() -> None:
+    # A layout on which even AltGr+Shift+F24 would type: the manager must refuse it
+    # without calling RegisterHotKey, so another owner can still take the combo.
+    refusing = WindowsHotkeyManager(layout_probe=FakeLayoutProbe(everything="x"))
+    other = WindowsHotkeyManager()
+    try:
+        assert not refusing.register("t", COMBO, lambda: None)
+        assert refusing.registered == {}
+        assert refusing.last_error("t") == (
+            "Ctrl+Alt+Shift+F24 is AltGr+Shift+F24, which types 'x' on the US keyboard layout"
+        )
+        assert other.register("t", COMBO, lambda: None)  # nothing was registered
+        # With Win held, AltGr is not involved: no check, registration proceeds.
+        assert refusing.register("w", "ctrl+alt+meta+f22", lambda: None)
+    finally:
+        refusing.stop()
+        other.stop()
+
+
+@windows_only
+def test_windows_punctuation_without_a_key_is_refused(
+    win: WindowsHotkeyManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(hotkeys, "_win_virtual_key", lambda *args: None)
+    assert not win.register("t", "ctrl+alt+shift+/", lambda: None)
+    assert win.last_error("t") == (
+        "Ctrl+Alt+Shift+/: no key types '/' without Shift or AltGr on the current keyboard layout"
+    )
+
+
+@windows_only
+def test_windows_live_layout_queries_are_read_only_and_sane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from eye_tracker.config import HotkeySettings
+
+    probe = hotkeys._Win32LayoutProbe(hotkeys._win32())
+    installed = probe.layouts()
+    assert installed  # every session has at least one keyboard layout
+    for hkl in installed:
+        assert probe.altgr_text(0x87, False, hkl) is None  # VK_F24 never types
+        assert probe.layout_name(hkl)
+    assert hotkeys._win_layout_text(US) == "US"
+    assert hotkeys._win_layout_text(0xF0020409) == "United States-Dvorak"  # "Layout Id" 0002
+    manager = WindowsHotkeyManager()
+    monkeypatch.setattr(sys, "platform", "win32")
+    defaults = HotkeySettings()
+    for text in (defaults.toggle_tracking, defaults.toggle_privacy, defaults.recalibrate):
+        assert manager.layout_conflict(text) is None
+    if TURKISH_Q in installed:  # the maintainer's layout: Ctrl+Alt+T is AltGr+T = '₺'
+        conflict = manager.layout_conflict("ctrl+alt+t")
+        assert conflict is not None
+        assert "'₺'" in conflict

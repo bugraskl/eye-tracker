@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import sys
 import tempfile
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -104,6 +105,15 @@ class SwitchingSettings:
     typing_grace_ms: int = _opt(
         2000, lo=0, hi=10000, doc="No switching for this long after you type."
     )
+    reading_grace_ms: int = _opt(
+        6000,
+        lo=0,
+        hi=60000,
+        doc="After you typed while looking at another monitor (e.g. copying from a document "
+        "there), switching to that monitor waits this long after your last keystroke instead "
+        "of the typing grace, so reading pauses do not move your keyboard focus. 0 turns this "
+        "off.",
+    )
     cursor_target: str = _opt(
         "last",
         choices=("last", "center", "gaze"),
@@ -160,12 +170,47 @@ class PrivacySettings:
     )
 
 
+#: Modifiers of the default hotkeys by ``sys.platform``; the keys are T (pause /
+#: resume tracking), P (privacy mode) and C (calibrate) everywhere. Each set was
+#: chosen so that the combinations type no character and are no stock OS shortcut:
+#:
+#: * Windows reports AltGr as Ctrl+Alt, and the layout tables of the stock Windows
+#:   layouts show Ctrl+Alt(+Shift)+T, P and C typing characters on 19-47 layouts each
+#:   (Ctrl+Alt+T is '₺' on Turkish Q, Ctrl+Alt+C 'ć' on Polish (Programmers),
+#:   Ctrl+Alt+P 'ö' on US-International). No Windows layout uses the Win key as a
+#:   character modifier, and the shell's own Win shortcuts (Game Bar Win+Alt+*,
+#:   Win+Ctrl+*, the Office key Ctrl+Alt+Shift+Win) leave Ctrl+Alt+Win+T/P/C free.
+#: * Linux desktops open a terminal on Ctrl+Alt+T and switch virtual terminals on
+#:   Ctrl+Alt+F1-F12. X11 keeps AltGr a modifier of its own, so Ctrl+Alt+Shift
+#:   never types, and no major desktop binds it to T, P or C.
+#: * macOS has no AltGr, Control+Option+letter types nothing, and macOS binds no
+#:   ⌃⌥+letter shortcut (only VoiceOver, while it runs, uses ⌃⌥ as its prefix).
+_HOTKEY_MODIFIERS: dict[str, str] = {"win32": "ctrl+alt+meta", "darwin": "ctrl+alt"}
+_HOTKEY_MODIFIERS_OTHER = "ctrl+alt+shift"  # Linux/X11 and other Unix desktops
+
+
+def _default_hotkey(key: str) -> str:
+    """The default hotkey for ``key`` on the running platform (see above)."""
+    return f"{_HOTKEY_MODIFIERS.get(sys.platform, _HOTKEY_MODIFIERS_OTHER)}+{key}"
+
+
 @dataclass
 class HotkeySettings:
     enabled: bool = _opt(True, doc="Register global hotkeys.")
-    toggle_tracking: str = _opt("ctrl+alt+t", doc="Pause / resume tracking.")
-    toggle_privacy: str = _opt("ctrl+alt+p", doc="Privacy mode (camera fully off).")
-    recalibrate: str = _opt("ctrl+alt+c", doc="Start calibration.")
+    # Factories (not plain defaults) so the platform is looked up when settings are
+    # created, which also lets tests check every platform's defaults.
+    toggle_tracking: str = field(
+        default_factory=lambda: _default_hotkey("t"),
+        metadata={"doc": "Pause / resume tracking."},
+    )
+    toggle_privacy: str = field(
+        default_factory=lambda: _default_hotkey("p"),
+        metadata={"doc": "Privacy mode (camera fully off)."},
+    )
+    recalibrate: str = field(
+        default_factory=lambda: _default_hotkey("c"),
+        metadata={"doc": "Start calibration."},
+    )
 
 
 @dataclass

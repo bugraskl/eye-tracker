@@ -15,13 +15,20 @@ Output in dist/ (or --distpath):
              .../Contents/MacOS/eye-tracker-cli
     Linux    eye-tracker/eye-tracker          one executable for the app and the CLI
 
-The version comes from ``src/eye_tracker/__init__.py`` (parsed, not imported).
-Executable names are mirrored in ``entry.py``, which picks the entry point, and
-in ``eye_tracker/platform/autostart.py``, which registers the windowed one.
+The version comes from ``src/eye_tracker/__init__.py`` and the list of face
+models (with their pinned SHA-256) from ``eye_tracker/vision/backends/__init__.py``;
+both are parsed, not imported. Executable names are mirrored in ``entry.py``,
+which picks the entry point, and in ``eye_tracker/platform/autostart.py``, which
+registers the windowed one.
+
+After the build, the release workflow runs the bundle privacy gate:
+
+    uv run python scripts/check_privacy.py --bundle dist/<DIST_NAME>
 """
 
 import ast
 import glob
+import hashlib
 import importlib.metadata
 import importlib.util
 import logging
@@ -35,7 +42,7 @@ from pathlib import Path
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
-from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules, copy_metadata
+from PyInstaller.utils.hooks import collect_submodules, copy_metadata
 
 log = logging.getLogger("eye-tracker.spec")
 
@@ -106,8 +113,7 @@ def runtime_distributions() -> list:
     """Installed distributions the app needs at run time (its dependency closure).
 
     Environment markers are evaluated for this machine, so platform-only
-    dependencies (pyobjc, python-xlib) appear only where they apply. Packages
-    the lock file overrides away (matplotlib, ...) are simply not installed.
+    dependencies (pyobjc, python-xlib) appear only where they apply.
     """
     found = {}
     pending = [PROJECT]
@@ -285,14 +291,49 @@ def macos_minimum_version(distributions, floor=(12, 0)) -> str:
     return f"{best[0]}.{best[1]}"
 
 
-MODEL_FILES = ("face_landmarker.task", "face_detection_yunet_2023mar.onnx")
-_missing_models = [f for f in MODEL_FILES if not (PACKAGE / "vision" / "models" / f).is_file()]
-if _missing_models:
-    raise SystemExit(
-        "eye-tracker.spec: missing model files "
-        + ", ".join(_missing_models)
-        + "; run `uv run python scripts/fetch_models.py` first"
-    )
+def pinned_models() -> dict:
+    """``MODEL_FILES`` (file name -> SHA-256) from ``eye_tracker.vision.backends``.
+
+    Parsed rather than imported, so the spec does not load OpenCV; the backends
+    and ``scripts/fetch_models.py`` pin the same files.
+    """
+    source = (PACKAGE / "vision" / "backends" / "__init__.py").read_text(encoding="utf-8")
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        else:
+            continue
+        if isinstance(target, ast.Name) and target.id == "MODEL_FILES" and value is not None:
+            return dict(ast.literal_eval(value))
+    raise SystemExit("eye-tracker.spec: MODEL_FILES not found in eye_tracker/vision/backends")
+
+
+def verify_models(models: dict, directory: Path) -> None:
+    """Refuse to build with a missing or modified model file."""
+    problems = []
+    for name, expected in sorted(models.items()):
+        path = directory / name
+        if not path.is_file():
+            problems.append(f"{name} is missing")
+        elif hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            problems.append(f"{name} does not match its pinned SHA-256")
+    if problems:
+        raise SystemExit(
+            "eye-tracker.spec: "
+            + "; ".join(problems)
+            + ". Run `uv run python scripts/fetch_models.py` first."
+        )
+
+
+MODELS_DIR = PACKAGE / "vision" / "models"
+MODEL_FILES = pinned_models()
+verify_models(MODEL_FILES, MODELS_DIR)
+# Shipped with the models: their licences and provenance (Apache-2.0 requires it).
+MODEL_NOTICE = "NOTICE.md"
+if not (MODELS_DIR / MODEL_NOTICE).is_file():
+    raise SystemExit(f"eye-tracker.spec: {MODELS_DIR / MODEL_NOTICE} is missing")
 
 if IS_WINDOWS:
     hide_foreign_openssl_from_path()
@@ -307,15 +348,6 @@ binaries = []
 # dist-info folders let importlib.metadata report library versions ("doctor").
 for _dist in RUNTIME_DISTRIBUTIONS:
     datas += copy_metadata(_dist)
-
-if importlib.util.find_spec("mediapipe") is not None:
-    # MediaPipe 1.x is a ctypes wrapper: it loads libmediapipe.{dll,so,dylib} from
-    # the "mediapipe.tasks.c" package via importlib.resources, which static
-    # analysis cannot see.
-    binaries += collect_dynamic_libs("mediapipe")
-    hiddenimports.append("mediapipe.tasks.c")
-else:
-    log.warning("MediaPipe is not installed; the bundle will only have the OpenCV backend.")
 
 if IS_MACOS:
     # platform/macos.py imports pyobjc lazily with importlib.import_module(), and
@@ -349,9 +381,10 @@ if IS_LINUX:
         )
 
 EXCLUDES = [
-    # MediaPipe's drawing helpers import matplotlib; the app installs a shim instead.
-    "matplotlib",
-    "sounddevice",
+    # The MediaPipe *runtime* must never ship: it contains a usage logger that
+    # uploads to Google. Its face models run in OpenCV DNN instead (see
+    # vision/models/NOTICE.md); the bundle privacy gate fails if it slips in.
+    "mediapipe",
     # No TLS: the app never uses the network (scripts/check_privacy.py enforces it
     # for our code; this keeps a TLS stack out of the bundle as well).
     "ssl",
@@ -400,9 +433,9 @@ a = Analysis(  # noqa: F821 - injected by PyInstaller
 )
 
 _bundled = {Path(dest).as_posix() for dest, _src, _kind in a.datas}
-for _model in MODEL_FILES:
+for _model in (*MODEL_FILES, MODEL_NOTICE):
     if f"eye_tracker/vision/models/{_model}" not in _bundled:
-        raise SystemExit(f"eye-tracker.spec: model {_model} was not collected")
+        raise SystemExit(f"eye-tracker.spec: {_model} was not collected")
 
 
 def _unwanted(dest: str) -> bool:

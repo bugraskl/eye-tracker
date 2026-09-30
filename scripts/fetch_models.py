@@ -3,7 +3,8 @@
 
 The models are committed to the repository, so most people never need to run
 this. It exists to recreate them in a fresh or damaged checkout, to verify them
-in CI, and to record exactly where each file comes from and under which licence.
+in CI, and to record exactly where each file comes from and under which licence
+(see also ``src/eye_tracker/vision/models/NOTICE.md``).
 
 Usage::
 
@@ -11,8 +12,12 @@ Usage::
     python scripts/fetch_models.py --check    # verify only; never touches the network
     python scripts/fetch_models.py --force    # download again even if valid
 
-Every file is checked against a pinned SHA-256 before it is moved into place,
-so a failed or tampered download can never replace a good model.
+Every download is checked against a pinned SHA-256 before anything is moved
+into place, so a failed or tampered download can never replace a good model.
+Some models come inside an archive (MediaPipe's ``face_landmarker.task`` is a
+zip file): the archive is verified, only the members the app needs are
+extracted, and each member is verified against its own pinned SHA-256. The
+archive itself is not kept.
 
 This is developer tooling that lives outside ``src/``: the application itself
 never touches the network.
@@ -28,6 +33,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,8 +48,21 @@ _CHUNK = 1024 * 256
 
 
 @dataclass(frozen=True)
+class Member:
+    """A file installed from a downloaded archive."""
+
+    #: Path inside the archive; also the installed file name.
+    name: str
+    sha256: str
+
+
+@dataclass(frozen=True)
 class Model:
-    """A model file with its canonical source and pinned checksum."""
+    """A model download with its canonical source and pinned checksum.
+
+    With ``members`` the download is a zip archive and only those members are
+    installed; otherwise the downloaded file is installed as ``filename``.
+    """
 
     filename: str
     url: str
@@ -51,6 +70,13 @@ class Model:
     license: str
     homepage: str
     description: str
+    members: tuple[Member, ...] = ()
+
+    def installed(self) -> tuple[tuple[str, str], ...]:
+        """``(file name, sha256)`` of every file this model puts into the model directory."""
+        if self.members:
+            return tuple((m.name, m.sha256) for m in self.members)
+        return ((self.filename, self.sha256),)
 
 
 MODELS: tuple[Model, ...] = (
@@ -63,7 +89,20 @@ MODELS: tuple[Model, ...] = (
         sha256="64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff",
         license="Apache-2.0",
         homepage="https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker",
-        description="MediaPipe Face Landmarker (478 landmarks incl. iris, head pose)",
+        description=(
+            "MediaPipe Face Landmarker bundle: the 478-point face landmark network "
+            "(with irises) and the canonical face geometry, run with OpenCV DNN"
+        ),
+        members=(
+            Member(
+                "face_landmarks_detector.tflite",
+                "c7d54204ce0448474c7f3fa9af494787c0965cbdd6f20fc72867e43046bd43d5",
+            ),
+            Member(
+                "geometry_pipeline_metadata_landmarks.binarypb",
+                "bdbcda96dfcb7da883da124aaa2c55dee49770d934f0fcc71747f8c21bdc75b4",
+            ),
+        ),
     ),
     Model(
         filename="face_detection_yunet_2023mar.onnx",
@@ -74,7 +113,7 @@ MODELS: tuple[Model, ...] = (
         sha256="8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
         license="MIT",
         homepage="https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet",
-        description="OpenCV Zoo YuNet face detector (lightweight fallback backend)",
+        description="OpenCV Zoo YuNet face detector (face finding and the lite backend)",
     ),
 )
 
@@ -93,11 +132,15 @@ def sha256_file(path: Path) -> str:
 
 
 def verify(model: Model, dest: Path) -> str:
-    """``"ok"``, ``"missing"`` or ``"mismatch"`` for the model file in ``dest``."""
-    path = dest / model.filename
-    if not path.is_file():
-        return "missing"
-    return "ok" if sha256_file(path) == model.sha256 else "mismatch"
+    """``"ok"``, ``"missing"`` or ``"mismatch"`` for the model's files in ``dest``."""
+    status = "ok"
+    for name, sha256 in model.installed():
+        path = dest / name
+        if not path.is_file():
+            return "missing"
+        if sha256_file(path) != sha256:
+            status = "mismatch"
+    return status
 
 
 def _human_size(n: int) -> str:
@@ -107,6 +150,10 @@ def _human_size(n: int) -> str:
             return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
     return f"{n} B"  # pragma: no cover - loop always returns
+
+
+def _installed_size(model: Model, dest: Path) -> int:
+    return sum((dest / name).stat().st_size for name, _ in model.installed())
 
 
 def _download_once(model: Model, target: Path, timeout: float) -> None:
@@ -127,6 +174,55 @@ def _download_once(model: Model, target: Path, timeout: float) -> None:
         )
 
 
+def _write_atomic(data: bytes, final: Path) -> None:
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{final.name}.", suffix=".part", dir=final.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+        os.replace(tmp, final)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def extract_members(model: Model, archive: Path, dest: Path) -> list[Path]:
+    """Install the verified members of a downloaded (and verified) zip archive.
+
+    Every member is read and checked before any file is written, so a bad
+    archive leaves the model directory untouched.
+
+    Raises:
+        DownloadError: The archive is not a zip file, lacks a member or a
+            member's checksum does not match.
+    """
+    contents: list[tuple[Member, bytes]] = []
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            for member in model.members:
+                try:
+                    data = bundle.read(member.name)
+                except KeyError as exc:
+                    raise DownloadError(
+                        f"{model.filename}: archive has no member {member.name!r}"
+                    ) from exc
+                actual = hashlib.sha256(data).hexdigest()
+                if actual != member.sha256:
+                    raise DownloadError(
+                        f"{model.filename}: checksum mismatch for {member.name} "
+                        f"(got {actual}, expected {member.sha256})"
+                    )
+                contents.append((member, data))
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise DownloadError(f"{model.filename}: not a readable zip archive: {exc}") from exc
+    installed = []
+    for member, data in contents:
+        # Only the pinned base name is used: archive paths never reach the disk.
+        final = dest / Path(member.name).name
+        _write_atomic(data, final)
+        installed.append(final)
+    return installed
+
+
 def _pause_before_retry(model: Model, exc: Exception, attempt: int) -> None:
     delay = 2.0 * attempt
     print(f"  retry    {model.filename}: {exc} (again in {delay:.0f} s)")
@@ -134,10 +230,10 @@ def _pause_before_retry(model: Model, exc: Exception, attempt: int) -> None:
 
 
 def download(model: Model, dest: Path, *, timeout: float = 60.0, attempts: int = 3) -> Path:
-    """Download ``model`` into ``dest`` atomically; returns the final path.
+    """Download ``model`` into ``dest`` atomically; returns the (first) installed path.
 
-    The data goes to a temporary file in the same directory and replaces the
-    target only after the checksum matches.
+    The data goes to a temporary file in the same directory and is installed
+    only after the checksum matches (for archives: after every member matched).
     """
     dest.mkdir(parents=True, exist_ok=True)
     final = dest / model.filename
@@ -148,6 +244,8 @@ def download(model: Model, dest: Path, *, timeout: float = 60.0, attempts: int =
         tmp = Path(tmp_name)
         try:
             _download_once(model, tmp, timeout)
+            if model.members:
+                return extract_members(model, tmp, dest)[0]
             os.replace(tmp, final)
             return final
         except DownloadError:
@@ -165,6 +263,12 @@ def download(model: Model, dest: Path, *, timeout: float = 60.0, attempts: int =
         finally:
             tmp.unlink(missing_ok=True)
     raise DownloadError(f"{model.filename}: download failed: {last_error}")
+
+
+def _describe(model: Model) -> str:
+    if not model.members:
+        return model.filename
+    return f"{model.filename} -> " + ", ".join(m.name for m in model.members)
 
 
 # --------------------------------------------------------------------------------- main
@@ -188,21 +292,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     for model in MODELS:
         status = "stale" if args.force else verify(model, dest)
         if status == "ok":
-            size = _human_size((dest / model.filename).stat().st_size)
-            print(f"  ok       {model.filename} ({size}, sha256 {model.sha256[:12]}...)")
+            size = _human_size(_installed_size(model, dest))
+            print(f"  ok       {_describe(model)} ({size}, sha256 verified)")
             continue
         if args.check:
-            print(f"  {status:<8} {model.filename}  (run scripts/fetch_models.py to fix)")
+            print(f"  {status:<8} {_describe(model)}  (run scripts/fetch_models.py to fix)")
             failures += 1
             continue
         print(f"  fetch    {model.filename} [{model.license}] from {model.url}")
         try:
-            path = download(model, dest, timeout=args.timeout)
+            download(model, dest, timeout=args.timeout)
         except DownloadError as exc:
             print(f"  FAILED   {exc}", file=sys.stderr)
             failures += 1
             continue
-        print(f"  ok       {model.filename} ({_human_size(path.stat().st_size)}, verified)")
+        size = _human_size(_installed_size(model, dest))
+        print(f"  ok       {_describe(model)} ({size}, verified)")
 
     if failures:
         print(f"{failures} model(s) missing or invalid in {dest}", file=sys.stderr)

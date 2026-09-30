@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import threading
 import time
 from collections.abc import Callable, Iterator
 from typing import ClassVar
 
+import cv2
 import numpy as np
 import pytest
 
 from eye_tracker.types import Observation, WorkerStats
+from eye_tracker.vision import worker as worker_mod
 from eye_tracker.vision.backends.base import BackendUnavailable, VisionBackend
 from eye_tracker.vision.camera import CameraError
 from eye_tracker.vision.worker import VisionWorker
@@ -684,6 +687,217 @@ def test_stats_snapshot(harness: Harness) -> None:
     assert harness.worker.stats.extra["frames"] != -1
     # The camera opening is published immediately.
     assert any(s.camera_open for s in harness.recorder.stats)
+
+
+def test_stats_report_device_and_frame_size() -> None:
+    class NamedSource(FakeSource):
+        device = "/dev/v4l/by-id/usb-cam-video-index0"
+
+    recorder = Recorder()
+    worker = VisionWorker(NamedSource, FakeBackend, recorder.on_observation, recorder.on_stats)
+    worker.set_interval(0.005)
+    worker.set_motion_gate(False, 2.0)
+    worker.start()
+    try:
+        assert recorder.wait_for(lambda: len(recorder.observations) >= 2)
+        extra = worker.stats.extra
+    finally:
+        worker.stop()
+    assert extra["device"] == "/dev/v4l/by-id/usb-cam-video-index0"
+    assert extra["frame_size"] == (64, 48)
+    assert extra["backend_failing"] is False
+
+
+def test_worker_caps_opencv_threads(monkeypatch: pytest.MonkeyPatch, harness: Harness) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr(worker_mod, "limit_opencv_threads", lambda: calls.append(1) or 1)
+    harness.worker.start()
+    assert harness.recorder.wait_for(lambda: len(harness.recorder.observations) >= 1)
+    assert calls == [1]
+
+
+# ------------------------------------------------- deactivation while starting
+def test_camera_stays_off_when_deactivated_during_backend_creation() -> None:
+    """Privacy mode pressed while the backend loads: the camera must never open."""
+    creating = threading.Event()
+    release = threading.Event()
+    sources: list[FakeSource] = []
+
+    def slow_backend() -> FakeBackend:
+        creating.set()
+        release.wait(TIMEOUT)
+        return FakeBackend()
+
+    def source_factory() -> FakeSource:
+        sources.append(FakeSource())
+        return sources[-1]
+
+    worker = VisionWorker(source_factory, slow_backend, lambda _o: None)
+    worker.start()
+    try:
+        assert creating.wait(TIMEOUT)
+        worker.set_active(False)
+        release.set()
+        time.sleep(0.05)
+        assert sources == []
+        worker.set_active(True)
+        assert wait_until(lambda: bool(sources) and sources[0].is_open)
+    finally:
+        release.set()
+        worker.stop()
+
+
+def test_stop_during_backend_creation_never_opens_the_camera() -> None:
+    creating = threading.Event()
+    release = threading.Event()
+    sources: list[FakeSource] = []
+
+    def slow_backend() -> FakeBackend:
+        creating.set()
+        release.wait(TIMEOUT)
+        return FakeBackend()
+
+    worker = VisionWorker(lambda: sources.append(FakeSource()) or sources[-1], slow_backend, print)
+    worker.start()
+    assert creating.wait(TIMEOUT)
+    stopper = threading.Thread(target=worker.stop, args=(TIMEOUT,))
+    stopper.start()
+    time.sleep(0.02)
+    release.set()
+    stopper.join(TIMEOUT)
+    assert not worker.is_running
+    assert sources == []
+
+
+# ------------------------------------------------------- failing backend
+def test_backend_that_keeps_failing_is_reported_and_releases_the_camera() -> None:
+    """A backend that raises on every frame must not look like healthy tracking."""
+    h = Harness()
+
+    def always_failing() -> FakeBackend:
+        h.backends.append(FakeBackend(fail_times=10**6))
+        return h.backends[-1]
+
+    h.worker._backend_factory = always_failing
+    h.worker.BACKOFF_S = (0.05,)
+    h.worker.set_motion_gate(False, 2.0)
+    h.worker.start()
+    try:
+        assert wait_until(lambda: bool(h.worker.stats.extra.get("backend_failing")))
+        assert h.recorder.wait_for(
+            lambda: any(
+                (s.last_error or "").startswith("Vision backend keeps failing")
+                and "simulated inference failure" in (s.last_error or "")
+                for s in h.recorder.stats
+            )
+        )
+        # The camera is released while the worker backs off.
+        assert h.recorder.wait_for(
+            lambda: any(
+                not s.camera_open and s.extra.get("backend_failing") for s in h.recorder.stats
+            )
+        )
+        assert h.sources[0].release_calls >= 1
+        # The error is sticky: reopening the camera does not clear it.
+        assert wait_until(lambda: len(h.sources) >= 2)
+        with h.recorder.cond:
+            reopened = [
+                s for s in h.recorder.stats if s.camera_open and s.extra.get("camera_opens", 0) > 1
+            ]
+        assert reopened
+        assert all(s.last_error for s in reopened)
+        assert h.recorder.count() == 0
+    finally:
+        h.worker.stop()
+
+
+def test_backend_failure_clears_once_frames_are_analysed_again() -> None:
+    h = Harness()
+    h.backend_fail_times = 3  # the first backend fails three times in a row
+    h.worker.BACKOFF_S = (0.01,)
+    h.worker.set_motion_gate(False, 2.0)
+    h.worker.start()
+    try:
+        assert h.recorder.wait_for(lambda: len(h.recorder.observations) >= 2)
+        assert wait_until(lambda: h.worker.stats.last_error is None)
+        assert h.worker.stats.extra["backend_failing"] is False
+        assert any(s.extra.get("backend_failing") for s in h.recorder.stats)
+    finally:
+        h.worker.stop()
+
+
+# ------------------------------------------------------------- blinks and gate
+class ScriptedBackend(FakeBackend):
+    """Reports a blink for the first ``blinks`` analysed frames."""
+
+    def __init__(self, blinks: int = 0, face_count: int = 1) -> None:
+        super().__init__()
+        self.blinks = blinks
+        self.face_count = face_count
+
+    def process(self, frame_bgr: np.ndarray, timestamp: float) -> Observation:
+        obs = super().process(frame_bgr, timestamp)
+        blink = self.process_calls <= self.blinks
+        if self.face_count == 0:
+            return Observation(timestamp=timestamp, face_count=0, frame_size=obs.frame_size)
+        return dataclasses.replace(obs, blink=blink, face_count=self.face_count)
+
+
+def _run_worker(
+    backend: VisionBackend, frame_fn: Callable[[int], np.ndarray], n: int, *, gate: bool = True
+) -> list[Observation]:
+    recorder = Recorder()
+    worker = VisionWorker(
+        lambda: FakeSource(frame_fn=frame_fn), lambda: backend, recorder.on_observation
+    )
+    worker.set_interval(0.002)
+    worker.set_motion_gate(gate, 2.0)
+    worker.start()
+    try:
+        assert recorder.wait_for(lambda: len(recorder.observations) >= n)
+    finally:
+        worker.stop()
+    with recorder.cond:
+        return list(recorder.observations)
+
+
+def test_gate_never_holds_a_blink() -> None:
+    """After an analysed blink the next frame is analysed even if it looks the same."""
+    backend = ScriptedBackend(blinks=3)
+    obs = _run_worker(backend, lambda _n: np.full((48, 64, 3), 100, np.uint8), 8)
+    assert [o.skipped for o in obs[:4]] == [False, False, False, False]
+    assert not obs[3].blink
+    assert all(o.skipped for o in obs[4:8])  # eyes open: the gate holds again
+
+
+# ------------------------------------------------------------------ blindness
+def _dark(_n: int) -> np.ndarray:
+    return np.full((48, 64, 3), 3, np.uint8)
+
+
+def _textured(_n: int) -> np.ndarray:
+    rng = np.random.default_rng(5)
+    return cv2.resize(rng.integers(0, 255, (6, 8, 3), dtype=np.uint8), (64, 48))
+
+
+@pytest.mark.parametrize("gate", [True, False])
+def test_dark_featureless_frames_without_a_face_are_blind(gate: bool) -> None:
+    obs = _run_worker(ScriptedBackend(face_count=0), _dark, 4, gate=gate)
+    assert all(o.blind for o in obs)
+    assert not any(o.face_present for o in obs)
+    if gate:
+        assert any(o.skipped for o in obs)  # skipped copies keep the flag
+
+
+def test_ordinary_empty_scene_is_not_blind() -> None:
+    obs = _run_worker(ScriptedBackend(face_count=0), _textured, 3)
+    assert not any(o.blind for o in obs)
+
+
+def test_a_face_in_the_dark_is_not_blind() -> None:
+    obs = _run_worker(ScriptedBackend(face_count=1), _dark, 3)
+    assert not any(o.blind for o in obs)
+    assert all(o.face_present for o in obs)
 
 
 def test_stats_published_at_most_once_per_second(harness: Harness) -> None:

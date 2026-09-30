@@ -43,17 +43,23 @@ PRIVACY_STATEMENT = (
 #: (component, licence, what it is used for, homepage)
 THIRD_PARTY: tuple[tuple[str, str, str, str], ...] = (
     ("Qt 6 / PySide6", "LGPL-3.0", "User interface", "https://www.qt.io/qt-for-python"),
-    ("OpenCV", "Apache-2.0", "Camera capture and image processing", "https://opencv.org"),
     (
-        "MediaPipe Face Landmarker",
+        "OpenCV",
         "Apache-2.0",
-        "Face landmarks, head pose and iris position (model included)",
-        "https://ai.google.dev/edge/mediapipe",
+        "Camera capture, image processing and running the face models (DNN module)",
+        "https://opencv.org",
     ),
     (
-        "YuNet face detector (OpenCV Zoo)",
+        "MediaPipe Face Landmarker model",
+        "Apache-2.0",
+        "Face landmarks, head pose and iris position: the face mesh model and its "
+        "face geometry, run by OpenCV (the MediaPipe runtime is not included)",
+        "https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker",
+    ),
+    (
+        "YuNet face detector model (OpenCV Zoo)",
         "MIT",
-        "Lightweight face detection (model included)",
+        "Face detection",
         "https://github.com/opencv/opencv_zoo",
     ),
     ("NumPy", "BSD-3-Clause", "Numerical computing", "https://numpy.org"),
@@ -114,7 +120,8 @@ def _third_party_html() -> str:
         f"{rows}</table>"
         "<p>Each component is used under its own licence; the licence texts ship with "
         "the packages. Qt is linked dynamically and can be replaced, as the LGPL requires. "
-        "The trained models are redistributed unmodified.</p>"
+        "The trained models are redistributed unmodified (their origin and checksums are "
+        "listed in the models' NOTICE file).</p>"
     )
 
 

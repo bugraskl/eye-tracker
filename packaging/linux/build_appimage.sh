@@ -2,15 +2,21 @@
 # Package the Linux PyInstaller build as an AppImage and a tarball.
 #
 # Usage (from the repository root, after PyInstaller):
-#   bash packaging/linux/build_appimage.sh [--version X.Y.Z] [--dist DIR] [--appimagetool PATH]
+#   bash packaging/linux/build_appimage.sh [--version X.Y.Z] [--dist DIR]
+#        [--appimagetool PATH] [--runtime-file PATH] [--allow-unpinned]
 #
 # Writes to DIST (default: dist/):
 #   EyeTracker-<version>-linux-<arch>.AppImage
 #   EyeTracker-<version>-linux-<arch>.tar.gz   (eye-tracker/ with desktop file, icon, licence)
 #
 # appimagetool is taken from --appimagetool, $APPIMAGETOOL or PATH; if none is
-# found it is downloaded from $APPIMAGETOOL_URL (default: the AppImage project's
-# "continuous" release) into build/tools/. Set APPIMAGETOOL_SHA256 to pin it.
+# found, the pinned release below is downloaded into build/tools/ and verified
+# against its SHA-256. The AppImage runtime (the ELF header users execute first)
+# is pinned the same way and passed with --runtime-file, so appimagetool never
+# embeds whatever its "continuous" channel serves at build time. Override with
+# --runtime-file / $APPIMAGE_RUNTIME (a local file, checked if
+# $APPIMAGE_RUNTIME_SHA256 is set) or $APPIMAGETOOL_URL + $APPIMAGETOOL_SHA256.
+# A download without a checksum is refused unless --allow-unpinned is given.
 # Where FUSE is unavailable (containers, CI) export APPIMAGE_EXTRACT_AND_RUN=1.
 # Set UPDATE_INFORMATION to embed AppImage update information; a .zsync file is
 # written next to the AppImage when appimagetool can produce one.
@@ -28,13 +34,32 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 DIST="$ROOT/dist"
 VERSION=""
 APPIMAGETOOL="${APPIMAGETOOL:-}"
+RUNTIME_FILE="${APPIMAGE_RUNTIME:-}"
+ALLOW_UNPINNED=0
+
+# Pinned third-party build tools. To update: pick a tagged release, and copy the
+# SHA-256 of each asset from the release page (or `sha256sum` a downloaded copy).
+APPIMAGETOOL_VERSION="1.9.1"        # https://github.com/AppImage/appimagetool/releases
+APPIMAGE_RUNTIME_VERSION="20251108" # https://github.com/AppImage/type2-runtime/releases
+
+pinned_sha256() {
+  case "$1:$2" in
+    appimagetool:x86_64) echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0" ;;
+    appimagetool:aarch64) echo "f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158" ;;
+    runtime:x86_64) echo "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d" ;;
+    runtime:aarch64) echo "00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444" ;;
+    *) return 1 ;;
+  esac
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --version) VERSION="${2:?--version needs a value}"; shift 2 ;;
     --dist) DIST="${2:?--dist needs a path}"; shift 2 ;;
     --appimagetool) APPIMAGETOOL="${2:?--appimagetool needs a path}"; shift 2 ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    --runtime-file) RUNTIME_FILE="${2:?--runtime-file needs a path}"; shift 2 ;;
+    --allow-unpinned) ALLOW_UNPINNED=1; shift ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -58,7 +83,34 @@ BASENAME="EyeTracker-$VERSION-linux-$ARCH"
 TARBALL="$DIST/$BASENAME.tar.gz"
 APPIMAGE="$DIST/$BASENAME.AppImage"
 
-# ------------------------------------------------------------------- appimagetool
+# ------------------------------------------------------------------ build tools
+is_verified() {
+  local file="$1" sha256="$2"
+  [[ -f "$file" ]] && echo "$sha256  $file" | sha256sum --check --status
+}
+
+# Download URL to DEST (atomically) unless a copy with the expected checksum is
+# already there. An empty checksum is refused unless --allow-unpinned was given.
+fetch_verified() {
+  local url="$1" dest="$2" sha256="$3"
+  if [[ -n "$sha256" ]] && is_verified "$dest" "$sha256"; then
+    return 0
+  fi
+  if [[ -z "$sha256" ]]; then
+    [[ "$ALLOW_UNPINNED" == 1 ]]       || die "refusing to download $url without a SHA-256 (set one, or pass --allow-unpinned)"
+    echo "build_appimage: warning: $url is not verified (--allow-unpinned)" >&2
+  fi
+  command -v curl >/dev/null 2>&1 || die "curl is needed to download $url"
+  echo "==> Downloading $url"
+  mkdir -p "$(dirname "$dest")"
+  curl --fail --location --silent --show-error --retry 3 --output "$dest.part" "$url"
+  if [[ -n "$sha256" ]] && ! is_verified "$dest.part" "$sha256"; then
+    rm -f "$dest.part"
+    die "checksum mismatch for $url (expected $sha256)"
+  fi
+  mv "$dest.part" "$dest"
+}
+
 find_appimagetool() {
   if [[ -n "$APPIMAGETOOL" ]]; then
     if [[ -x "$APPIMAGETOOL" ]]; then return 0; fi
@@ -73,21 +125,33 @@ find_appimagetool() {
     return 0
   fi
 
-  local url="${APPIMAGETOOL_URL:-https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$ARCH.AppImage}"
-  local tools="$ROOT/build/tools"
-  APPIMAGETOOL="$tools/appimagetool-$ARCH.AppImage"
-  if [[ ! -x "$APPIMAGETOOL" ]]; then
-    command -v curl >/dev/null 2>&1 || die "appimagetool is missing and curl is not installed"
-    echo "==> Downloading appimagetool from $url"
-    mkdir -p "$tools"
-    curl --fail --location --silent --show-error --retry 3 --output "$APPIMAGETOOL.part" "$url"
-    mv "$APPIMAGETOOL.part" "$APPIMAGETOOL"
-    chmod 755 "$APPIMAGETOOL"
+  local url sha256 name
+  if [[ -n "${APPIMAGETOOL_URL:-}" ]]; then
+    url="$APPIMAGETOOL_URL"
+    sha256="${APPIMAGETOOL_SHA256:-}"
+    name="appimagetool-custom-$ARCH.AppImage"
+  else
+    url="https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-$ARCH.AppImage"
+    sha256="${APPIMAGETOOL_SHA256:-$(pinned_sha256 appimagetool "$ARCH" || true)}"
+    name="appimagetool-$APPIMAGETOOL_VERSION-$ARCH.AppImage"
   fi
-  if [[ -n "${APPIMAGETOOL_SHA256:-}" ]]; then
-    echo "$APPIMAGETOOL_SHA256  $APPIMAGETOOL" | sha256sum --check --status \
-      || die "appimagetool checksum mismatch (expected $APPIMAGETOOL_SHA256)"
+  APPIMAGETOOL="$ROOT/build/tools/$name"
+  fetch_verified "$url" "$APPIMAGETOOL" "$sha256"
+  chmod 755 "$APPIMAGETOOL"
+}
+
+find_runtime() {
+  if [[ -n "$RUNTIME_FILE" ]]; then
+    [[ -f "$RUNTIME_FILE" ]] || die "AppImage runtime not found: $RUNTIME_FILE"
+    if [[ -n "${APPIMAGE_RUNTIME_SHA256:-}" ]]; then
+      is_verified "$RUNTIME_FILE" "$APPIMAGE_RUNTIME_SHA256"         || die "checksum mismatch for $RUNTIME_FILE (expected $APPIMAGE_RUNTIME_SHA256)"
+    fi
+    return 0
   fi
+  local sha256
+  sha256="${APPIMAGE_RUNTIME_SHA256:-$(pinned_sha256 runtime "$ARCH" || true)}"
+  RUNTIME_FILE="$ROOT/build/tools/runtime-$APPIMAGE_RUNTIME_VERSION-$ARCH"
+  fetch_verified     "https://github.com/AppImage/type2-runtime/releases/download/$APPIMAGE_RUNTIME_VERSION/runtime-$ARCH"     "$RUNTIME_FILE" "$sha256"
 }
 
 # ------------------------------------------------------------------ libxcb-cursor
@@ -124,6 +188,7 @@ ensure_xcb_cursor() {
 }
 
 find_appimagetool
+find_runtime
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/eye-tracker-appimage.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -159,7 +224,8 @@ install -m 644 "$ROOT/LICENSE" "$APPDIR/usr/lib/eye-tracker/LICENSE"
 ln -s eye-tracker.png "$APPDIR/.DirIcon"
 
 echo "==> Running appimagetool ($APPIMAGETOOL)"
-TOOL_ARGS=(--no-appstream)
+# The pinned runtime becomes the AppImage's entry point.
+TOOL_ARGS=(--no-appstream --runtime-file "$RUNTIME_FILE")
 if [[ -n "${UPDATE_INFORMATION:-}" ]]; then
   TOOL_ARGS+=(--updateinformation "$UPDATE_INFORMATION")
 fi

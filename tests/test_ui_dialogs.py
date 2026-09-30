@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from eye_tracker.config import Settings, describe_settings
-from eye_tracker.gaze.calibration import CalibrationTarget
+from eye_tracker.gaze.calibration import CalibrationSample, CalibrationTarget
 from eye_tracker.gaze.store import CalibrationData
 from eye_tracker.platform import autostart
 from eye_tracker.platform.base import PlatformServices
@@ -49,7 +49,7 @@ pytestmark = pytest.mark.usefixtures("qapp")
 
 LEFT = Monitor(0, "Left", Rect(0, 0, 1920, 1080), primary=True)
 RIGHT = Monitor(1, "Right", Rect(1920, 0, 1920, 1080))
-BACKEND = ("mediapipe", "mp-pose-iris-1")
+BACKEND = ("facemesh", "facemesh-pose-iris-1")
 MACOS = sys.platform == "darwin"
 
 
@@ -105,6 +105,9 @@ class FakeController(QObject):
         self.is_calibrated = False
         self.calibration_reason = "no calibration yet"
         self.hotkey_manager: Any = None
+        #: What gaze_feature_indices() reports: the synthetic observations below
+        #: encode the dot's position in features 0 and 1.
+        self.gaze_indices: tuple[int, ...] | None = (0, 1)
         self.notify.connect(lambda title, text: self.notifications.append((title, text)))
 
     @property
@@ -121,6 +124,9 @@ class FakeController(QObject):
 
     def backend_info(self) -> tuple[str, str]:
         return self.backend
+
+    def gaze_feature_indices(self) -> tuple[int, ...] | None:
+        return self.gaze_indices
 
     def calibration(self) -> CalibrationData | None:
         return None
@@ -155,18 +161,23 @@ class FakeAutostart:
         self.enabled = False
         self.calls: list[str] = []
         self.fail: str | None = None
+        #: What status() reports while not enabled ("disabled", "stale", ...).
+        self.idle_status = "disabled"
 
-    def enable(self, background: bool = True) -> None:
+    def enable(self, background: bool = True, config_dir: Any = None) -> None:
         self.calls.append("enable" if background else "enable-foreground")
         if self.fail:
             raise autostart.AutostartError(self.fail)
         self.enabled = True
 
-    def disable(self) -> None:
+    def disable(self, config_dir: Any = None) -> None:
         self.calls.append("disable")
         if self.fail:
             raise autostart.AutostartError(self.fail)
         self.enabled = False
+
+    def status(self, config_dir: Any = None) -> autostart.Status:
+        return autostart.Status("enabled" if self.enabled else self.idle_status)
 
 
 @pytest.fixture(autouse=True)
@@ -176,18 +187,25 @@ def fake_autostart(monkeypatch: pytest.MonkeyPatch) -> FakeAutostart:
     monkeypatch.setattr(autostart, "is_enabled", lambda: fake.enabled)
     monkeypatch.setattr(autostart, "enable", fake.enable)
     monkeypatch.setattr(autostart, "disable", fake.disable)
+    monkeypatch.setattr(autostart, "status", fake.status)
     return fake
 
 
 @pytest.fixture(autouse=True)
-def no_real_probes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Camera probing and the diagnostics report are faked everywhere."""
+def probes(monkeypatch: pytest.MonkeyPatch) -> list[frozenset[int]]:
+    """Camera probing and the diagnostics report are faked everywhere.
 
-    def probe(max_index: int = 4, api: str = "auto") -> list[CameraInfo]:
+    Returns the ``skip`` set of every probe (the camera in use is never opened).
+    """
+    calls: list[frozenset[int]] = []
+
+    def probe(max_index: int = 4, api: str = "auto", skip: Any = ()) -> list[CameraInfo]:
+        calls.append(frozenset(skip))
         return [CameraInfo(0, "Integrated Camera", 640, 480), CameraInfo(2, "USB Cam", 1280, 720)]
 
     monkeypatch.setattr(sd, "probe_cameras", probe)
     monkeypatch.setattr(sd, "load_diagnostics_text", lambda: "FAKE DIAGNOSTICS REPORT")
+    return calls
 
 
 def _dispose(widget: QWidget | QObject) -> None:
@@ -219,7 +237,7 @@ def _button(parent: QWidget, text: str) -> QPushButton:
 def _non_default_settings() -> Settings:
     """Every field changed from its default, with floats a spin box cannot show exactly."""
     s = Settings()
-    s.general.backend = "opencv"
+    s.general.backend = "lite"
     s.general.start_paused = True
     s.general.first_run_done = True
     s.general.notifications = False
@@ -238,6 +256,7 @@ def _non_default_settings() -> Settings:
     s.switching.cooldown_ms = 900
     s.switching.mouse_grace_ms = 1234
     s.switching.typing_grace_ms = 2500
+    s.switching.reading_grace_ms = 7500
     s.switching.cursor_target = "gaze"
     s.switching.focus_window = False
     s.switching.smoothing = 0.377
@@ -443,7 +462,7 @@ def test_invalid_hotkeys_block_apply(
 
 
 def test_duplicate_hotkeys_are_rejected(dialog: SettingsDialog) -> None:
-    dialog.hotkey_edit("toggle_tracking").set_hotkey("ctrl+alt+c")  # recalibrate's default
+    dialog.hotkey_edit("toggle_tracking").set_hotkey(Settings().hotkeys.recalibrate)
     errors = dialog.hotkey_errors()
     assert len(errors) == 1
     assert "same shortcut" in next(iter(errors.values()))
@@ -508,7 +527,7 @@ def test_live_stats_are_shown(controller: FakeController, dialog: SettingsDialog
             "cpu_percent": 0.64,
             "state": "tracking",
             "state_label": "Tracking",
-            "backend": "mediapipe",
+            "backend": "facemesh",
         }
     )
     text = dialog.stats_text()
@@ -618,6 +637,7 @@ def _observation(
     face: bool = True,
     usable: bool = True,
     skipped: bool = False,
+    frame_size: tuple[int, int] = (0, 0),
 ) -> Observation:
     """A synthetic observation whose features encode the dot being looked at."""
     features = None
@@ -630,6 +650,7 @@ def _observation(
         features=features,
         quality=1.0 if face else 0.0,
         skipped=skipped,
+        frame_size=frame_size,
     )
 
 
@@ -1139,3 +1160,498 @@ def test_hotkeys_are_suspended_while_a_shortcut_is_recorded(
     edit._set_recording(True)
     edit.hide()  # closing the dialog mid-recording must restore the hotkeys
     assert calls == [True, False, True, False]
+
+
+# ======================================================== settings: review fixes
+def _autostart_box(dialog: SettingsDialog) -> QCheckBox:
+    return next(
+        b for b in dialog.findChildren(QCheckBox) if b.text() == "Start Eye Tracker when I log in"
+    )
+
+
+def test_backend_choices_are_the_opencv_backends(dialog: SettingsDialog) -> None:
+    combo = dialog.widget_for("general.backend")
+    assert isinstance(combo, QComboBox)
+    assert [combo.itemData(i) for i in range(combo.count())] == ["auto", "facemesh", "lite"]
+    assert combo.itemText(1).startswith("Face mesh")
+    assert combo.itemText(2).startswith("Lite")
+    labels = " ".join(combo.itemText(i) for i in range(combo.count()))
+    assert "MediaPipe" not in labels
+    assert "OpenCV" not in labels
+
+
+def test_failed_start_at_login_change_stays_pending(
+    fake_autostart: FakeAutostart, dialog: SettingsDialog
+) -> None:
+    """Regression (ui_app-02): a second OK must retry, not accept the failed state."""
+    accepted: list[bool] = []
+    dialog.accepted.connect(lambda: accepted.append(True))
+    box = _autostart_box(dialog)
+    fake_autostart.fail = "access denied"
+    box.setChecked(True)
+    assert dialog.apply() is False
+    assert "access denied" in dialog._status.text()
+    assert box.isChecked()
+    assert dialog.is_modified()  # still pending: Apply stays enabled
+    apply_button = dialog._buttons.button(QDialogButtonBox.StandardButton.Apply)
+    assert apply_button is not None
+    assert apply_button.isEnabled()
+    dialog.accept()  # OK tries again, fails again, and the dialog stays open
+    assert fake_autostart.calls == ["enable", "enable"]
+    assert accepted == []
+    assert not fake_autostart.enabled
+    fake_autostart.fail = None
+    dialog.accept()
+    assert fake_autostart.calls == ["enable", "enable", "enable"]
+    assert fake_autostart.enabled
+    assert accepted == [True]
+    assert not dialog.is_modified()
+
+
+def test_start_at_login_explains_a_stale_login_item(
+    controller: FakeController, fake_autostart: FakeAutostart
+) -> None:
+    fake_autostart.idle_status = "stale"
+    dlg = SettingsDialog(controller)
+    try:
+        note = dlg._autostart_note
+        assert not note.isHidden()
+        assert "no longer exists" in note.text()
+        box = _autostart_box(dlg)
+        assert not box.isChecked()
+        box.setChecked(True)  # re-enabling points the item at this copy
+        assert dlg.apply()
+        assert fake_autostart.calls == ["enable"]
+        assert note.isHidden()
+    finally:
+        _dispose(dlg)
+
+
+def test_reading_grace_is_editable_next_to_the_typing_grace(
+    controller: FakeController, dialog: SettingsDialog
+) -> None:
+    spin = dialog.widget_for("switching.reading_grace_ms")
+    assert isinstance(spin, QSpinBox)
+    assert spin.value() == Settings().switching.reading_grace_ms
+    spin.setValue(9000)
+    dialog.widget_for("switching.enabled").setChecked(False)  # type: ignore[attr-defined]
+    assert not spin.isEnabled()  # follows "Move the cursor to the monitor I look at"
+    assert dialog.apply()
+    assert controller.applied[-1].switching.reading_grace_ms == 9000
+
+
+def test_invalid_hotkey_does_not_block_other_changes_while_hotkeys_are_off() -> None:
+    """Regression (ui_app-10): a hand-edited bad shortcut must not lock the dialog."""
+    settings = Settings()
+    settings.hotkeys.enabled = False
+    settings.hotkeys.toggle_tracking = "ctrl+alt+"
+    controller = FakeController(settings)
+    dlg = SettingsDialog(controller)
+    try:
+        ok = dlg._buttons.button(QDialogButtonBox.StandardButton.Ok)
+        assert ok is not None
+        assert dlg.is_valid()
+        assert ok.isEnabled()
+        dlg.widget_for("general.notifications").setChecked(False)  # type: ignore[attr-defined]
+        assert dlg.apply()
+        applied = controller.applied[-1]
+        assert applied.general.notifications is False
+        assert applied.hotkeys.toggle_tracking == "ctrl+alt+"  # left as it was
+        # Turning shortcuts back on brings the problem up, also in the footer,
+        # which is visible from every page.
+        dlg.show_page("general")
+        dlg.widget_for("hotkeys.enabled").setChecked(True)  # type: ignore[attr-defined]
+        assert not dlg.is_valid()
+        assert not ok.isEnabled()
+        assert dlg._status.text().startswith("Pause / resume tracking:")
+        dlg.hotkey_edit("toggle_tracking").set_hotkey("ctrl+alt+j")
+        assert dlg.is_valid()
+        assert ok.isEnabled()
+        assert dlg._status.text() == ""
+    finally:
+        _dispose(dlg)
+
+
+class _LayoutAwareHotkeys:
+    """A hotkey manager whose ``layout_conflict`` flags Ctrl+Alt+T (AltGr+T)."""
+
+    supported = True
+    note = None
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+
+    def layout_conflict(self, hotkey: object) -> str | None:
+        self.asked.append(str(hotkey))
+        if str(hotkey) == "ctrl+alt+t":
+            return "Ctrl+Alt+T is AltGr+T, which types '₺' on the Turkish Q keyboard layout"
+        return None
+
+
+def test_shortcuts_that_type_a_character_are_flagged(controller: FakeController) -> None:
+    manager = _LayoutAwareHotkeys()
+    controller.hotkey_manager = manager
+    dlg = SettingsDialog(controller)
+    try:
+        edit = dlg.hotkey_edit("toggle_tracking")
+        edit.set_hotkey("ctrl+alt+t")
+        # A warning, not an error: the OS refuses it, but other changes can be applied.
+        assert dlg.is_valid()
+        warning = dlg._hotkey_warning
+        assert not warning.isHidden()
+        assert "Turkish Q" in warning.text()
+        assert warning.text().startswith("Pause / resume tracking:")
+        dlg.widget_for("general.notifications").setChecked(False)  # type: ignore[attr-defined]
+        assert manager.asked.count("ctrl+alt+t") == 1  # answers are cached
+        edit.set_hotkey("ctrl+alt+meta+t")
+        assert warning.isHidden()
+    finally:
+        _dispose(dlg)
+
+
+def test_detect_cameras_never_probes_the_camera_in_use(
+    controller: FakeController, dialog: SettingsDialog, probes: list[frozenset[int]]
+) -> None:
+    """Regression (vision-01): closing a DirectShow probe of the camera in use kills it."""
+    dialog.detect_cameras()
+    assert _wait_until(dialog._detect_button.isEnabled)
+    assert probes == [frozenset({0})]  # the applied device, not the edited one
+    assert "The camera in use is not probed." in dialog._camera_note.text()
+    video = controller.settings.copy()
+    video.camera.device = "clip.mp4"  # not a camera index: nothing to leave out
+    controller.apply_settings(video)
+    dialog.detect_cameras()
+    assert _wait_until(dialog._detect_button.isEnabled)
+    assert probes[-1] == frozenset()
+
+
+def test_the_camera_in_use_stays_selectable_after_detection(
+    dialog: SettingsDialog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        sd,
+        "probe_cameras",
+        lambda max_index=4, api="auto", skip=(): [CameraInfo(2, "USB Cam", 1280, 720)],
+    )
+    dialog.detect_cameras()
+    assert _wait_until(dialog._detect_button.isEnabled)
+    combo = dialog.widget_for("camera.device")
+    assert isinstance(combo, QComboBox)
+    assert [combo.itemData(i) for i in range(combo.count())] == ["2", "0"]
+    assert combo.currentData() == "0"
+    assert "in use" in combo.currentText()
+    assert not dialog.is_modified()
+
+
+# ====================================================== calibration: review fixes
+def _run_to_result(
+    window: CalibrationWindow,
+    controller: FakeController,
+    clock: FakeClock,
+    make: Callable[[CalibrationTarget | None], Observation | None] | None = None,
+) -> None:
+    rng = np.random.default_rng(11)
+    window.start()
+    window.begin()
+    _run_dots(window, controller, clock, make or (lambda t: _observation(t, clock(), rng)))
+    window.tick()
+
+
+def test_calibration_fits_with_the_gaze_features_and_records_the_camera(
+    calib: tuple[CalibrationWindow, FakeController, FakeClock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window, controller, clock = calib
+    controller.settings.camera.device = "1"
+    rng = np.random.default_rng(12)
+    seen: list[object] = []
+    real = cw.evaluate
+
+    def spy(samples: Any, monitors: Any, degree: Any = None, *, nonlinear: Any = None) -> Any:
+        seen.append(nonlinear)
+        return real(samples, monitors, degree, nonlinear=nonlinear)
+
+    monkeypatch.setattr(cw, "evaluate", spy)
+    _run_to_result(
+        window,
+        controller,
+        clock,
+        lambda t: _observation(t, clock(), rng, frame_size=(640, 480)),
+    )
+    assert window.state == cw.STATE_RESULT
+    assert seen == [(0, 1)]  # controller.gaze_feature_indices()
+    assert window.model is not None
+    assert window.model.nonlinear == (0, 1)
+    assert window.save()
+    data = controller.finished[-1]
+    assert isinstance(data, CalibrationData)
+    assert data.camera == "1"
+    assert data.frame_size == (640, 480)
+    assert data.camera_matches(camera="1", frame_size=(1280, 960)) == (True, "")
+
+
+def test_gaze_features_come_from_the_backend_class_without_a_controller_api() -> None:
+    from eye_tracker.gaze.model import gaze_feature_indices
+    from eye_tracker.vision.backends import backend_class
+
+    class Minimal:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def backend_info(self) -> tuple[str, str]:
+            return (self.name, "v")
+
+    lite = backend_class("lite")
+    expected = gaze_feature_indices(lite.feature_names, lite.gaze_features)
+    assert expected
+    assert cw.controller_gaze_features(Minimal("lite")) == expected
+    assert cw.controller_gaze_features(Minimal("no-such-backend")) is None
+    assert cw.controller_gaze_features(Minimal("")) is None
+    assert cw.controller_gaze_features(object()) is None
+    # Indices that do not fit the recorded features degrade to "all nonlinear".
+    sample = CalibrationSample(np.zeros(4), 0.0, 0.0, 0, 0)
+    assert cw._fit_features((0, 7), [sample]) is None
+    assert cw._fit_features((0, 1), [sample]) == (0, 1)
+    assert cw._fit_features(None, [sample]) is None
+
+
+def test_an_untouched_intro_closes_itself(
+    calib: tuple[CalibrationWindow, FakeController, FakeClock],
+) -> None:
+    """Regression (ui_app-06): an abandoned calibration suspended walk-away locking."""
+    window, controller, clock = calib
+    results: list[bool] = []
+    window.finished.connect(results.append)
+    window.start()
+    clock.advance(cw.IDLE_TIMEOUT_S - 1)
+    window.tick()
+    assert window.state == cw.STATE_INTRO
+    QTest.keyClick(window.surfaces()[0], Qt.Key.Key_A)  # any key: someone is there
+    clock.advance(cw.IDLE_TIMEOUT_S - 1)
+    assert window.check_idle() is False
+    clock.advance(2.0)
+    assert window.check_idle() is True
+    assert window.state == cw.STATE_CLOSED
+    assert controller.finished == [None]  # the controller leaves CALIBRATING
+    assert results == [False]
+    title, text = controller.notifications[-1]
+    assert title == "Calibration closed"
+    assert "Calibrate now" in text
+
+
+def test_an_unsaved_result_closes_itself(
+    calib: tuple[CalibrationWindow, FakeController, FakeClock],
+) -> None:
+    window, controller, clock = calib
+    _run_to_result(window, controller, clock)
+    assert window.state == cw.STATE_RESULT
+    # The animation timer is stopped on this screen; the watchdog keeps running.
+    assert window._watchdog.isActive()
+    clock.advance(cw.IDLE_TIMEOUT_S + 1)
+    assert window.check_idle()
+    assert controller.finished == [None]  # nothing saved without Enter
+
+
+def test_an_error_screen_closes_itself(
+    calib: tuple[CalibrationWindow, FakeController, FakeClock],
+) -> None:
+    window, controller, clock = calib
+    rng = np.random.default_rng(13)
+    _run_to_result(window, controller, clock, lambda t: _observation(t, clock(), rng, skipped=True))
+    assert window.state == cw.STATE_ERROR
+    assert window._watchdog.isActive()
+    clock.advance(cw.IDLE_TIMEOUT_S + 1)
+    assert window.check_idle()
+    assert window.state == cw.STATE_CLOSED
+
+
+def test_dots_paused_without_a_face_close_the_calibration(
+    calib: tuple[CalibrationWindow, FakeController, FakeClock],
+) -> None:
+    window, controller, clock = calib
+    rng = np.random.default_rng(14)
+    window.start()
+    window.begin()
+    for _ in range(40):  # 2 s without a face: the dots pause
+        controller.observation.emit(_observation(None, clock(), rng, face=False))
+        clock.advance(0.05)
+        window.tick()
+    assert window.paused
+    clock.advance(cw.NO_FACE_TIMEOUT_S - 3)
+    window.tick()
+    assert window.state == cw.STATE_RUNNING
+    clock.advance(3.0)
+    window.tick()
+    assert window.state == cw.STATE_CLOSED
+    assert "No face" in controller.notifications[-1][1]
+
+
+def test_a_manual_pause_left_alone_closes_the_calibration(
+    calib: tuple[CalibrationWindow, FakeController, FakeClock],
+) -> None:
+    window, controller, clock = calib
+    rng = np.random.default_rng(15)
+    window.start()
+    window.begin()
+    controller.observation.emit(_observation(window.current_target, clock(), rng))
+    QTest.keyClick(window.surfaces()[0], Qt.Key.Key_Space)
+    assert window.paused
+    for _ in range(3):
+        clock.advance(cw.IDLE_TIMEOUT_S / 4)
+        controller.observation.emit(_observation(window.current_target, clock(), rng))
+        window.tick()
+    assert window.state == cw.STATE_RUNNING  # a face alone is not a key press
+    clock.advance(cw.IDLE_TIMEOUT_S / 4 + 1)
+    window.tick()
+    assert window.state == cw.STATE_CLOSED
+
+
+def test_a_layout_change_at_save_cancels_instead_of_offering_a_retry(
+    calib: tuple[CalibrationWindow, FakeController, FakeClock],
+) -> None:
+    """Regression (ui_app-05): retrying planned on the stale layout forever."""
+    window, controller, clock = calib
+    _run_to_result(window, controller, clock)
+    assert window.state == cw.STATE_RESULT
+    controller._monitors = [LEFT, Monitor(1, "Right", Rect(1920, 0, 2560, 1440))]
+    assert window.save() is False
+    assert window.state == cw.STATE_CLOSED
+    assert controller.finished == [None]
+    assert controller.notifications[-1][0] == "Calibration cancelled"
+
+
+def test_retry_rechecks_the_monitor_layout(
+    calib: tuple[CalibrationWindow, FakeController, FakeClock],
+) -> None:
+    window, controller, clock = calib
+    rng = np.random.default_rng(16)
+    _run_to_result(window, controller, clock, lambda t: _observation(t, clock(), rng, skipped=True))
+    assert window.state == cw.STATE_ERROR
+    # The controller reports the new layout only after its debounce.
+    controller._monitors = [Monitor(0, "Left", Rect(0, 0, 2560, 1440), primary=True), RIGHT]
+    QTest.keyClick(window.surfaces()[0], Qt.Key.Key_R)
+    assert window.state == cw.STATE_CLOSED
+    assert controller.notifications[-1][0] == "Calibration cancelled"
+
+
+def test_screen_geometry_and_primary_changes_cancel(
+    calib: tuple[CalibrationWindow, FakeController, FakeClock],
+) -> None:
+    window, controller, _clock = calib
+    screen = QGuiApplication.primaryScreen()
+    assert screen is not None
+    window.start()
+    screen.geometryChanged.emit(screen.geometry())  # resolution change or rearrangement
+    assert window.state == cw.STATE_CLOSED
+    assert controller.finished == [None]
+    screen.geometryChanged.emit(screen.geometry())  # disconnected: nothing happens
+
+    second = _make_window(controller, FakeClock())
+    try:
+        second.start()
+        app = QGuiApplication.instance()
+        assert isinstance(app, QGuiApplication)
+        app.primaryScreenChanged.emit(screen)
+        assert second.state == cw.STATE_CLOSED
+    finally:
+        _dispose(second)
+
+
+def test_a_screen_without_usable_dots_is_named_on_the_result() -> None:
+    third = Monitor(2, "Third", Rect(3840, 0, 1920, 1080))
+    controller = FakeController(monitors=(LEFT, RIGHT, third))
+    clock = FakeClock()
+    window = _make_window(controller, clock)
+    rng = np.random.default_rng(17)
+
+    def make(target: CalibrationTarget | None) -> Observation:
+        # The face is seen but not measurable while looking at the third screen.
+        usable = target is None or target.monitor_index != third.index
+        return _observation(target, clock(), rng, usable=usable)
+
+    try:
+        _run_to_result(window, controller, clock, make)
+        assert window.state == cw.STATE_RESULT
+        report = window.report
+        assert report is not None
+        assert report.uncovered_monitors == [third.index]
+        assert report.grade in ("fair", "poor")
+        card = window.surfaces()[0].card  # type: ignore[attr-defined]
+        tip = card.labels["tip"].text()
+        assert tip.startswith("Screen 3 was not calibrated")
+        assert "press R" in tip
+    finally:
+        window.cancel()
+        _dispose(window)
+
+
+# =========================================================== wizard: review fixes
+def test_wizard_names_a_camera_blocked_by_privacy_settings(
+    wizard_env: tuple[FakeController, FakeClock, list[FirstRunWizard]],
+) -> None:
+    controller, clock, _ = wizard_env
+    controller.platform.perms["camera"] = False
+    wizard = _wizard(wizard_env, show_permissions=False)
+    wizard.next()
+    page = wizard.camera_page
+    assert page.privacy_settings.isHidden()
+    controller.state_changed.emit(TrackingState.CAMERA_ERROR)
+    assert wizard.face_status() == "blocked"
+    assert "privacy settings" in page.status.text()
+    assert "try another one" not in page.status.text()
+    assert not page.privacy_settings.isHidden()
+    assert not page.help.isHidden()
+    page.privacy_settings.click()
+    assert controller.platform.calls[-1] == ("open", "camera")
+    # The camera works again: the hints go away.
+    controller.state_changed.emit(TrackingState.NEEDS_CALIBRATION)
+    controller.observation.emit(Observation(timestamp=clock(), face_count=1, quality=1.0))
+    assert wizard.face_status() == "face"
+    assert page.privacy_settings.isHidden()
+    assert page.help.isHidden()
+
+
+def test_wizard_offers_the_privacy_settings_for_any_camera_error(
+    wizard_env: tuple[FakeController, FakeClock, list[FirstRunWizard]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, _clock, _ = wizard_env
+    controller.platform.perms["camera"] = None  # the OS cannot tell
+    monkeypatch.setattr(controller.platform, "open_permission_settings", lambda name: False)
+    wizard = _wizard(wizard_env, show_permissions=False)
+    wizard.next()
+    controller.state_changed.emit(TrackingState.CAMERA_ERROR)
+    assert wizard.face_status() == "error"
+    page = wizard.camera_page
+    assert "another app may be using it" in page.status.text()
+    assert not page.privacy_settings.isHidden()
+    page.privacy_settings.click()  # no settings page here (Linux): the steps stand out
+    assert not page.help.isHidden()
+    assert page.help.text() == wz.CAMERA_PRIVACY_HELP.get(
+        sys.platform, wz.CAMERA_PRIVACY_HELP["linux"]
+    )
+
+
+def test_wizard_detect_cameras_skips_the_camera_in_use(
+    wizard_env: tuple[FakeController, FakeClock, list[FirstRunWizard]],
+    probes: list[frozenset[int]],
+) -> None:
+    wizard = _wizard(wizard_env, show_permissions=False)
+    wizard.next()  # the live preview holds camera 0 now
+    wizard.detect_cameras()
+    assert _wait_until(wizard.camera_page.detect.isEnabled)
+    assert probes == [frozenset({0})]
+
+
+def test_wizard_explains_a_stale_accessibility_grant(
+    wizard_env: tuple[FakeController, FakeClock, list[FirstRunWizard]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, _clock, _ = wizard_env
+    monkeypatch.setattr(controller.platform, "accessibility_status", lambda: "stale", raising=False)
+    wizard = _wizard(wizard_env, show_permissions=True)
+    wizard.next()
+    wizard.next()
+    assert wizard.currentId() == wz.PAGE_PERMISSIONS
+    text = wizard.permissions_page.status["accessibility"].text()
+    assert text.startswith("✗ Granted to an earlier version")
+    assert wizard.permissions_page.allow["accessibility"].isEnabled()

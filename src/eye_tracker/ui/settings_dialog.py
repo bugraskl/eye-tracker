@@ -21,7 +21,7 @@ import logging
 import math
 import sys
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -70,16 +70,19 @@ from ..platform import autostart
 from ..platform.base import PlatformServices
 from ..platform.hotkeys import format_hotkey, parse_hotkey
 from ..types import TrackingState
+from . import util
 from .icons import app_icon
-from .util import ACCENT, DANGER, ui_scale
+from .util import ACCENT, DANGER, WARNING, ui_scale
 
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "BACKEND_LABELS",
     "HOTKEY_ACTIONS",
     "CameraProbe",
     "HotkeyEdit",
     "SettingsDialog",
+    "camera_in_use",
     "format_stats",
     "hotkey_text_from_event",
     "load_diagnostics_text",
@@ -95,6 +98,25 @@ HOTKEY_ACTIONS: tuple[tuple[str, str], ...] = (
     ("toggle_privacy", "Privacy mode (camera off)"),
     ("recalibrate", "Recalibrate"),
 )
+
+#: Explanations under "Start at login" by ``autostart.status()`` value.
+_AUTOSTART_NOTES: dict[str, str] = {
+    "stale": (
+        f"The login item starts a copy of {APP_NAME} that no longer exists or will be gone "
+        "after a restart. Tick the box and apply to point it at this copy."
+    ),
+    "other-profile": (
+        f"The login item starts {APP_NAME} with another settings folder (--config-dir). "
+        "Tick the box and apply to start this one instead."
+    ),
+}
+
+#: Vision backends offered in the settings (``general.backend`` values), best first.
+BACKEND_LABELS: dict[str, str] = {
+    "auto": "Automatic (recommended)",
+    "facemesh": "Face mesh — head pose + eye direction (most accurate)",
+    "lite": "Lite — head pose from face geometry only (lightest)",
+}
 
 # Settings metadata (range, choices, documentation) keyed by "section.field".
 _META: dict[str, dict[str, Any]] = {row["key"]: row for row in describe_settings()}
@@ -187,11 +209,26 @@ def format_stats(stats: object) -> str:
     return " · ".join(parts)
 
 
-def probe_cameras(max_index: int = 4, api: str = "auto") -> list[Any]:
-    """List cameras that deliver frames (runs on a worker thread; tests patch this)."""
+def probe_cameras(max_index: int = 4, api: str = "auto", skip: Collection[int] = ()) -> list[Any]:
+    """List cameras that deliver frames (runs on a worker thread; tests patch this).
+
+    Indices in ``skip`` are never opened: the camera the tracker is using must
+    not be probed, since closing the probe would tear down the tracker's capture
+    of the same device on DirectShow.
+    """
     from ..vision.camera import list_cameras
 
-    return list(list_cameras(max_index, api))
+    return list(list_cameras(max_index, api, skip=skip))
+
+
+def camera_in_use(controller: object) -> set[int]:
+    """The camera index the controller has applied, as a ``skip`` set for probing.
+
+    Uses the *applied* settings, not a value being edited in a dialog: that is
+    the device the vision worker may hold open. Empty for a video file.
+    """
+    device = str(settings_from_controller(controller).camera.device).strip()
+    return {int(device)} if device.isdigit() else set()
 
 
 def load_diagnostics_text() -> str:
@@ -234,19 +271,25 @@ class CameraProbe(QObject):
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def start(self, api: str = "auto", max_index: int = 4) -> bool:
-        """Start probing; returns ``False`` if a probe is already running."""
+    def start(self, api: str = "auto", max_index: int = 4, skip: Collection[int] = ()) -> bool:
+        """Start probing (never opening the indices in ``skip``).
+
+        Returns ``False`` if a probe is already running.
+        """
         if self.running:
             return False
         self._thread = threading.Thread(
-            target=self._run, args=(api, max_index), name="eye-tracker-camera-probe", daemon=True
+            target=self._run,
+            args=(api, max_index, frozenset(skip)),
+            name="eye-tracker-camera-probe",
+            daemon=True,
         )
         self._thread.start()
         return True
 
-    def _run(self, api: str, max_index: int) -> None:
+    def _run(self, api: str, max_index: int, skip: frozenset[int]) -> None:
         try:
-            cameras = probe_cameras(max_index, api)
+            cameras = probe_cameras(max_index, api, skip)
         except Exception:
             log.warning("Camera detection failed", exc_info=True)
             cameras = []
@@ -624,6 +667,10 @@ class SettingsDialog(QDialog):
         self._bindings: dict[str, _Binding] = {}
         self._hotkey_edits: dict[str, HotkeyEdit] = {}
         self._hotkey_errors: dict[str, str] = {}
+        #: layout_conflict() answers by canonical hotkey text.
+        self._conflicts: dict[str, str | None] = {}
+        #: The footer shows a hotkey error (cleared once the shortcuts are valid).
+        self._status_shows_hotkey_error = False
         self._pages: dict[str, int] = {}
         self._diagnostics_loaded = False
         self._loading = False
@@ -636,10 +683,13 @@ class SettingsDialog(QDialog):
 
         self._camera_probe = CameraProbe(self)
         self._camera_probe.finished.connect(self._on_cameras_detected)
+        #: Camera indices left out of the running probe (the one in use).
+        self._probe_skip: set[int] = set()
 
         self._build()
         self._autostart_initial = self._read_autostart()
         self._autostart.setChecked(self._autostart_initial)
+        self._refresh_autostart_note()
         self._load(self._base)
 
         self._connect_controller_signal("stats_changed", self._on_stats)
@@ -695,7 +745,7 @@ class SettingsDialog(QDialog):
     def apply(self) -> bool:
         """Validate and hand the settings to the controller. Returns ``False`` if invalid."""
         if not self.is_valid():
-            self._set_status("Fix the highlighted shortcut first.", DANGER)
+            self._show_hotkey_error()
             return False
         new = self.settings()
         if new.to_dict() != self._base.to_dict():
@@ -1071,6 +1121,9 @@ class SettingsDialog(QDialog):
         )
         self._autostart.toggled.connect(self._on_changed)
         form.addRow(self._autostart)
+        self._autostart_note = self._hint("")
+        self._autostart_note.setVisible(False)
+        form.addRow(self._autostart_note)
         self._check(form, "general.start_paused", "Start with tracking paused")
         wizard = self._check(
             form, "general.first_run_done", "Show the setup assistant at next start", invert=True
@@ -1096,19 +1149,17 @@ class SettingsDialog(QDialog):
 
         form = self._group(layout, "Advanced")
         available = self._available_backends()
-        labels = {
-            "auto": "Automatic (recommended)",
-            "mediapipe": "MediaPipe — head pose + iris (most accurate)",
-            "opencv": "OpenCV — face geometry only (lightest)",
-        }
         options = []
-        for value in ("auto", "mediapipe", "opencv"):
-            text = labels[value]
-            if available is not None and value != "auto" and value not in available:
-                text += " — not available"
-            options.append((value, text))
+        for value, label in BACKEND_LABELS.items():
+            missing = available is not None and value != "auto" and value not in available
+            options.append((value, f"{label} — not available" if missing else label))
         self._combo(form, "general.backend", "Vision backend", options)
-        form.addRow(self._hint("Changing the backend requires a new calibration."))
+        form.addRow(
+            self._hint(
+                "Face mesh follows your head and your eyes; Lite follows only the head, "
+                "for slow computers. Changing the backend requires a new calibration."
+            )
+        )
         self._combo(
             form,
             "general.log_level",
@@ -1146,6 +1197,13 @@ class SettingsDialog(QDialog):
         typing = self._int(
             timing, "switching.typing_grace_ms", "Wait after typing", suffix=" ms", step=250
         )
+        reading = self._int(
+            timing,
+            "switching.reading_grace_ms",
+            "… while reading another monitor",
+            suffix=" ms",
+            step=500,
+        )
 
         tuning = self._group(layout, "Sensitivity")
         smoothing = self._slider(
@@ -1171,7 +1229,7 @@ class SettingsDialog(QDialog):
         )
         self._depends(
             enabled,
-            [target, focus, dwell, cooldown, mouse, typing, smoothing, hysteresis, margin],
+            [target, focus, dwell, cooldown, mouse, typing, reading, smoothing, hysteresis, margin],
         )
 
         learn = self._group(layout, "Adaptive accuracy")
@@ -1390,6 +1448,12 @@ class SettingsDialog(QDialog):
         self._hotkey_error.setStyleSheet(f"color: {DANGER};")
         self._hotkey_error.setVisible(False)
         form.addRow(self._hotkey_error)
+        # Valid shortcuts the OS will refuse (they type a character, e.g. AltGr).
+        self._hotkey_warning = QLabel()
+        self._hotkey_warning.setWordWrap(True)
+        self._hotkey_warning.setStyleSheet(f"color: {WARNING};")
+        self._hotkey_warning.setVisible(False)
+        form.addRow(self._hotkey_warning)
         self._depends(enabled, edits)
 
         tip = (
@@ -1449,7 +1513,9 @@ class SettingsDialog(QDialog):
             self._base = settings.copy()
             for key, binding in self._bindings.items():
                 binding.load(_get(settings, key))
-            self._autostart_initial = self._autostart.isChecked()
+            # The start-at-login baseline is not reset here: it is what the OS
+            # has (read at start, updated only by a successful change), so a
+            # change that failed stays pending and OK/Apply retry it.
         finally:
             self._loading = False
         self._on_changed()
@@ -1467,6 +1533,20 @@ class SettingsDialog(QDialog):
             ok.setEnabled(valid)
         if apply_button is not None:
             apply_button.setEnabled(valid and self.is_modified())
+        # The error label is on the Hotkeys page; the footer says why OK is off
+        # whichever page is shown.
+        if not valid:
+            self._show_hotkey_error()
+        elif self._status_shows_hotkey_error:
+            self._set_status("", None)
+
+    def _show_hotkey_error(self) -> None:
+        """Put the first shortcut error in the footer (cleared once all are valid)."""
+        self._set_status(
+            next(iter(self._hotkey_errors.values()), "Fix the highlighted shortcut first."),
+            DANGER,
+        )
+        self._status_shows_hotkey_error = True
 
     def _on_button(self, button: QAbstractButton) -> None:
         if self._buttons.buttonRole(button) == QDialogButtonBox.ButtonRole.ApplyRole:
@@ -1505,11 +1585,16 @@ class SettingsDialog(QDialog):
     # ============================================================== hotkeys
     def _validate_hotkeys(self) -> None:
         errors: dict[str, str] = {}
+        warnings: dict[str, str] = {}
         seen: dict[str, str] = {}
         labels = dict(HOTKEY_ACTIONS)
+        enabled = self._bindings.get("hotkeys.enabled")
+        # With global shortcuts off nothing is registered, and the fields cannot
+        # be edited: a bad stored value must not block every other change.
+        active = enabled is None or bool(enabled.read())
         for action, edit in self._hotkey_edits.items():
             text = edit.hotkey()
-            if not text:
+            if not text or not active:
                 continue
             try:
                 canonical = str(parse_hotkey(text))
@@ -1518,19 +1603,45 @@ class SettingsDialog(QDialog):
                 continue
             if canonical in seen:
                 errors[action] = f"{labels[action]}: same shortcut as {labels[seen[canonical]]}"
-            else:
-                seen[canonical] = action
+                continue
+            seen[canonical] = action
+            conflict = self._layout_conflict(canonical)
+            if conflict:
+                warnings[action] = f"{labels[action]}: {conflict}. Choose another shortcut."
         self._hotkey_errors = errors
         for action, edit in self._hotkey_edits.items():
-            edit.set_invalid(action in errors)
+            edit.set_invalid(action in errors or action in warnings)
         self._hotkey_error.setText("\n".join(errors.values()))
         self._hotkey_error.setVisible(bool(errors))
+        self._hotkey_warning.setText("\n".join(warnings.values()))
+        self._hotkey_warning.setVisible(bool(warnings))
+
+    def _layout_conflict(self, hotkey: str) -> str | None:
+        """Why ``hotkey`` would swallow a character on an installed keyboard layout.
+
+        Asks the controller's hotkey manager (``layout_conflict``, read-only);
+        answers are cached for the life of the dialog, since the check reads
+        every installed layout.
+        """
+        if hotkey not in self._conflicts:
+            manager = getattr(self._controller, "hotkey_manager", None)
+            check = getattr(manager, "layout_conflict", None)
+            result: str | None = None
+            if callable(check):
+                try:
+                    value = check(hotkey)
+                    result = str(value) if value else None
+                except Exception:
+                    log.debug("layout_conflict(%s) failed", hotkey, exc_info=True)
+            self._conflicts[hotkey] = result
+        return self._conflicts[hotkey]
 
     # ============================================================== camera
     def detect_cameras(self) -> None:
         """Probe connected cameras in the background and fill the device list."""
         api = self._bindings["camera.api"].value() or "auto"
-        if self._camera_probe.start(str(api)):
+        self._probe_skip = camera_in_use(self._controller)
+        if self._camera_probe.start(str(api), skip=self._probe_skip):
             self._detect_button.setEnabled(False)
             self._detect_button.setText("Detecting…")
 
@@ -1550,13 +1661,16 @@ class SettingsDialog(QDialog):
                 self._device.addItem(
                     f"{getattr(info, 'name', f'Camera {index}')}{size}", str(index)
                 )
+            for index in sorted(self._probe_skip):
+                # Not probed, but it exists: keep it selectable.
+                if self._device.findData(str(index)) < 0:
+                    self._device.addItem(f"Camera {index} (in use)", str(index))
         self._select_device(current)
-        if found:
-            self._camera_note.setText(f"Found {len(found)} camera(s).")
-        else:
-            self._camera_note.setText(
-                "No other camera found. The camera in use by Eye Tracker may not be listed."
-            )
+        other = "other " if self._probe_skip else ""
+        parts = [f"Found {len(found)} {other}camera(s)." if found else f"No {other}camera found."]
+        if self._probe_skip:
+            parts.append("The camera in use is not probed.")
+        self._camera_note.setText(" ".join(parts))
         self._camera_note.setVisible(True)
         self._on_changed()
 
@@ -1617,11 +1731,21 @@ class SettingsDialog(QDialog):
             else:
                 autostart.disable()
         except autostart.AutostartError as exc:
+            # _autostart_initial keeps the OS state, so the change stays pending
+            # (Apply enabled) and the next OK/Apply tries again.
             log.warning("Changing start at login failed: %s", exc)
             self._set_status(str(exc), DANGER)
             return False
         self._autostart_initial = wanted
+        self._refresh_autostart_note()
         return True
+
+    def _refresh_autostart_note(self) -> None:
+        """Explain an unchecked box whose login item exists but does not start this copy."""
+        status = util.autostart_status(autostart) if self._autostart_supported() else ""
+        text = _AUTOSTART_NOTES.get(status, "")
+        self._autostart_note.setText(text)
+        self._autostart_note.setVisible(bool(text))
 
     # ============================================================== misc
     def _connect_controller_signal(self, name: str, slot: Callable[[object], None]) -> None:
@@ -1634,6 +1758,7 @@ class SettingsDialog(QDialog):
             log.debug("Controller signal %s not connectable", name, exc_info=True)
 
     def _set_status(self, text: str, color: str | None) -> None:
+        self._status_shows_hotkey_error = False
         self._status.setText(text)
         self._status.setStyleSheet(f"color: {color};" if color else "")
 

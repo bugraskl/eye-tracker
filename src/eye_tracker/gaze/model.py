@@ -10,14 +10,23 @@ which matters because prediction runs for every analysed frame.
 Design matrices by ``degree``:
 
 * ``1``: ``[1, z_i]``
-* ``2``: ``[1, z_i, z_i*z_j (i <= j)]``
-* ``3``: degree 2 plus the pure cubes ``z_i**3``. Looking at a flat screen from
+* ``2``: ``[1, z_i, z_j*z_k (j <= k)]``
+* ``3``: degree 2 plus the pure cubes ``z_j**3``. Looking at a flat screen from
   close up maps angles to pixels through ``tan``, which bends noticeably beyond
   about 30 degrees (wide or triple-monitor desks). Pure cubes model that odd,
-  one-sided curvature at the cost of only ``d`` extra terms; the full cubic
-  expansion would add ``O(d**3)`` terms and overfit.
+  one-sided curvature at the cost of only ``k`` extra terms; the full cubic
+  expansion would add ``O(k**3)`` terms and overfit.
 
-Three details keep the model well behaved:
+``j`` and ``k`` run over the *nonlinear* features only (:attr:`GazeModel.nonlinear`;
+all features when it is ``None``, the behaviour of models saved before it
+existed). A backend declares which of its features encode gaze direction (head
+rotation, iris offsets) and only those get products and cubes. Head position and
+roll barely vary while the user calibrates, so cross-validation, which holds out
+a dot but never a posture, cannot tell that a curved fit through them is noise,
+and such a fit falls apart as soon as the user sits lower or leans back. Their
+linear terms still correct the gaze for moderate posture changes.
+
+Four details keep the model well behaved:
 
 * Targets are normalised to the virtual-desktop bounds, so the regularisation
   strength ``alpha`` means the same thing on a 1080p laptop and a triple-4K desk.
@@ -27,6 +36,11 @@ Three details keep the model well behaved:
   polynomial expansion. A pose never seen during calibration (for example a head
   roll the user did not make while calibrating) would otherwise be squared or
   cubed and could throw the prediction thousands of pixels off.
+* Clipping hides how far outside the calibrated range a frame lies, and the
+  clipped polynomial may even bend back onto the screens. :meth:`GazeModel.looks_away`
+  therefore reports gaze-direction features far beyond their calibrated range
+  (the user reads a phone on the desk or turns to a colleague), so such frames
+  are treated as looking away instead of as gaze at the nearest monitor.
 """
 
 from __future__ import annotations
@@ -58,6 +72,21 @@ CLIP_MARGIN = 0.5
 DEFAULT_ALPHAS: tuple[float, ...] = (0.01, 0.1, 1.0, 10.0, 100.0)
 SUPPORTED_DEGREES: tuple[int, ...] = (1, 2, 3)
 
+#: A frame looks away from every monitor when one of its gaze-direction features
+#: lies more than this fraction of its calibrated range beyond that range (see
+#: :meth:`GazeModel.looks_away`). Calibration dots stop 10 % short of the screen
+#: edges, so gaze at an edge lies about 0.125 of the range beyond the calibrated
+#: range; head sway and per-frame noise mostly stay inside the range because it
+#: was measured with them. In synthetic tests (two and three monitors, posture
+#: changes of 8-12 cm included) fewer than 0.3 % of on-screen frames, corners
+#: included, exceed 0.25, while about half of the frames of gaze 40 cm below the
+#: screens and nearly all at 60-80 cm (a phone or papers on the desk) do. Treated
+#: as "no gaze", every such frame restarts the switch dwell, so even partial
+#: detection keeps a glance at the phone from switching monitors. Lower values
+#: catch more of the nearer glances at the cost of occasionally dropping frames
+#: of gaze near the screen edges.
+LOOK_AWAY_EXCESS = 0.25
+
 # A more complex candidate (higher degree, smaller alpha) must beat the simpler
 # one by this relative margin in cross-validation to be chosen.
 _PREFER_SIMPLER = 1e-3
@@ -65,9 +94,20 @@ _PREFER_SIMPLER = 1e-3
 
 class GazeModel:
     """Maps a feature vector to a gaze point on the virtual desktop (ridge regression on
-    standardised features with optional polynomial terms, see the module docstring)."""
+    standardised features with optional polynomial terms, see the module docstring).
 
-    def __init__(self, degree: int = 2, alpha: float = 1.0) -> None:
+    ``nonlinear`` lists the indices of the features that get quadratic and cubic
+    terms (the backend's gaze-direction features, see :func:`gaze_feature_indices`);
+    the others enter linearly. ``None`` expands every feature. Indices are sorted
+    and de-duplicated; they are checked against the feature count when fitting.
+    """
+
+    def __init__(
+        self,
+        degree: int = 2,
+        alpha: float = 1.0,
+        nonlinear: Sequence[int] | None = None,
+    ) -> None:
         if degree not in SUPPORTED_DEGREES:
             raise ValueError(f"degree must be one of {SUPPORTED_DEGREES}, got {degree!r}")
         alpha = float(alpha)
@@ -75,6 +115,7 @@ class GazeModel:
             raise ValueError(f"alpha must be a finite number >= 0, got {alpha!r}")
         self.degree = degree
         self.alpha = alpha
+        self._nonlinear = _as_indices(nonlinear)
         self._mean: np.ndarray | None = None
         self._std: np.ndarray | None = None
         self._lo: np.ndarray | None = None
@@ -93,13 +134,19 @@ class GazeModel:
         return 0 if self._mean is None else int(self._mean.shape[0])
 
     @property
+    def nonlinear(self) -> tuple[int, ...] | None:
+        """Indices of the features with polynomial terms (``None``: all of them)."""
+        return self._nonlinear
+
+    @property
     def bounds(self) -> Rect | None:
         """Virtual-desktop rectangle used to normalise targets (``None`` if unfitted)."""
         return self._bounds
 
     def __repr__(self) -> str:
         state = f"fitted, {self.n_features} features" if self.is_fitted else "unfitted"
-        return f"GazeModel(degree={self.degree}, alpha={self.alpha:g}, {state})"
+        nonlinear = "" if self._nonlinear is None else f", nonlinear={list(self._nonlinear)}"
+        return f"GazeModel(degree={self.degree}, alpha={self.alpha:g}{nonlinear}, {state})"
 
     # ---------------------------------------------------------------- fitting
     def fit(
@@ -120,9 +167,10 @@ class GazeModel:
         Y_arr = _as_targets(Y, X_arr.shape[0])
         w = _as_weights(weights, X_arr.shape[0])
         bounds = _check_bounds(bounds, Y_arr)
+        _check_indices(self._nonlinear, X_arr.shape[1])
 
         mean, std = _standardisation(X_arr)
-        A = _design((X_arr - mean) / std, self.degree)
+        A = _design((X_arr - mean) / std, self.degree, self._nonlinear)
         AtW = A.T * w
         self._coef = _solve_ridge(AtW @ A, AtW @ _normalise(Y_arr, bounds), self.alpha)
         self._mean, self._std = mean, std
@@ -135,24 +183,78 @@ class GazeModel:
         """Predict gaze point(s) in global pixels: ``(d,) -> (2,)`` or ``(n, d) -> (n, 2)``."""
         if self._coef is None or self._mean is None or self._std is None or self._bounds is None:
             raise RuntimeError("GazeModel is not fitted")
-        arr = np.asarray(x, dtype=np.float64)
-        single = arr.ndim == 1
-        X_arr = arr.reshape(1, -1) if single else arr
-        if X_arr.ndim != 2 or X_arr.shape[1] != self._mean.shape[0]:
-            raise ValueError(
-                f"expected feature vector(s) of length {self._mean.shape[0]}, got shape {arr.shape}"
-            )
+        arr, X_arr = self._features(x)
         if self._lo is not None and self._hi is not None:
             span = self._hi - self._lo
             X_arr = np.clip(X_arr, self._lo - CLIP_MARGIN * span, self._hi + CLIP_MARGIN * span)
         Z = (X_arr - self._mean) / self._std
-        Y = _denormalise(_design(Z, self.degree) @ self._coef, self._bounds)
-        return Y[0] if single else Y
+        Y = _denormalise(_design(Z, self.degree, self._nonlinear) @ self._coef, self._bounds)
+        return Y[0] if arr.ndim == 1 else Y
+
+    # ---------------------------------------------------------------- range checks
+    def extrapolation(self, x: np.ndarray) -> np.ndarray:
+        """How far each feature lies outside the calibrated range, in units of that range.
+
+        ``0`` inside ``[lo, hi]`` (the minimum and maximum seen when fitting),
+        ``0.25`` a quarter of the range below ``lo`` or above ``hi``, and so on;
+        ``(d,) -> (d,)`` or ``(n, d) -> (n, d)``. All zeros for a model loaded
+        from a file written before the range was stored, where it is unknown.
+        """
+        if self._mean is None:
+            raise RuntimeError("GazeModel is not fitted")
+        arr, X_arr = self._features(x)
+        if self._lo is None or self._hi is None:
+            excess = np.zeros_like(X_arr)
+        else:
+            span = np.maximum(self._hi - self._lo, STD_FLOOR)
+            excess = np.maximum(np.maximum(self._lo - X_arr, X_arr - self._hi), 0.0) / span
+        return excess[0] if arr.ndim == 1 else excess
+
+    def looks_away(
+        self,
+        x: np.ndarray,
+        features: Sequence[int] | None = None,
+        threshold: float = LOOK_AWAY_EXCESS,
+    ) -> bool:
+        """Whether the feature vector ``x`` ``(d,)`` shows gaze away from every monitor.
+
+        True when one of the gaze-direction ``features`` (indices; default
+        :attr:`nonlinear`) lies more than ``threshold`` of its calibrated range
+        outside that range (see :data:`LOOK_AWAY_EXCESS`). Head position and roll
+        must not take part, or leaning back would count as looking away, so this
+        is False when the gaze-direction features are unknown (``features`` and
+        :attr:`nonlinear` both ``None``, as for models saved before
+        ``nonlinear`` existed): pass the backend's indices for those.
+        """
+        indices = self._nonlinear if features is None else _as_indices(features)
+        arr = np.asarray(x, dtype=np.float64)
+        if arr.ndim != 1:
+            raise ValueError(f"expected one feature vector, got shape {arr.shape}")
+        excess = self.extrapolation(arr)
+        if not indices:
+            return False
+        _check_indices(indices, excess.shape[0])
+        # NaN compares False, so a broken feature never reads as "looking away".
+        return bool(np.max(excess[list(indices)]) > threshold)
+
+    def _features(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """``(input as an array, input as an (n, d) matrix)``, with the length checked."""
+        assert self._mean is not None
+        arr = np.asarray(x, dtype=np.float64)
+        X_arr = arr.reshape(1, -1) if arr.ndim == 1 else arr
+        if X_arr.ndim != 2 or X_arr.shape[1] != self._mean.shape[0]:
+            raise ValueError(
+                f"expected feature vector(s) of length {self._mean.shape[0]}, got shape {arr.shape}"
+            )
+        return arr, X_arr
 
     # ---------------------------------------------------------------- persistence
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe representation (plain lists and numbers)."""
         out: dict[str, Any] = {"kind": MODEL_KIND, "degree": self.degree, "alpha": self.alpha}
+        if self._nonlinear is not None:
+            # Absent means "every feature", which is how older files are read.
+            out["nonlinear"] = list(self._nonlinear)
         if (
             self._coef is not None
             and self._bounds is not None
@@ -182,8 +284,12 @@ class GazeModel:
         if kind != MODEL_KIND:
             raise ValueError(f"unsupported model kind {kind!r}")
         try:
-            model = cls(degree=int(d.get("degree", 2)), alpha=float(d.get("alpha", 1.0)))
-        except (TypeError, ValueError) as exc:
+            model = cls(
+                degree=int(d.get("degree", 2)),
+                alpha=float(d.get("alpha", 1.0)),
+                nonlinear=_index_list(d.get("nonlinear")),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(f"invalid model parameters: {exc}") from exc
         if "coef" not in d:
             return model  # an unfitted model was saved
@@ -195,11 +301,15 @@ class GazeModel:
             bounds = Rect.from_list(d["bounds"])
             lo = _vector(d["lo"], "lo") if "lo" in d else None
             hi = _vector(d["hi"], "hi") if "hi" in d else None
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            # OverflowError: int(inf) for a bounds value such as 1e400 or Infinity.
             raise ValueError(f"invalid model data: {exc}") from exc
 
         n = mean.shape[0]
-        if n == 0 or std.shape != (n,) or coef.shape != (_n_terms(n, model.degree), 2):
+        if n == 0 or std.shape != (n,):
+            raise ValueError("model arrays have inconsistent shapes")
+        _check_indices(model.nonlinear, n)
+        if coef.shape != (_n_terms(n, model.degree, model.nonlinear), 2):
             raise ValueError("model arrays have inconsistent shapes")
         if (lo is None) != (hi is None):
             raise ValueError("model clip range is incomplete")
@@ -219,6 +329,29 @@ class GazeModel:
 
 
 # ------------------------------------------------------------ model selection
+def gaze_feature_indices(
+    feature_names: Sequence[str], gaze_features: Sequence[str]
+) -> tuple[int, ...] | None:
+    """Indices of ``gaze_features`` within ``feature_names`` (a backend's
+    ``VisionBackend.feature_names`` and ``gaze_features``).
+
+    The result is what :class:`GazeModel`, :func:`select_model` and
+    ``calibration.evaluate`` take as ``nonlinear`` and :meth:`GazeModel.looks_away`
+    as ``features``. ``None`` (every feature is nonlinear, gaze direction unknown)
+    when the backend declares no gaze features. Names missing from
+    ``feature_names`` are ignored with a warning rather than raised on, so a
+    backend declaration error degrades the model instead of stopping tracking.
+    """
+    names = list(feature_names)
+    indices = []
+    for name in gaze_features:
+        if name in names:
+            indices.append(names.index(name))
+        else:
+            log.warning("Gaze feature %r is not one of the features %s; ignored", name, names)
+    return tuple(sorted(set(indices))) or None
+
+
 def select_alpha(
     X: np.ndarray,
     Y: np.ndarray,
@@ -228,6 +361,7 @@ def select_alpha(
     bounds: Rect | None = None,
     *,
     weights: np.ndarray | None = None,
+    nonlinear: Sequence[int] | None = None,
 ) -> float:
     """Pick the ridge strength with the lowest leave-one-group-out mean pixel error.
 
@@ -235,10 +369,18 @@ def select_alpha(
     predicts a point the model has never seen. That mirrors real use far better
     than per-sample cross-validation, where near-duplicate frames of the same point
     leak into the training set. Returns the middle alpha when fewer than two groups
-    exist. Near-ties go to the larger alpha (the smoother model).
+    exist. Near-ties go to the larger alpha (the smoother model). ``nonlinear`` is
+    passed to the candidate models (see :class:`GazeModel`).
     """
     selection = select_model(
-        X, Y, groups, alphas=alphas, degrees=(degree,), bounds=bounds, weights=weights
+        X,
+        Y,
+        groups,
+        alphas=alphas,
+        degrees=(degree,),
+        bounds=bounds,
+        weights=weights,
+        nonlinear=nonlinear,
     )
     return selection.alpha
 
@@ -264,12 +406,15 @@ def select_model(
     degrees: Sequence[int] = SUPPORTED_DEGREES,
     bounds: Rect | None = None,
     weights: np.ndarray | None = None,
+    nonlinear: Sequence[int] | None = None,
 ) -> ModelSelection:
     """Choose ``degree`` and ``alpha`` jointly by leave-one-group-out cross-validation.
 
     Simpler candidates win near-ties (lower degree first, then larger alpha). With
     fewer than two groups no cross-validation is possible and the lowest listed
-    degree (at most 2) with the middle alpha is returned.
+    degree (at most 2) with the middle alpha is returned. ``nonlinear`` selects
+    the features with polynomial terms, as for :class:`GazeModel`; build the final
+    model with the same value.
     """
     alpha_list = sorted({float(a) for a in alphas}, reverse=True)
     degree_list = sorted({int(d) for d in degrees})
@@ -286,6 +431,8 @@ def select_model(
     Y_arr = _as_targets(Y, X_arr.shape[0])
     g = _as_groups(groups, X_arr.shape[0])
     w = _as_weights(weights, X_arr.shape[0])
+    indices = _as_indices(nonlinear)
+    _check_indices(indices, X_arr.shape[1])
     # One normalisation for every fold, so alpha means the same in each of them
     # and in the final fit.
     bounds = _check_bounds(bounds, Y_arr)
@@ -298,7 +445,7 @@ def select_model(
 
     best: ModelSelection | None = None
     for degree in degree_list:
-        folds = _LopoFolds(X_arr, Y_arr, g, w, degree=degree, bounds=bounds)
+        folds = _LopoFolds(X_arr, Y_arr, g, w, degree=degree, bounds=bounds, nonlinear=indices)
         for alpha in alpha_list:
             preds = folds.predict(alpha)
             err = _mean_error(preds, Y_arr)
@@ -322,6 +469,7 @@ def lopo_predictions(
     degree: int = 2,
     bounds: Rect | None = None,
     weights: np.ndarray | None = None,
+    nonlinear: Sequence[int] | None = None,
 ) -> np.ndarray:
     """Leave-one-group-out predictions ``(n, 2)`` in global pixels.
 
@@ -332,11 +480,15 @@ def lopo_predictions(
     Y_arr = _as_targets(Y, X_arr.shape[0])
     g = _as_groups(groups, X_arr.shape[0])
     w = _as_weights(weights, X_arr.shape[0])
+    indices = _as_indices(nonlinear)
+    _check_indices(indices, X_arr.shape[1])
     if np.unique(g).shape[0] < 2:
         raise ValueError("leave-one-group-out needs at least two groups")
     if degree not in SUPPORTED_DEGREES:
         raise ValueError(f"degree must be one of {SUPPORTED_DEGREES}, got {degree!r}")
-    folds = _LopoFolds(X_arr, Y_arr, g, w, degree=degree, bounds=_check_bounds(bounds, Y_arr))
+    folds = _LopoFolds(
+        X_arr, Y_arr, g, w, degree=degree, bounds=_check_bounds(bounds, Y_arr), nonlinear=indices
+    )
     return folds.predict(alpha)
 
 
@@ -362,9 +514,10 @@ class _LopoFolds:
         *,
         degree: int,
         bounds: Rect,
+        nonlinear: tuple[int, ...] | None = None,
     ) -> None:
         mean, std = _standardisation(X)
-        A = _design((X - mean) / std, degree)
+        A = _design((X - mean) / std, degree, nonlinear)
         Yn = _normalise(Y, bounds)
         AtW = A.T * w
         lhs, rhs = AtW @ A, AtW @ Yn
@@ -388,12 +541,13 @@ class _LopoFolds:
 
 
 # --------------------------------------------------------------------- internals
-def _n_terms(n_features: int, degree: int) -> int:
+def _n_terms(n_features: int, degree: int, nonlinear: tuple[int, ...] | None = None) -> int:
+    k = n_features if nonlinear is None else len(nonlinear)
     n = 1 + n_features
     if degree >= 2:
-        n += n_features * (n_features + 1) // 2
+        n += k * (k + 1) // 2
     if degree >= 3:
-        n += n_features
+        n += k
     return n
 
 
@@ -403,14 +557,18 @@ def _pair_indices(d: int) -> tuple[np.ndarray, np.ndarray]:
     return iu, ju
 
 
-def _design(Z: np.ndarray, degree: int) -> np.ndarray:
-    n, d = Z.shape
+def _design(Z: np.ndarray, degree: int, nonlinear: tuple[int, ...] | None = None) -> np.ndarray:
+    n = Z.shape[0]
     cols = [np.ones((n, 1)), Z]
     if degree >= 2:
-        iu, ju = _pair_indices(d)
-        cols.append(Z[:, iu] * Z[:, ju])
-    if degree >= 3:
-        cols.append(Z**3)
+        # A list index selects columns; a tuple would index dimensions.
+        Zn = Z if nonlinear is None else Z[:, list(nonlinear)]
+        k = Zn.shape[1]
+        if k:
+            iu, ju = _pair_indices(k)
+            cols.append(Zn[:, iu] * Zn[:, ju])
+            if degree >= 3:
+                cols.append(Zn**3)
     return np.hstack(cols)
 
 
@@ -501,3 +659,32 @@ def _vector(values: Any, name: str) -> np.ndarray:
     if arr.ndim != 1:
         raise ValueError(f"{name} must be a list of numbers")
     return arr
+
+
+def _as_indices(indices: Sequence[int] | None) -> tuple[int, ...] | None:
+    """Sorted, de-duplicated, non-negative feature indices (``None`` passes through)."""
+    if indices is None:
+        return None
+    out = set()
+    for i in indices:
+        # bool is an int, and numpy integers are not; accept the latter only.
+        if isinstance(i, bool) or not isinstance(i, int | np.integer):
+            raise ValueError(f"feature indices must be integers, got {i!r}")
+        if i < 0:
+            raise ValueError(f"feature indices must be >= 0, got {i!r}")
+        out.add(int(i))
+    return tuple(sorted(out))
+
+
+def _check_indices(indices: tuple[int, ...] | None, n_features: int) -> None:
+    if indices and indices[-1] >= n_features:
+        raise ValueError(f"feature index {indices[-1]} is out of range for {n_features} features")
+
+
+def _index_list(value: Any) -> tuple[int, ...] | None:
+    """``nonlinear`` as read from JSON: absent/null or a list of integers."""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("nonlinear must be a list of feature indices")
+    return _as_indices(value)

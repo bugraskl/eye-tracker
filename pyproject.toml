@@ -1,5 +1,6 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+# 1.27 is the first release that reads the PEP 639 `license-files` list.
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -19,7 +20,7 @@ keywords = [
   "dual-monitor",
   "productivity",
   "webcam",
-  "mediapipe",
+  "opencv",
   "accessibility",
   "privacy",
 ]
@@ -46,8 +47,6 @@ dependencies = [
   "PySide6-Essentials>=6.7",
   "platformdirs>=4.2",
   "psutil>=5.9",
-  # MediaPipe publishes no macOS x86_64 wheel; Intel Macs fall back to the OpenCV backend.
-  "mediapipe>=1.0.1,<2; sys_platform != 'darwin' or platform_machine != 'x86_64'",
   "python-xlib>=0.33; sys_platform == 'linux'",
   "pyobjc-framework-Cocoa>=10.3; sys_platform == 'darwin'",
   "pyobjc-framework-Quartz>=10.3; sys_platform == 'darwin'",
@@ -57,7 +56,9 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/bugraskl/eye-tracker"
-Documentation = "https://github.com/bugraskl/eye-tracker/tree/main/docs"
+Documentation = "https://github.com/bugraskl/eye-tracker#readme"
+Troubleshooting = "https://github.com/bugraskl/eye-tracker/blob/main/docs/troubleshooting.md"
+Privacy = "https://github.com/bugraskl/eye-tracker/blob/main/docs/privacy.md"
 Issues = "https://github.com/bugraskl/eye-tracker/issues"
 Changelog = "https://github.com/bugraskl/eye-tracker/blob/main/CHANGELOG.md"
 
@@ -80,16 +81,6 @@ build = [
 
 [tool.uv]
 default-groups = ["dev", "build"]
-# MediaPipe 1.x declares heavyweight dependencies that this app never imports:
-# opencv-contrib-python (bundles its own Qt on Linux and clashes with PySide6 and
-# opencv-python-headless), matplotlib and sounddevice. They are excluded here and
-# the single import MediaPipe makes of matplotlib is satisfied by a shim
-# (see src/eye_tracker/vision/_mp_shim.py).
-override-dependencies = [
-  "opencv-contrib-python; sys_platform == 'never'",
-  "matplotlib; sys_platform == 'never'",
-  "sounddevice; sys_platform == 'never'",
-]
 
 [tool.hatch.version]
 path = "src/eye_tracker/__init__.py"

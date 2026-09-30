@@ -20,6 +20,16 @@ sequence pauses by itself (the collector runs on a clock that stands still
 while paused) and resumes as soon as the face is back, so a user who glances at
 the keyboard does not lose dots.
 
+While the window is open the controller is in ``CALIBRATING``: walk-away
+detection and the shoulder guard are suspended and the camera runs at the
+calibration rate. An abandoned window must not keep it that way, so the
+calibration closes itself after :data:`IDLE_TIMEOUT_S` without a key press on
+the instructions, result or error screen (or while paused with Space), and after
+:data:`NO_FACE_TIMEOUT_S` of dots paused because nobody is in front of the camera.
+
+A monitor that is added, removed, resized or moved cancels the calibration
+(with a notification): dots recorded on the old geometry could never be saved.
+
 Fitting the model (:func:`~eye_tracker.gaze.calibration.evaluate`) takes about
 0.1 s, longer on slow machines. It runs on a short-lived background thread whose
 result the UI tick polls, so the windows stay responsive (Esc works, the spinner
@@ -67,6 +77,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..config import Settings
 from ..gaze.calibration import (
     EVENT_FINISHED,
     EVENT_RETRY,
@@ -79,7 +90,7 @@ from ..gaze.calibration import (
     evaluate,
     make_plan,
 )
-from ..gaze.model import GazeModel
+from ..gaze.model import GazeModel, gaze_feature_indices
 from ..gaze.store import CalibrationData
 from ..types import Monitor, Observation, layout_signature
 from . import util
@@ -88,7 +99,9 @@ from .util import screen_for_monitor, ui_scale
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "IDLE_TIMEOUT_S",
     "NO_FACE_PAUSE_S",
+    "NO_FACE_TIMEOUT_S",
     "STATE_CLOSED",
     "STATE_ERROR",
     "STATE_FITTING",
@@ -97,6 +110,7 @@ __all__ = [
     "STATE_RESULT",
     "STATE_RUNNING",
     "CalibrationWindow",
+    "controller_gaze_features",
 ]
 
 # States of the calibration window.
@@ -112,9 +126,17 @@ STATE_CLOSED = "closed"  # finished (saved or cancelled)
 NO_FACE_PAUSE_S = 1.5
 #: Without any observation for this long the camera is reported as missing.
 NO_CAMERA_S = 2.0
+#: Close the calibration after this long without a key press while it waits for
+#: the user (instructions, result, error, paused with Space). Walk-away locking
+#: is suspended while the window is open.
+IDLE_TIMEOUT_S = 120.0
+#: Close the calibration after the dots were paused this long for lack of a face.
+NO_FACE_TIMEOUT_S = 60.0
 
 TICK_MS = 30  # animation / collector tick while running
 IDLE_TICK_MS = 250  # intro: only the face indicator needs refreshing
+#: The inactivity check also runs on screens that stop the animation timer.
+WATCHDOG_MS = 1000
 
 # Share of the settle phase used to glide from the previous dot (same monitor)
 # or to pop in (new monitor). Moving targets are easier to follow than jumps.
@@ -198,8 +220,62 @@ def _monitor_labels(monitors: Sequence[Monitor]) -> dict[int, str]:
 FitResult = tuple[GazeModel, CalibrationReport]
 
 
+def controller_gaze_features(controller: object) -> tuple[int, ...] | None:
+    """Indices of the vision backend's gaze-direction features (head rotation, eyes).
+
+    They are what :func:`~eye_tracker.gaze.calibration.evaluate` takes as
+    ``nonlinear``: the model gets polynomial terms only for them, so a changed
+    posture (head position) does not bend the fit. Asks the controller
+    (``gaze_feature_indices()``) and otherwise derives them from the class of the
+    backend ``backend_info()`` names. ``None`` when neither is known, which means
+    every feature is treated alike (the behaviour of older calibrations).
+    """
+    getter = getattr(controller, "gaze_feature_indices", None)
+    if callable(getter):
+        try:
+            value = getter()
+        except Exception:
+            log.debug("controller.gaze_feature_indices() failed", exc_info=True)
+        else:
+            return tuple(int(i) for i in value) if value is not None else None
+    try:
+        from ..vision.backends import backend_class
+
+        name = str(controller.backend_info()[0])  # type: ignore[attr-defined]
+        cls = backend_class(name) if name else None
+    except Exception:
+        log.debug("No backend class for the calibration", exc_info=True)
+        return None
+    if cls is None:
+        return None
+    return gaze_feature_indices(cls.feature_names, cls.gaze_features)
+
+
+def _fit_features(
+    indices: tuple[int, ...] | None, samples: Sequence[CalibrationSample]
+) -> tuple[int, ...] | None:
+    """``indices``, or ``None`` when they do not fit the recorded feature vectors.
+
+    The backend may have changed between the start of the calibration and the fit;
+    a stale index must degrade the model (every feature nonlinear), not fail it.
+    """
+    if not indices or not samples:
+        return indices or None
+    n_features = len(samples[0].features)
+    if max(indices) >= n_features:
+        log.warning(
+            "Gaze feature indices %s do not fit %d features; fitting without them",
+            indices,
+            n_features,
+        )
+        return None
+    return indices
+
+
 def _start_fit(
-    samples: Sequence[CalibrationSample], monitors: Sequence[Monitor]
+    samples: Sequence[CalibrationSample],
+    monitors: Sequence[Monitor],
+    nonlinear: tuple[int, ...] | None = None,
 ) -> Future[FitResult]:
     """Run :func:`evaluate` on a daemon thread; the returned future is polled by the UI.
 
@@ -214,7 +290,7 @@ def _start_fit(
         if not future.set_running_or_notify_cancel():
             return
         try:
-            future.set_result(evaluate(samples, monitors))
+            future.set_result(evaluate(samples, monitors, nonlinear=nonlinear))
         except BaseException as exc:  # delivered to the UI thread, never lost
             future.set_exception(exc)
 
@@ -844,8 +920,10 @@ class CalibrationWindow(QObject):
 
     Args:
         controller: The app controller (``monitors()``, ``backend_info()``,
-            ``begin_calibration()``, ``finish_calibration(data)`` and the
-            ``observation`` signal).
+            ``begin_calibration()``, ``finish_calibration(data)``, the
+            ``observation`` and ``notify`` signals; optionally ``settings`` for
+            the camera the calibration belongs to and ``gaze_feature_indices()``,
+            see :func:`controller_gaze_features`).
         parent: Optional QObject parent.
         clock: Monotonic clock in seconds (inject a fake one in tests).
         points_per_monitor: Dots per monitor (1, 5 or a square number, see
@@ -912,10 +990,22 @@ class CalibrationWindow(QObject):
         self._last_face_at: float | None = None
         self._face_grace_until = -math.inf
         self._connected = False
+        #: When the user last pressed a key (or button) here; drives the idle timeout.
+        self._last_input_at = 0.0
+        #: When the dots were paused for lack of a face (``None`` while not).
+        self._no_face_since: float | None = None
+        #: Gaze-direction feature indices passed to the fit (see controller_gaze_features).
+        self._nonlinear: tuple[int, ...] | None = None
+        #: Screens whose geometryChanged is connected (disconnected in _finish).
+        self._watched_screens: list[QScreen] = []
 
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.timeout.connect(self.tick)
+        # Separate from the animation timer, which the result and error screens stop.
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(WATCHDOG_MS)
+        self._watchdog.timeout.connect(self.check_idle)
 
     # ============================================================== properties
     @property
@@ -980,13 +1070,11 @@ class CalibrationWindow(QObject):
         Calling it while a calibration is open just raises the windows.
         """
         if self.is_active:
+            # Asked for again (tray, hotkey, second launch): the user is here.
+            self._last_input_at = self._clock()
             self._focus_primary()
             return True
-        try:
-            monitors = list(self._controller.monitors())  # type: ignore[attr-defined]
-        except Exception:
-            log.exception("Could not list monitors for calibration")
-            monitors = []
+        monitors = self._current_monitors()
         if not monitors:
             log.warning("Calibration needs at least one monitor")
             self._state = STATE_CLOSED
@@ -1002,22 +1090,21 @@ class CalibrationWindow(QObject):
         if signal is not None:
             signal.connect(self._on_observation)
             self._connected = True
-        app = QGuiApplication.instance()
-        if isinstance(app, QGuiApplication):
-            app.screenAdded.connect(self._on_screens_changed)
-            app.screenRemoved.connect(self._on_screens_changed)
+        self._watch_screens()
         try:
             self._controller.begin_calibration()  # type: ignore[attr-defined]
         except Exception:
             log.exception("controller.begin_calibration failed")
 
         log.info("Calibration opened on %d monitor(s)", len(monitors))
+        self._last_input_at = self._clock()
         self._set_state(STATE_INTRO)
         self._show_intro()
         for surface in self._surfaces:
             surface.present()
         self._focus_primary()
         self._timer.start(IDLE_TICK_MS)
+        self._watchdog.start()
         return True
 
     def show(self) -> bool:
@@ -1027,6 +1114,12 @@ class CalibrationWindow(QObject):
     def begin(self) -> None:
         """Start (or restart) showing the dots."""
         if self._state in (STATE_IDLE, STATE_CLOSED):
+            return
+        # The controller reports a new layout up to a second after Qt does (it
+        # debounces hot-plugs), so a change may have slipped past the screen
+        # signals: dots on the old geometry could never be saved.
+        if self._layout_changed():
+            self._on_screens_changed()
             return
         settle_s, collect_s, min_samples, max_retries = self._timing
         self._plan = make_plan(self._monitors, self._points_per_monitor, self._margin)
@@ -1038,6 +1131,8 @@ class CalibrationWindow(QObject):
             max_retries=max_retries,
         )
         now = self._clock()
+        self._last_input_at = now
+        self._no_face_since = None
         self._prev_target = self._last_target = None
         self._retrying = False
         self._manual_pause = self._auto_pause = False
@@ -1063,8 +1158,10 @@ class CalibrationWindow(QObject):
         """Pause or resume the dots (Space while running)."""
         if self._state != STATE_RUNNING:
             return
+        now = self._clock()
+        self._last_input_at = now
         self._manual_pause = not self._manual_pause
-        self._update_pause(self._clock())
+        self._update_pause(now)
         self._render()
 
     def save(self) -> bool:
@@ -1073,12 +1170,10 @@ class CalibrationWindow(QObject):
             return False
         collector = self._collector
         assert collector is not None
-        try:
-            now_monitors = list(self._controller.monitors())  # type: ignore[attr-defined]
-        except Exception:
-            now_monitors = self._monitors
-        if layout_signature(now_monitors) != layout_signature(self._monitors):
-            self._show_error("The monitor layout changed during calibration. Please try again.")
+        if self._layout_changed():
+            # Retrying would plan on the same stale layout: close, and let the
+            # user start over on the new one.
+            self._on_screens_changed()
             return False
         try:
             backend, feature_version = self._controller.backend_info()  # type: ignore[attr-defined]
@@ -1098,6 +1193,10 @@ class CalibrationWindow(QObject):
             implicit_samples=[],
             model=self._model,
             report=self._report.to_dict(),
+            # The calibration only fits the camera it was recorded with (its
+            # position and field of view shape every feature).
+            camera=self._camera_device(),
+            frame_size=collector.frame_size,
         )
         self._data = data
         log.info("Calibration saved: %s", self._report.summary())
@@ -1116,6 +1215,8 @@ class CalibrationWindow(QObject):
     # ============================================================== input
     def handle_key(self, key: int) -> bool:
         """Keyboard control shared by every surface. Returns True if handled."""
+        # Any key proves someone is at the keyboard (restarts the idle timeout).
+        self._last_input_at = self._clock()
         K = Qt.Key
         enter = key in (K.Key_Return.value, K.Key_Enter.value)
         if key == K.Key_Escape.value:
@@ -1164,12 +1265,7 @@ class CalibrationWindow(QObject):
         if not self.is_active:
             return
         log.info("Monitor layout changed; calibration cancelled")
-        notify = getattr(self._controller, "notify", None)
-        if notify is not None:
-            try:
-                notify.emit("Calibration cancelled", "The monitor layout changed.")
-            except Exception:
-                log.debug("Could not emit notify", exc_info=True)
+        self._notify("Calibration cancelled", "The monitor layout changed. Please calibrate again.")
         self.cancel()
 
     # ============================================================== ticking
@@ -1179,12 +1275,47 @@ class CalibrationWindow(QObject):
         Called by a timer every 30 ms while dots are shown; tests call it directly
         after advancing a fake clock.
         """
+        if self.check_idle():
+            return
         if self._state == STATE_INTRO:
             self._refresh_face_chip()
         elif self._state == STATE_RUNNING:
             self._tick_running()
         elif self._state == STATE_FITTING:
             self._tick_fitting()
+
+    def check_idle(self) -> bool:
+        """Close an abandoned calibration. Returns ``True`` if it was closed.
+
+        Runs every :data:`WATCHDOG_MS` (and on every :meth:`tick`). A calibration
+        waiting for a key for :data:`IDLE_TIMEOUT_S`, or with its dots paused
+        for lack of a face for :data:`NO_FACE_TIMEOUT_S`, is cancelled so that
+        walk-away detection and the normal camera rate resume.
+        """
+        if not self.is_active:
+            return False
+        now = self._clock()
+        waiting = self._state in (STATE_INTRO, STATE_RESULT, STATE_ERROR) or (
+            self._state == STATE_RUNNING and self._manual_pause
+        )
+        if waiting and now - self._last_input_at >= IDLE_TIMEOUT_S:
+            reason = f"Nothing was pressed for {IDLE_TIMEOUT_S / 60:g} minutes."
+        elif (
+            self._state == STATE_RUNNING
+            and self._auto_pause
+            and self._no_face_since is not None
+            and now - self._no_face_since >= NO_FACE_TIMEOUT_S
+        ):
+            reason = f"No face was seen for {NO_FACE_TIMEOUT_S:g} seconds."
+        else:
+            return False
+        log.info("Calibration closed after inactivity (%s)", self._state)
+        self._notify(
+            "Calibration closed",
+            f"{reason} Choose “Calibrate now…” in the tray menu to start again.",
+        )
+        self.cancel()
+        return True
 
     def _tick_running(self) -> None:
         collector = self._collector
@@ -1196,6 +1327,7 @@ class CalibrationWindow(QObject):
         )
         if face_missing != self._auto_pause:
             self._auto_pause = face_missing
+            self._no_face_since = now if face_missing else None
             log.debug("Calibration %s", "paused: no face" if face_missing else "resumed")
             self._update_pause(now)
         for event in collector.update(self._collector_time(now)):
@@ -1298,9 +1430,10 @@ class CalibrationWindow(QObject):
                 card.add_label("Almost done…", muted=True)
             surface.place_card()
         collector = self._collector
+        samples = collector.samples if collector is not None else []
+        self._nonlinear = _fit_features(controller_gaze_features(self._controller), samples)
         if self._fit_in_thread:
-            samples = collector.samples if collector is not None else []
-            self._fit_future = _start_fit(samples, self._monitors)
+            self._fit_future = _start_fit(samples, self._monitors, self._nonlinear)
         # Without a thread the fit runs on the next tick, so the "Calculating"
         # screen is painted first; with one, ticks animate the spinner and poll.
         self._timer.start(TICK_MS)
@@ -1315,7 +1448,7 @@ class CalibrationWindow(QObject):
             collector = self._collector
             samples = collector.samples if collector is not None else []
             try:
-                result = evaluate(samples, self._monitors)
+                result = evaluate(samples, self._monitors, nonlinear=self._nonlinear)
             except Exception as exc:
                 self._fit_failed(exc)
             else:
@@ -1333,6 +1466,7 @@ class CalibrationWindow(QObject):
     def _fit_succeeded(self, model: GazeModel, report: CalibrationReport) -> None:
         self._timer.stop()
         self._model, self._report = model, report
+        self._last_input_at = self._clock()  # the idle timeout counts from the result
         self._set_state(STATE_RESULT)
         self._show_result(report)
 
@@ -1442,7 +1576,18 @@ class CalibrationWindow(QObject):
             if skipped:
                 details += f" · {skipped} skipped"
             card.add_label(details, name="details", muted=True, size=10.0)
-            if report.grade in ("fair", "poor"):
+            uncovered = self._uncovered_labels(report)
+            if uncovered:
+                # Every dot of these screens was skipped: switching to them cannot work.
+                verb = "was" if len(uncovered) == 1 else "were"
+                card.add_label(
+                    f"{' and '.join(uncovered)} {verb} not calibrated — make sure the camera "
+                    "sees your face when you look there, then press R to try again.",
+                    name="tip",
+                    size=10.5,
+                    color=_WARNING,
+                )
+            elif report.grade in ("fair", "poor"):
                 tip = (
                     "Tip: sit where you usually sit, make sure your face is evenly lit and "
                     "turn your head a little towards each dot. Press R to try again."
@@ -1466,9 +1611,19 @@ class CalibrationWindow(QObject):
             surface.place_card()
         self._focus_primary()
 
+    def _uncovered_labels(self, report: CalibrationReport) -> list[str]:
+        """Labels of the monitors the report has no dots for, left to right."""
+        uncovered = set(getattr(report, "uncovered_monitors", None) or ())
+        return [
+            self._labels.get(m.index, f"Screen {m.index + 1}")
+            for m in _spatial_order(self._monitors)
+            if m.index in uncovered
+        ]
+
     def _show_error(self, message: str, *, badge: str = "Not enough data") -> None:
         self._timer.stop()
         self._error = message
+        self._last_input_at = self._clock()  # the idle timeout counts from here
         self._set_state(STATE_ERROR)
         for surface in self._surfaces:
             surface.unsetCursor()
@@ -1508,16 +1663,13 @@ class CalibrationWindow(QObject):
             return
         self._set_state(STATE_CLOSED)
         self._timer.stop()
+        self._watchdog.stop()
         self._drop_fit()
         if self._connected:
             with contextlib.suppress(RuntimeError, TypeError, AttributeError):
                 self._controller.observation.disconnect(self._on_observation)  # type: ignore[attr-defined]
             self._connected = False
-        app = QGuiApplication.instance()
-        if isinstance(app, QGuiApplication):
-            for sig in (app.screenAdded, app.screenRemoved):
-                with contextlib.suppress(RuntimeError, TypeError):
-                    sig.disconnect(self._on_screens_changed)
+        self._unwatch_screens()
         try:
             self._controller.finish_calibration(data)  # type: ignore[attr-defined]
         except Exception:
@@ -1528,6 +1680,66 @@ class CalibrationWindow(QObject):
             surface.deleteLater()
         self._surfaces = []
         self.finished.emit(data is not None)
+
+    def _current_monitors(self) -> list[Monitor]:
+        try:
+            return list(self._controller.monitors())  # type: ignore[attr-defined]
+        except Exception:
+            log.exception("Could not list monitors for calibration")
+            return []
+
+    def _layout_changed(self) -> bool:
+        """Whether the controller's monitor layout differs from the one being calibrated."""
+        current = self._current_monitors()
+        return bool(current) and layout_signature(current) != layout_signature(self._monitors)
+
+    def _watch_screens(self) -> None:
+        """Cancel on any display change: added, removed, resized, moved or a new primary."""
+        app = QGuiApplication.instance()
+        if not isinstance(app, QGuiApplication):
+            return
+        app.screenAdded.connect(self._on_screens_changed)
+        app.screenRemoved.connect(self._on_screens_changed)
+        app.primaryScreenChanged.connect(self._on_screens_changed)
+        # A screen added later cancels the calibration itself, so the screens
+        # present now are all whose geometry matters.
+        self._watched_screens = list(QGuiApplication.screens())
+        for screen in self._watched_screens:
+            screen.geometryChanged.connect(self._on_screens_changed)
+
+    def _unwatch_screens(self) -> None:
+        app = QGuiApplication.instance()
+        if isinstance(app, QGuiApplication):
+            for sig in (app.screenAdded, app.screenRemoved, app.primaryScreenChanged):
+                with contextlib.suppress(RuntimeError, TypeError):
+                    sig.disconnect(self._on_screens_changed)
+        screens, self._watched_screens = self._watched_screens, []
+        for screen in screens:
+            # A removed screen's QScreen may already be gone.
+            with contextlib.suppress(RuntimeError, TypeError):
+                screen.geometryChanged.disconnect(self._on_screens_changed)
+
+    def _notify(self, title: str, message: str) -> None:
+        """Tell the user through the controller's ``notify`` signal (shown by the tray)."""
+        notify = getattr(self._controller, "notify", None)
+        if notify is None:
+            return
+        try:
+            notify.emit(title, message)
+        except Exception:
+            log.debug("Could not emit notify", exc_info=True)
+
+    def _camera_device(self) -> str:
+        """The camera setting the calibration is recorded with (``""`` if unknown)."""
+        settings = getattr(self._controller, "settings", None)
+        if callable(settings):
+            try:
+                settings = settings()
+            except Exception:
+                settings = None
+        if isinstance(settings, Settings):
+            return str(settings.camera.device).strip()
+        return ""
 
     def _focus_primary(self) -> None:
         if not self._surfaces:

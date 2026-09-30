@@ -7,8 +7,11 @@ loader and every subprocess entry point are stubbed by an autouse fixture.
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -23,12 +26,14 @@ PYOBJC_MODULES = (
     "AppKit",
     "ApplicationServices",
     "CoreFoundation",
+    "Foundation",
     "AVFoundation",
     "objc",
 )
 PID = 321
 OTHER_PID = 654
 AX_ERROR_ATTRIBUTE_UNSUPPORTED = -25205
+AX_ERROR_CANNOT_COMPLETE = -25204
 
 
 class Clock:
@@ -82,9 +87,14 @@ def clock() -> Clock:
 
 
 @pytest.fixture
-def plat(clock: Clock) -> macos.MacPlatform:
+def state_path(tmp_path: Path) -> Path:
+    return tmp_path / "macos-accessibility.json"
+
+
+@pytest.fixture
+def plat(clock: Clock, state_path: Path) -> macos.MacPlatform:
     """A MacPlatform with every pyobjc module "missing" until a test injects a fake."""
-    platform = macos.MacPlatform(clock=clock)
+    platform = macos.MacPlatform(clock=clock, state_path=state_path)
     platform._modules.update(dict.fromkeys(PYOBJC_MODULES))
     return platform
 
@@ -164,6 +174,9 @@ class FakeAX:
         self.hit: Any = None
         self.pids: dict[Any, int] = {}
         self.unpack = True
+        #: Elements whose app does not answer (every query times out).
+        self.hung: set[Any] = set()
+        self.queries: list[tuple[Any, str]] = []
 
     # element factories
     def AXUIElementCreateApplication(self, pid: int) -> str:
@@ -176,6 +189,9 @@ class FakeAX:
     def AXUIElementCopyAttributeValue(self, element: Any, name: str, out: Any) -> tuple[int, Any]:
         assert out is None
         key = (element, name)
+        self.queries.append(key)
+        if element in self.hung:
+            return (AX_ERROR_CANNOT_COMPLETE, None)
         if key not in self.attrs:
             return (AX_ERROR_ATTRIBUTE_UNSUPPORTED, None)
         return (0, self.attrs[key])
@@ -573,9 +589,10 @@ def test_foreground_window_with_accessibility(
     assert ref.handle == (PID, "win")
     assert ref.pid == PID
     assert ref.rect == Rect(100, 50, 800, 600)
-    assert ax.timeouts == [("system", 0.5)]  # global AX timeout set once
+    # The global AX timeout is set once; the polled app gets a tighter one.
+    assert ax.timeouts == [("system", 0.5), (f"app:{PID}", 0.25)]
     plat.foreground_window()
-    assert len(ax.timeouts) == 1
+    assert [t for t in ax.timeouts if t[0] == "system"] == [("system", 0.5)]
 
 
 @pytest.mark.usefixtures("appkit")
@@ -708,6 +725,98 @@ def test_window_rect(plat: macos.MacPlatform, ax: FakeAX, quartz: FakeQuartz) ->
     assert plat.window_rect(WindowRef(handle=None)) is None
 
 
+def test_cursor_position_is_reliable(plat: macos.MacPlatform) -> None:
+    assert plat.cursor_position_reliable() is True
+
+
+# ------------------------------------------------------------------ windows: Spaces
+@pytest.mark.usefixtures("appkit")
+def test_window_on_another_space_is_not_valid(
+    plat: macos.MacPlatform, ax: FakeAX, quartz: FakeQuartz
+) -> None:
+    # AX keeps answering for a window on another Space (or behind a full-screen
+    # app) with a frame inside the display; only the on-screen list tells.
+    ax.window("win", (100, 50, 800, 600))
+    quartz.windows = [cg_window(OTHER_PID, 0, 0, 1920, 1080)]  # a full-screen app in front
+    assert not plat.is_window_valid(WindowRef(handle=(PID, "win")))
+    assert not plat.is_window_valid(WindowRef(handle=(PID, None)))
+    quartz.windows.append(cg_window(PID, 101, 49, 799, 601))  # back on the visible Space
+    assert plat.is_window_valid(WindowRef(handle=(PID, "win")))
+    assert plat.is_window_valid(WindowRef(handle=(PID, None)))
+
+
+@pytest.mark.usefixtures("appkit")
+def test_other_window_of_the_same_app_does_not_count(
+    plat: macos.MacPlatform, ax: FakeAX, quartz: FakeQuartz
+) -> None:
+    ax.window("win", (100, 50, 800, 600))
+    quartz.windows = [cg_window(PID, 1000, 50, 400, 300)]  # a different window of the app
+    assert not plat.is_window_valid(WindowRef(handle=(PID, "win")))
+    assert plat.is_window_valid(WindowRef(handle=(PID, None)))
+
+
+def test_frames_match_tolerance() -> None:
+    assert macos._frames_match(Rect(0, 0, 100, 100), Rect(2, -2, 98, 102))
+    assert not macos._frames_match(Rect(0, 0, 100, 100), Rect(3, 0, 100, 100))
+
+
+# ------------------------------------------------------------------ windows: hung apps
+@pytest.mark.usefixtures("appkit")
+def test_hung_frontmost_app_is_left_alone_for_a_while(
+    plat: macos.MacPlatform, ax: FakeAX, quartz: FakeQuartz, clock: Clock
+) -> None:
+    quartz.windows = [cg_window(PID, 1920, 0, 1280, 720)]
+    ax.hung.add(f"app:{PID}")
+    ref = plat.foreground_window()
+    assert ref is not None
+    assert ref.handle == (PID, None)  # application level, from the window list
+    assert ref.rect == Rect(1920, 0, 1280, 720)
+    asked = len(ax.queries)
+    clock.now += 1.0
+    again = plat.foreground_window()
+    assert again is not None
+    assert (again.handle, again.rect) == (ref.handle, ref.rect)
+    assert len(ax.queries) == asked  # no further AX request to the hung app
+    ax.hung.clear()
+    ax.attrs[(f"app:{PID}", "AXFocusedWindow")] = ax.window("win", (1920, 0, 1280, 720))
+    clock.now += macos._AX_UNRESPONSIVE_S
+    assert plat.foreground_window().handle == (PID, "win")  # type: ignore[union-attr]
+
+
+def test_ax_rect_stops_after_a_failed_position(ax: FakeAX) -> None:
+    ax.window("win", (0, 0, 10, 10))
+    ax.hung.add("win")
+    assert macos._ax_rect_checked(ax, "win") == (AX_ERROR_CANNOT_COMPLETE, None)
+    assert ax.queries == [("win", "AXPosition")]  # AXSize would time out again
+
+
+@pytest.mark.usefixtures("appkit")
+def test_hung_window_is_not_a_target(
+    plat: macos.MacPlatform, ax: FakeAX, quartz: FakeQuartz
+) -> None:
+    ax.window("win", (5, 6, 70, 80))
+    quartz.windows = [cg_window(PID, 5, 6, 70, 80)]
+    ax.hung.add("win")
+    ref = WindowRef(handle=(PID, "win"))
+    assert not plat.is_window_valid(ref)
+    asked = len(ax.queries)
+    assert plat.window_rect(ref) == Rect(5, 6, 70, 80)  # from the window list
+    assert not plat.is_window_valid(ref)
+    assert len(ax.queries) == asked
+
+
+def test_activating_a_hung_app_skips_accessibility(
+    plat: macos.MacPlatform, ax: FakeAX, appkit: FakeAppKit
+) -> None:
+    ax.window("win", (0, 0, 10, 10))
+    ax.hung.add("win")
+    assert plat.activate_window(WindowRef(handle=(PID, "win"))) is True
+    assert appkit.apps[PID].activations == [2]
+    assert ax.sets == []
+    assert ax.actions == []
+    assert ax.queries == [("win", "AXMinimized")]
+
+
 def test_same_window(plat: macos.MacPlatform) -> None:
     compared: list[tuple[Any, Any]] = []
 
@@ -789,6 +898,156 @@ def test_open_permission_settings(plat: macos.MacPlatform, recorder: Recorder) -
 def test_set_accessory_app(plat: macos.MacPlatform, appkit: FakeAppKit) -> None:
     assert plat.set_accessory_app() is True
     assert appkit.policies == [1]
+
+
+# ------------------------------------------------------------------ App Nap
+class FakeProcessInfo:
+    def __init__(self) -> None:
+        self.begun: list[tuple[int, str]] = []
+        self.ended: list[Any] = []
+        self.fail = False
+
+    def beginActivityWithOptions_reason_(self, options: int, reason: str) -> Any:
+        if self.fail:
+            raise RuntimeError("no activities here")
+        self.begun.append((options, reason))
+        return f"token{len(self.begun)}"
+
+    def endActivity_(self, token: Any) -> None:
+        self.ended.append(token)
+
+
+@pytest.fixture
+def process_info(plat: macos.MacPlatform) -> FakeProcessInfo:
+    info = FakeProcessInfo()
+    plat._modules["Foundation"] = SimpleNamespace(
+        NSProcessInfo=SimpleNamespace(processInfo=lambda: info)
+    )
+    return info
+
+
+@pytest.mark.usefixtures("appkit")
+def test_accessory_app_opts_out_of_app_nap(
+    plat: macos.MacPlatform, process_info: FakeProcessInfo
+) -> None:
+    assert plat.set_accessory_app() is True
+    # User initiated (no App Nap, no timer coalescing) but idle sleep still allowed.
+    assert process_info.begun == [(0x00EFFFFF, macos._ACTIVITY_REASON)]
+    assert plat._activity == "token1"  # the token must stay referenced
+
+
+def test_background_activity_begins_and_ends_once(
+    plat: macos.MacPlatform, process_info: FakeProcessInfo
+) -> None:
+    assert plat.set_background_activity(True) is True
+    assert plat.set_background_activity(True) is True
+    assert len(process_info.begun) == 1
+    assert plat.set_background_activity(False) is True
+    assert plat.set_background_activity(False) is True
+    assert process_info.ended == ["token1"]
+    assert plat._activity is None
+    assert plat.set_background_activity(True) is True  # e.g. tracking resumed
+    assert plat._activity == "token2"
+
+
+def test_background_activity_uses_the_named_option(plat: macos.MacPlatform) -> None:
+    info = FakeProcessInfo()
+    plat._modules["Foundation"] = SimpleNamespace(
+        NSProcessInfo=SimpleNamespace(processInfo=lambda: info),
+        NSActivityUserInitiatedAllowingIdleSystemSleep=0x1234,
+    )
+    assert plat.set_background_activity(True) is True
+    assert info.begun[0][0] == 0x1234
+
+
+def test_background_activity_degrades(
+    plat: macos.MacPlatform, process_info: FakeProcessInfo
+) -> None:
+    process_info.fail = True
+    assert plat.set_background_activity(True) is False
+    assert plat._activity is None
+    plat._modules["Foundation"] = None
+    assert plat.set_background_activity(True) is False
+    assert plat.set_background_activity(False) is True  # nothing to end
+
+
+# ------------------------------------------------------------------ Accessibility after updates
+def test_accessibility_status_granted_and_missing(
+    plat: macos.MacPlatform, ax: FakeAX, state_path: Path
+) -> None:
+    assert plat.accessibility_status() == "granted"
+    ax.trusted = False
+    assert plat.accessibility_status() == "missing"
+    assert not state_path.exists()  # source runs have no build identity to remember
+
+
+def test_accessibility_status_unknown_without_the_api(plat: macos.MacPlatform) -> None:
+    assert plat.accessibility_status() == "unknown"
+
+
+def _packaged(monkeypatch: pytest.MonkeyPatch, build: str) -> None:
+    monkeypatch.setattr(macos, "_build_fingerprint", lambda: build)
+
+
+def test_accessibility_granted_to_an_earlier_build_is_stale(
+    monkeypatch: pytest.MonkeyPatch, clock: Clock, state_path: Path
+) -> None:
+    fake = FakeAX()
+    _packaged(monkeypatch, "1.0:100:1")
+    first = macos.MacPlatform(clock=clock, state_path=state_path)
+    first._modules["ApplicationServices"] = fake
+    assert first.accessibility_status() == "granted"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {"trusted_build": "1.0:100:1"}
+
+    # An update: new ad-hoc signature, System Settings still shows the old grant.
+    fake.trusted = False
+    _packaged(monkeypatch, "1.1:120:2")
+    second = macos.MacPlatform(clock=clock, state_path=state_path)
+    second._modules["ApplicationServices"] = fake
+    assert second.accessibility_status() == "stale"
+    assert second.permissions()["accessibility"] is False
+
+    # Re-granted: the record follows the new build.
+    fake.trusted = True
+    assert second.accessibility_status() == "granted"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {"trusted_build": "1.1:120:2"}
+
+
+def test_accessibility_never_granted_is_missing_for_packaged_builds(
+    monkeypatch: pytest.MonkeyPatch, plat: macos.MacPlatform, ax: FakeAX, state_path: Path
+) -> None:
+    _packaged(monkeypatch, "1.0:100:1")
+    ax.trusted = False
+    assert plat.accessibility_status() == "missing"
+    state_path.write_text("not json", encoding="utf-8")  # a damaged record
+    fresh = macos.MacPlatform(state_path=state_path)
+    fresh._modules["ApplicationServices"] = ax
+    assert fresh.accessibility_status() == "missing"
+
+
+def test_activation_without_accessibility_fails_on_sonoma(
+    monkeypatch: pytest.MonkeyPatch,
+    plat: macos.MacPlatform,
+    ax: FakeAX,
+    appkit: FakeAppKit,
+    state_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # macOS 14+ ignores activation requests from an inactive (menu-bar) app.
+    monkeypatch.setattr(macos, "_macos_major_version", lambda: 14)
+    _packaged(monkeypatch, "1.1:120:2")
+    state_path.write_text(json.dumps({"trusted_build": "1.0:100:1"}), encoding="utf-8")
+    ax.trusted = False
+    ref = WindowRef(handle=(PID, None))
+    with caplog.at_level(logging.WARNING, logger=macos.__name__):
+        assert plat.activate_window(ref) is False
+        assert plat.activate_window(ref) is False
+    assert appkit.apps[PID].activations == [2, 2]  # still asked, in case it works
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "earlier version" in warnings[0]
+    monkeypatch.setattr(macos, "_macos_major_version", lambda: 13)
+    assert plat.activate_window(ref) is True
 
 
 @pytest.mark.usefixtures("on_macos", "quartz", "appkit", "ax")

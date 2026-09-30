@@ -22,6 +22,8 @@ packaging/**/AppDir/
 
 # Local tooling
 graft/
+# ripgrep override that re-admits graft/ to local searches
+.ignore
 .claude/
 .idea/
 .vscode/

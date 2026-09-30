@@ -21,7 +21,15 @@ _GUI_EXECUTABLES = frozenset({"eyetracker", "eye tracker"})
 
 
 def _is_gui_executable(path: str) -> bool:
-    stem = os.path.splitext(os.path.basename(path))[0]
+    """Whether ``path`` names one of the windowed executables.
+
+    Both separators are accepted on every OS: ``os.path`` is ``posixpath`` on
+    macOS and Linux and would treat a Windows path as a single file name. The
+    real ``sys.executable`` is always native; this keeps the check (and its
+    tests) independent of the platform it runs on.
+    """
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    stem = os.path.splitext(name)[0]
     return stem.casefold() in _GUI_EXECUTABLES
 
 

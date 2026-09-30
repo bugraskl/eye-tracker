@@ -10,6 +10,18 @@ Design
   it the class still works at *application* level (``WindowRef.handle`` is
   ``(pid, None)``, rectangles come from the window list), so focus-follows-gaze
   degrades instead of failing.
+* **Permissions after an update.** Release builds are signed ad hoc, so every
+  build has a new code identity. macOS keeps showing the old build as allowed
+  under Privacy & Security › Accessibility, yet ``AXIsProcessTrusted()`` is
+  ``False`` for the new one: the entry must be removed with "−" and the app
+  added again. :meth:`MacPlatform.accessibility_status` reports this case as
+  ``"stale"`` (it remembers which build was last trusted) so the UI can say so.
+* **Hung apps.** Accessibility calls block until the target app answers. An
+  app that does not answer in time is left alone for a few seconds (window
+  list and application-level handles only), so polling it cannot stall the UI.
+* **App Nap.** A menu-bar app without visible windows is a candidate for App
+  Nap, which throttles its timers by seconds. :meth:`MacPlatform.set_accessory_app`
+  therefore also opts out of it (:meth:`MacPlatform.set_background_activity`).
 * **Imports.** pyobjc is imported lazily (and cached) the first time a method
   needs it, so this module imports on every OS; every public method degrades to
   ``None``/``False`` when pyobjc or a framework symbol is missing.
@@ -22,9 +34,11 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import importlib
+import json
 import logging
 import math
 import os
+import platform as _stdlib_platform
 import re
 import shutil
 import subprocess
@@ -32,8 +46,10 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from pathlib import Path
 from typing import Any, ClassVar
 
+from .. import __version__
 from ..types import Rect, WindowRef
 from .base import PlatformServices
 
@@ -64,15 +80,28 @@ _CG_NULL_WINDOW_ID = 0
 _AX_VALUE_CGPOINT = 1  # kAXValueCGPointType
 _AX_VALUE_CGSIZE = 2  # kAXValueCGSizeType
 _AX_SUCCESS = 0
+_AX_ERROR_CANNOT_COMPLETE = -25204  # kAXErrorCannotComplete: the app did not answer in time
 _NS_ACTIVATE_IGNORING_OTHER_APPS = 1 << 1
 _NS_ACTIVATION_POLICY_ACCESSORY = 1
+#: NSActivityUserInitiatedAllowingIdleSystemSleep: no App Nap and no timer
+#: coalescing, while the system and the displays may still sleep when idle.
+_NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP = 0x00EFFFFF
+_ACTIVITY_REASON = "Eye tracking follows the camera in real time"
 _AV_MEDIA_TYPE_VIDEO = "vide"  # value of AVMediaTypeVideo
 _AV_STATUS = {1: False, 2: False, 3: True}  # restricted, denied, authorized (0 = not asked)
 
 #: Default AX messaging timeout is 6 s; a hung app must not freeze our UI thread.
 _AX_TIMEOUT_S = 0.5
+#: Tighter timeout for the frontmost app's focused window, which is polled.
+_AX_APP_TIMEOUT_S = 0.25
+#: How long an app that did not answer an AX request is left alone.
+_AX_UNRESPONSIVE_S = 5.0
 _TRUST_TTL_S = 5.0
 _TOOL_TIMEOUT_S = 5.0
+#: An AX frame and a window-list frame this close (points) are the same window.
+_FRAME_TOLERANCE = 2
+#: Remembers which build Accessibility was granted to (see ``accessibility_status``).
+_ACCESSIBILITY_STATE_FILE = "macos-accessibility.json"
 
 _AX_POINT_RE = re.compile(r"x:\s*(-?[\d.]+)\s+y:\s*(-?[\d.]+)")
 _AX_SIZE_RE = re.compile(r"w:\s*(-?[\d.]+)\s+h:\s*(-?[\d.]+)")
@@ -120,6 +149,30 @@ def _run_ok(argv: Sequence[str], timeout: float = _TOOL_TIMEOUT_S) -> bool:
 def _reap(proc: Any) -> None:
     with contextlib.suppress(Exception):
         proc.wait(timeout=30)
+
+
+def _macos_major_version() -> int:
+    """Major macOS version (e.g. 14); 0 when unknown or not on macOS."""
+    try:
+        return int((_stdlib_platform.mac_ver()[0] or "0").split(".")[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _build_fingerprint() -> str | None:
+    """Identity of this packaged build; ``None`` when running from source.
+
+    An ad-hoc signed app's Accessibility grant is tied to its code hash, which
+    changes with every build - and so do the version, size and modification
+    time of the bundle's main executable.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    try:
+        stat = Path(sys.executable).resolve().stat()
+    except OSError:
+        return None
+    return f"{__version__}:{stat.st_size}:{stat.st_mtime_ns}"
 
 
 # ---------------------------------------------------------------------------
@@ -247,9 +300,23 @@ def _cg_front_rect(windows: Iterable[Mapping[str, Any]], pid: int, own_pid: int)
     return None
 
 
-def _ax_attr(ax: Any, element: Any, name: str) -> Any:
+def _frames_match(a: Rect, b: Rect, tolerance: int = _FRAME_TOLERANCE) -> bool:
+    return (
+        abs(a.x - b.x) <= tolerance
+        and abs(a.y - b.y) <= tolerance
+        and abs(a.w - b.w) <= tolerance
+        and abs(a.h - b.h) <= tolerance
+    )
+
+
+def _ax_attr_err(ax: Any, element: Any, name: str) -> tuple[int, Any]:
+    """``(AXError, value)`` of an attribute; the value is ``None`` on error."""
     err, value = _err_value(ax.AXUIElementCopyAttributeValue(element, name, None))
-    return value if err == _AX_SUCCESS else None
+    return err, (value if err == _AX_SUCCESS else None)
+
+
+def _ax_attr(ax: Any, element: Any, name: str) -> Any:
+    return _ax_attr_err(ax, element, name)[1]
 
 
 def _ax_set(ax: Any, element: Any, name: str, value: Any) -> bool:
@@ -297,16 +364,28 @@ def _ok_value(result: Any) -> tuple[bool, Any]:
     return True, result
 
 
-def _ax_rect(ax: Any, element: Any) -> Rect | None:
+def _ax_rect_checked(ax: Any, element: Any) -> tuple[int, Rect | None]:
+    """``(AXError, frame)`` of a window; the error lets callers spot hung apps."""
     if ax is None or element is None:
-        return None
+        return _AX_SUCCESS, None
     try:
-        origin = _ax_pair(ax, _ax_attr(ax, element, "AXPosition"), size=False)
-        size = _ax_pair(ax, _ax_attr(ax, element, "AXSize"), size=True)
+        err, position = _ax_attr_err(ax, element, "AXPosition")
+        if err != _AX_SUCCESS:
+            # Closed, or its app is hung: asking for AXSize would wait all over again.
+            return err, None
+        err, size = _ax_attr_err(ax, element, "AXSize")
+        if err != _AX_SUCCESS:
+            return err, None
+        origin = _ax_pair(ax, position, size=False)
+        dimensions = _ax_pair(ax, size, size=True)
     except Exception as exc:
         log.debug("AX geometry failed: %s", exc)
-        return None
-    return _rect_from(origin, size)
+        return _AX_SUCCESS, None
+    return _AX_SUCCESS, _rect_from(origin, dimensions)
+
+
+def _ax_rect(ax: Any, element: Any) -> Rect | None:
+    return _ax_rect_checked(ax, element)[1]
 
 
 def _ax_window_of(ax: Any, element: Any) -> Any:
@@ -335,17 +414,33 @@ def _ax_window_of(ax: Any, element: Any) -> Any:
 class MacPlatform(PlatformServices):
     """macOS 12+ implementation of :class:`PlatformServices`.
 
-    ``clock`` exists for tests; production code uses the default.
+    ``clock`` and ``state_path`` exist for tests; production code uses the
+    defaults (``state_path``: the file remembering which build was trusted).
     """
 
     name: ClassVar[str] = "macos"
 
-    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        state_path: Path | None = None,
+    ) -> None:
         self._clock = clock
         self._modules: dict[str, Any] = {}
         self._trust_cache: tuple[float, bool] | None = None
         self._ax_ready = False
         self._ax_lock = threading.Lock()
+        #: pid -> clock time until which AX requests to that app are skipped.
+        self._ax_unresponsive: dict[int, float] = {}
+        self._activity: Any = None  # NSProcessInfo activity token (App Nap opt-out)
+        self._activity_lock = threading.Lock()
+        self._state_path = state_path
+        self._trusted_build: str | None = None  # last build known to be trusted (cached)
+        self._trusted_build_loaded = False
+        self._build_id: str | None = None  # see _fingerprint
+        self._fingerprint_known = False
+        self._warned_untrusted = False
 
     def _mod(self, name: str) -> Any:
         """Import a pyobjc module once; ``None`` when unavailable."""
@@ -384,6 +479,22 @@ class MacPlatform(PlatformServices):
         self._trust_cache = (now, trusted)
         return trusted
 
+    def _ax_responsive(self, pid: int) -> bool:
+        """``False`` while an app that recently timed out an AX request is left alone."""
+        until = self._ax_unresponsive.get(pid)
+        if until is None:
+            return True
+        if self._clock() >= until:
+            self._ax_unresponsive.pop(pid, None)
+            return True
+        return False
+
+    def _note_ax_error(self, pid: int, err: int) -> None:
+        if err == _AX_ERROR_CANNOT_COMPLETE:
+            if pid not in self._ax_unresponsive:
+                log.debug("App %s does not answer Accessibility requests; skipping it", pid)
+            self._ax_unresponsive[pid] = self._clock() + _AX_UNRESPONSIVE_S
+
     # -------------------------------------------------------------- lifecycle
     def prepare_process(self) -> None:
         """Nothing to do: Qt already uses point coordinates, like Quartz and AX.
@@ -393,10 +504,14 @@ class MacPlatform(PlatformServices):
         """
 
     def set_accessory_app(self) -> bool:
-        """Run as a menu-bar ("accessory") app: no Dock icon, no app menu.
+        """Run as a menu-bar ("accessory") app: no Dock icon, no app menu, no App Nap.
 
-        Must be called on the main thread after the QApplication was created.
+        A menu-bar app without visible windows is exactly what App Nap throttles,
+        so this also calls :meth:`set_background_activity`. Must be called on the
+        main thread after the QApplication was created. Returns whether the
+        activation policy was set.
         """
+        self.set_background_activity(True)
         appkit = self._mod("AppKit")
         if appkit is None:
             return False
@@ -408,6 +523,44 @@ class MacPlatform(PlatformServices):
         except Exception as exc:
             log.debug("setActivationPolicy failed: %s", exc)
             return False
+
+    def set_background_activity(self, active: bool) -> bool:
+        """Opt out of App Nap while ``active`` (``True``), or allow it again.
+
+        Without this, macOS naps a window-less menu-bar app: its timers (the
+        controller tick, the walk-away countdown) and the camera loop get
+        delayed by up to seconds. The activity is "user initiated, allowing idle
+        system sleep": the Mac and its displays still sleep when idle. The
+        controller may end it while tracking is paused to save power. Returns
+        whether the requested state is in effect.
+        """
+        with self._activity_lock:
+            if active == (self._activity is not None):
+                return True
+            foundation = self._mod("Foundation")
+            if foundation is None:
+                return False
+            try:
+                info = foundation.NSProcessInfo.processInfo()
+                if active:
+                    options = getattr(
+                        foundation,
+                        "NSActivityUserInitiatedAllowingIdleSystemSleep",
+                        _NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP,
+                    )
+                    # The token must stay referenced: the activity ends with it.
+                    self._activity = info.beginActivityWithOptions_reason_(
+                        options, _ACTIVITY_REASON
+                    )
+                    log.debug("App Nap disabled")
+                    return self._activity is not None
+                info.endActivity_(self._activity)
+                self._activity = None
+                log.debug("App Nap allowed again")
+                return True
+            except Exception as exc:
+                log.debug("NSProcessInfo activity change failed: %s", exc)
+                return False
 
     def capabilities(self) -> dict[str, bool]:
         quartz = self._mod("Quartz") is not None
@@ -516,6 +669,10 @@ class MacPlatform(PlatformServices):
             return None
         return value if math.isfinite(value) and value >= 0.0 else None
 
+    def cursor_position_reliable(self) -> bool:
+        """Quartz reports the pointer everywhere, over every app's windows."""
+        return True
+
     def move_cursor(self, x: int, y: int) -> bool | None:
         quartz = self._mod("Quartz")
         if quartz is None:
@@ -543,8 +700,13 @@ class MacPlatform(PlatformServices):
             return None
         if pid <= 0 or pid == os.getpid():
             return None
-        window = self._focused_ax_window(pid) if self._ax_trusted() else None
-        rect = _ax_rect(self._ax(), window) if window is not None else None
+        window = None
+        if self._ax_trusted() and self._ax_responsive(pid):
+            window = self._focused_ax_window(pid)
+        rect = None
+        if window is not None:
+            err, rect = _ax_rect_checked(self._ax(), window)
+            self._note_ax_error(pid, err)
         if rect is None:
             rect = self._cg_front_rect(pid)
         return WindowRef(handle=(pid, window), pid=pid, rect=rect)
@@ -554,10 +716,17 @@ class MacPlatform(PlatformServices):
         if ax is None:
             return None
         try:
-            return _ax_attr(ax, ax.AXUIElementCreateApplication(pid), "AXFocusedWindow")
+            app = ax.AXUIElementCreateApplication(pid)
+            # Polled twice a second: a busy app must not hold the UI thread for
+            # the full global timeout on every poll.
+            with contextlib.suppress(Exception):
+                ax.AXUIElementSetMessagingTimeout(app, _AX_APP_TIMEOUT_S)
+            err, window = _ax_attr_err(ax, app, "AXFocusedWindow")
         except Exception as exc:
             log.debug("AXFocusedWindow failed: %s", exc)
             return None
+        self._note_ax_error(pid, err)
+        return window
 
     def window_at(self, x: int, y: int) -> WindowRef | None:
         """Frontmost ordinary window under a point (excluding our own).
@@ -573,12 +742,15 @@ class MacPlatform(PlatformServices):
         if hit is None:
             return None
         pid, rect = hit
-        window = self._ax_window_containing(pid, x, y, rect) if self._ax_trusted() else None
+        window = None
+        if self._ax_trusted() and self._ax_responsive(pid):
+            window = self._ax_window_containing(pid, x, y, rect)
         if window is not None:
             rect = _ax_rect(self._ax(), window) or rect
         return WindowRef(handle=(pid, window), pid=pid, rect=rect)
 
     def _cg_windows(self) -> list[Mapping[str, Any]] | None:
+        """On-screen windows, front to back; ``None`` when the list is unavailable."""
         quartz = self._mod("Quartz")
         if quartz is None:
             return None
@@ -594,7 +766,7 @@ class MacPlatform(PlatformServices):
         except Exception as exc:
             log.debug("CGWindowListCopyWindowInfo failed: %s", exc)
             return None
-        return list(info or [])
+        return None if info is None else list(info)
 
     def _cg_front_rect(self, pid: int) -> Rect | None:
         windows = self._cg_windows()
@@ -606,7 +778,9 @@ class MacPlatform(PlatformServices):
         if ax is None:
             return None
         try:
-            windows = _ax_attr(ax, ax.AXUIElementCreateApplication(pid), "AXWindows") or []
+            err, windows = _ax_attr_err(ax, ax.AXUIElementCreateApplication(pid), "AXWindows")
+            self._note_ax_error(pid, err)
+            windows = windows or []
             fallback = None
             for window in windows:  # AXWindows is ordered front to back
                 if _ax_attr(ax, window, "AXMinimized"):
@@ -650,21 +824,32 @@ class MacPlatform(PlatformServices):
         """Bring the app forward and raise the window (no synthetic click).
 
         ``activateWithOptions_`` alone is no longer enough on macOS 14+
-        (cooperative activation ignores requests from inactive apps), so the
-        Accessibility route (``AXFrontmost`` + ``AXRaise``) is used when permitted.
+        (cooperative activation ignores requests from inactive apps while still
+        reporting success), so the Accessibility route (``AXFrontmost`` +
+        ``AXRaise``) is used when permitted. Without Accessibility on macOS 14+
+        the request is still made but reported as failed: it has no effect for
+        a menu-bar app.
         """
         pid, window = _split_handle(ref.handle)
         if pid is None:
             return False
-        ax = self._ax() if self._ax_trusted() else None
+        trusted = self._ax_trusted()
+        if not trusted:
+            self._warn_untrusted_once()
+        # Every AX call to a hung app would block for the full timeout.
+        ax = self._ax() if trusted and self._ax_responsive(pid) else None
         if ax is not None and window is not None:
             try:
-                minimized = bool(_ax_attr(ax, window, "AXMinimized"))
+                err, minimized = _ax_attr_err(ax, window, "AXMinimized")
             except Exception:
-                minimized = False
+                err, minimized = _AX_SUCCESS, False
+            self._note_ax_error(pid, err)
             if minimized:
                 return False  # never un-minimise behind the user's back
-            _ax_set(ax, window, "AXMain", True)
+            if err == _AX_ERROR_CANNOT_COMPLETE:
+                ax = None
+            else:
+                _ax_set(ax, window, "AXMain", True)
         activated = False
         appkit = self._mod("AppKit")
         if appkit is not None:
@@ -688,9 +873,20 @@ class MacPlatform(PlatformServices):
                 activated = _ax_set(ax, app_element, "AXFrontmost", True) or activated
             if window is not None:
                 _ax_perform(ax, window, "AXRaise")
+        if not trusted and _macos_major_version() >= 14:
+            return False
         return activated
 
     def is_window_valid(self, ref: WindowRef) -> bool:
+        """Running, not hidden or minimised, and on a Space that is shown right now.
+
+        Accessibility keeps answering for windows on other Spaces, other Stage
+        Manager stages or behind another app's full-screen Space, with frames
+        inside the same display. Activating such a window would make macOS
+        switch that display back to its Space, so the on-screen window list
+        decides. Windows of an app that does not answer AX requests are not
+        valid targets either, for now.
+        """
         pid, window = _split_handle(ref.handle)
         appkit = self._mod("AppKit")
         if pid is None or appkit is None:
@@ -703,24 +899,47 @@ class MacPlatform(PlatformServices):
             log.debug("NSRunningApplication lookup failed: %s", exc)
             return False
         if window is None:
-            return True
+            return self._on_screen(pid, None)
+        if not self._ax_responsive(pid):
+            return False
         ax = self._ax()
         if ax is None:
             return False
         try:
-            if _ax_attr(ax, window, "AXMinimized"):
-                return False
+            err, minimized = _ax_attr_err(ax, window, "AXMinimized")
         except Exception:
             return False
+        self._note_ax_error(pid, err)
+        if minimized or err == _AX_ERROR_CANNOT_COMPLETE:
+            return False
         # A closed window's element answers every query with an error.
-        return _ax_rect(ax, window) is not None
+        err, rect = _ax_rect_checked(ax, window)
+        self._note_ax_error(pid, err)
+        if rect is None:
+            return False
+        return self._on_screen(pid, rect)
+
+    def _on_screen(self, pid: int, frame: Rect | None) -> bool:
+        """Whether ``pid`` shows a window (with about this frame) on a visible Space."""
+        windows = self._cg_windows()
+        if windows is None:
+            return True  # cannot tell: keep the previous behaviour
+        return any(
+            owner == pid and (frame is None or _frames_match(bounds, frame))
+            for owner, bounds in _cg_user_windows(windows, os.getpid())
+        )
 
     def window_rect(self, ref: WindowRef) -> Rect | None:
         pid, window = _split_handle(ref.handle)
         if pid is None:
             return None
-        if window is not None:
-            return _ax_rect(self._ax(), window)
+        if window is not None and self._ax_responsive(pid):
+            err, rect = _ax_rect_checked(self._ax(), window)
+            self._note_ax_error(pid, err)
+            if err != _AX_ERROR_CANNOT_COMPLETE:
+                return rect
+        # Application-level handle, or a hung app: the window list still knows
+        # where its front window is.
         return self._cg_front_rect(pid)
 
     def same_window(self, a: WindowRef | None, b: WindowRef | None) -> bool:
@@ -749,15 +968,104 @@ class MacPlatform(PlatformServices):
             "accessibility": self._accessibility_permission(),
         }
 
+    def accessibility_status(self) -> str:
+        """Accessibility permission, in more detail than :meth:`permissions`.
+
+        * ``"granted"``: keyboard focus can follow the gaze.
+        * ``"missing"``: never granted (or revoked); ``request_permission`` asks.
+        * ``"stale"``: not trusted, but a *previous build* of the app was.
+          Release builds are signed ad hoc, so each update has a new code
+          identity; System Settings keeps showing the old entry as enabled while
+          it no longer applies. The fix: remove Eye Tracker from Privacy &
+          Security › Accessibility with "−", then add the app again.
+        * ``"unknown"``: the Accessibility API is unavailable.
+
+        Only packaged builds can be told apart this way; a source checkout
+        (whose permission belongs to the terminal or Python) reports "missing".
+        """
+        trusted = self._accessibility_permission()
+        if trusted is None:
+            return "unknown"
+        self._trust_cache = (self._clock(), trusted)
+        if trusted:
+            return "granted"
+        current = self._fingerprint()
+        if current is None:
+            return "missing"
+        previous = self._load_trusted_build()
+        return "stale" if previous is not None and previous != current else "missing"
+
+    def _fingerprint(self) -> str | None:
+        """This build's :func:`_build_fingerprint`, computed once per process."""
+        if not self._fingerprint_known:
+            self._fingerprint_known = True
+            self._build_id = _build_fingerprint()
+        return self._build_id
+
     def _accessibility_permission(self) -> bool | None:
         ax = self._ax()
         if ax is None:
             return None
         try:
-            return bool(ax.AXIsProcessTrusted())
+            trusted = bool(ax.AXIsProcessTrusted())
         except Exception as exc:
             log.debug("AXIsProcessTrusted failed: %s", exc)
             return None
+        if trusted:
+            self._remember_trusted_build()
+        return trusted
+
+    def _warn_untrusted_once(self) -> None:
+        if self._warned_untrusted:
+            return
+        self._warned_untrusted = True
+        if self.accessibility_status() == "stale":
+            log.warning(
+                "Accessibility access was granted to an earlier version of Eye Tracker and "
+                "does not apply to this one: keyboard focus cannot follow your gaze. In System "
+                "Settings › Privacy & Security › Accessibility, remove Eye Tracker with '−' "
+                "and add it again."
+            )
+        else:
+            log.warning(
+                "Accessibility permission is missing: keyboard focus cannot follow your gaze "
+                "(System Settings › Privacy & Security › Accessibility)."
+            )
+
+    def _state_file(self) -> Path:
+        if self._state_path is None:
+            from .. import paths
+
+            self._state_path = paths.data_dir() / _ACCESSIBILITY_STATE_FILE
+        return self._state_path
+
+    def _load_trusted_build(self) -> str | None:
+        if not self._trusted_build_loaded:
+            self._trusted_build_loaded = True
+            try:
+                data = json.loads(self._state_file().read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                log.debug("No record of an earlier Accessibility grant: %s", exc)
+                data = None
+            value = data.get("trusted_build") if isinstance(data, dict) else None
+            self._trusted_build = value if isinstance(value, str) else None
+        return self._trusted_build
+
+    def _remember_trusted_build(self) -> None:
+        """Record this build as trusted, so a later update can recognise a stale grant."""
+        current = self._fingerprint()
+        if current is None or self._load_trusted_build() == current:
+            return
+        path = self._state_file()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            partial = path.with_name(path.name + ".tmp")
+            partial.write_text(json.dumps({"trusted_build": current}), encoding="utf-8")
+            os.replace(partial, path)
+        except OSError as exc:
+            log.debug("Could not record the Accessibility grant: %s", exc)
+            return
+        self._trusted_build = current
 
     def _capture_device(self) -> tuple[Any, Any]:
         """``(AVCaptureDevice class, AVMediaTypeVideo)`` or ``(None, None)``.

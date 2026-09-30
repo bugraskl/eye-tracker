@@ -1,18 +1,24 @@
 """Background thread that captures frames and turns them into observations.
 
 The worker owns the camera and the vision backend. Both are created, used and
-released on the worker thread (MediaPipe objects are thread-bound, and camera
+released on the worker thread (backends need not be thread-safe, and camera
 drivers are happiest when one thread does all the talking). The rest of the
 application steers it through thread-safe setters and receives results through
 callbacks, which run on the worker thread; the Qt controller marshals them to
 the main thread.
 
-Low CPU use comes from three mechanisms:
+Low CPU use comes from four mechanisms:
 
 * the loop sleeps between frames for the interval chosen by the rate scheduler,
 * a :class:`~eye_tracker.vision.motion.MotionGate` skips inference while the
-  picture is unchanged (a copy of the last observation is emitted instead), and
+  picture is unchanged (a copy of the last observation is emitted instead),
+* OpenCV's thread pool is capped (see :mod:`eye_tracker.vision.threads`), and
 * the camera is released entirely whenever the worker is inactive.
+
+Analysed frames without a face are also checked for being *blind* (lens
+covered, shutter closed, unlit room); such observations carry
+``Observation.blind`` so that presence detection can tell "cannot see" from
+"nobody here".
 """
 
 from __future__ import annotations
@@ -30,7 +36,8 @@ import numpy as np
 from ..types import Observation, WorkerStats
 from .backends.base import BackendUnavailable, VisionBackend
 from .camera import FrameSource
-from .motion import MotionGate
+from .motion import MotionGate, is_blind, thumbnail
+from .threads import limit_opencv_threads
 
 log = logging.getLogger(__name__)
 
@@ -84,7 +91,11 @@ class VisionWorker:
             emitted while the motion gate holds.
         on_stats: Receives a :class:`WorkerStats` snapshot at most once per second,
             plus immediately when the camera opens or closes or an error appears or
-            clears.
+            clears. Besides the counters, ``extra`` carries ``"backend"``,
+            ``"feature_version"``, ``"device"`` (the frame source's settings
+            string, once opened), ``"frame_size"`` (``(width, height)`` of the
+            analysed frames) and ``"backend_failing"`` (the backend keeps
+            raising; ``last_error`` says why).
         on_preview: Receives an annotated copy of each analysed frame while the
             preview is enabled.
         clock: Time source for observation timestamps and frame pacing.
@@ -151,7 +162,9 @@ class VisionWorker:
 
         # Statistics; guarded by _stats_lock.
         self._stats_lock = threading.Lock()
-        self._stats = WorkerStats(target_fps=1.0 / DEFAULT_INTERVAL_S)
+        self._stats = WorkerStats(
+            target_fps=1.0 / DEFAULT_INTERVAL_S, extra={"backend_failing": False}
+        )
         self._dt_ewma: float | None = None
         self._last_frame_t: float | None = None
         self._counters = {
@@ -276,7 +289,10 @@ class VisionWorker:
     def stats(self) -> WorkerStats:
         """A snapshot of the current statistics (safe to keep and mutate)."""
         with self._stats_lock:
-            return dataclasses.replace(self._stats, extra=dict(self._stats.extra))
+            # The counters go in every snapshot, also those published before any
+            # frame was analysed (a camera that opens but whose frames all fail).
+            extra = {**self._stats.extra, **self._counters}
+            return dataclasses.replace(self._stats, extra=extra)
 
     @property
     def backend_info(self) -> tuple[str, str] | None:
@@ -286,10 +302,15 @@ class VisionWorker:
     # ================================================================ thread body
     def _run(self) -> None:
         log.debug("Vision worker started")
+        # Every frame (skipped ones too) goes through OpenCV colour conversions
+        # and resizes; an uncapped pool multiplies their CPU cost.
+        limit_opencv_threads()
         self._slot = None
         self._backoff_step = 0
         self._backend_failures = 0
         self._backend_recreations = 0
+        with self._stats_lock:
+            self._stats.extra["backend_failing"] = False
         try:
             while True:
                 with self._cond:
@@ -337,6 +358,11 @@ class VisionWorker:
         if self._backend is None and not self._create_backend(cfg):
             self._backoff_wait()
             return
+        with self._cond:
+            # Creating a backend can take a second; privacy mode, a lock or stop()
+            # may have arrived meanwhile, and the camera must then stay off.
+            if self._stop_requested or not self._active or self._has_pending_locked():
+                return
         if not self._ensure_source():
             self._backoff_wait()
             return
@@ -389,21 +415,31 @@ class VisionWorker:
             now = self._last_ts + _MIN_TIMESTAMP_STEP
         self._last_ts = now
         self._backoff_step = 0
-        self._clear_error()
+        if self._backend_recreations == 0:
+            # A failing backend's error stays until a frame is analysed again.
+            self._clear_error()
 
         use_gate = cfg.gate_enabled and not cfg.preview
         if use_gate != self._gate_in_use:
             self._gate.reset()
             self._gate_in_use = use_gate
-        if use_gate and self._last_obs is not None and not self._gate.should_process(frame, now):
+        last = self._last_obs
+        # Never hold a closed-eyes observation: the reopening can be too subtle
+        # for the gate, and a repeated blink would suppress gaze for seconds.
+        if (
+            use_gate
+            and last is not None
+            and not last.blink
+            and not self._gate.should_process(frame, now)
+        ):
             self._record_frame(now, read_ms, skipped=True)
-            self._safe_call(self._on_observation, _skipped_copy(self._last_obs, now), "observation")
+            self._safe_call(self._on_observation, _skipped_copy(last, now), "observation")
             return True
 
         process_started = time.perf_counter()
         try:
             obs = backend.process(frame, now)
-        except Exception:
+        except Exception as exc:
             self._backend_failures += 1
             with self._stats_lock:
                 self._counters["backend_errors"] += 1
@@ -415,16 +451,33 @@ class VisionWorker:
                 "recreate",
                 f"Vision backend failed {self._backend_failures} times in a row; recreating it",
             )
+            # Make the failure visible (the camera would otherwise look healthy
+            # while nothing is analysed) and keep the camera off while backing off.
+            with self._stats_lock:
+                self._stats.extra["backend_failing"] = True
+            self._set_error(f"Vision backend keeps failing: {str(exc) or type(exc).__name__}")
             self._close_backend()
+            self._release_source()
             # Back off before recreating, longer each time it keeps failing, so a
             # persistently broken backend cannot burn CPU being rebuilt.
             self._backoff_step = self._backend_recreations - 1
             return False
         self._backend_failures = 0
-        self._backend_recreations = 0
+        if self._backend_recreations:
+            self._backend_recreations = 0
+            with self._stats_lock:
+                self._stats.extra["backend_failing"] = False
+            self._clear_error()
         elapsed_ms = (time.perf_counter() - process_started) * 1e3
         if use_gate:
             self._gate.mark_processed(frame, now, obs.face_box)
+        if obs.face_count == 0 and not obs.blind:
+            reference = self._gate.reference if use_gate else None
+            if is_blind(reference if reference is not None else thumbnail(frame)):
+                obs = dataclasses.replace(obs, blind=True)
+        with self._stats_lock:
+            if self._stats.extra.get("frame_size") != obs.frame_size:
+                self._stats.extra["frame_size"] = obs.frame_size
         self._last_obs = obs
         self._record_frame(now, read_ms, skipped=False, inference_ms=obs.inference_ms or elapsed_ms)
         self._safe_call(self._on_observation, obs, "observation")
@@ -499,10 +552,13 @@ class VisionWorker:
             self._set_error(message)
             self._release_source()
             return False
+        device = getattr(source, "device", None)
         with self._stats_lock:
             self._counters["camera_opens"] += 1
             self._stats.camera_open = True
-        self._clear_error()
+            self._stats.extra["device"] = None if device is None else str(device)
+        if self._backend_recreations == 0:
+            self._clear_error()
         self._publish_stats(force=True)
         return True
 
@@ -532,6 +588,10 @@ class VisionWorker:
         if backend_factory is not None:
             self._close_backend()
             self._backend_factory = backend_factory
+            # A different backend gets a clean slate.
+            self._backend_recreations = 0
+            with self._stats_lock:
+                self._stats.extra["backend_failing"] = False
         self._reset_tracking()
         self._backoff_step = 0
         self._log_times.clear()
@@ -631,7 +691,6 @@ class VisionWorker:
             previous_read = float(stats.extra.get("read_ms", read_ms))
             stats.extra["read_ms"] = previous_read + _EWMA_ALPHA * (read_ms - previous_read)
             stats.extra["motion"] = self._gate.last_motion
-            stats.extra.update(self._counters)
         self._publish_stats()
 
     def _set_error(self, message: str) -> None:

@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -77,6 +80,9 @@ class FakeWin32:
         self.cursor_offsets: list[tuple[int, int]] = []
         self.cursor_ok = True
         self.image_path: str | None = r"C:\Python\python.exe"
+        self.can_create_window = True
+        self.own_package: str | None = None
+        self.packages: dict[int, str] = {}  # pid -> package family name
 
     def _win(self, hwnd: int) -> FakeWindow | None:
         return self.windows.get(hwnd)
@@ -170,6 +176,18 @@ class FakeWin32:
         self.calls.append(("post_broadcast", msg, wparam, lparam))
         return True
 
+    def create_hidden_window(self) -> int | None:
+        self.calls.append(("create_window",))
+        return 0x5150 if self.can_create_window else None
+
+    def send_message(self, hwnd: int, msg: int, wparam: int, lparam: int) -> int:
+        self.calls.append(("send_message", hwnd, msg, wparam, lparam))
+        return 0
+
+    def destroy_window(self, hwnd: int) -> bool:
+        self.calls.append(("destroy_window", hwnd))
+        return True
+
     # input
     def send_empty_mouse_input(self) -> bool:
         self.calls.append(("empty_input",))
@@ -222,6 +240,13 @@ class FakeWin32:
     def process_image_path(self) -> str | None:
         return self.image_path
 
+    def current_package_family_name(self) -> str | None:
+        return self.own_package
+
+    def process_package_family_name(self, pid: int) -> str | None:
+        self.calls.append(("package_of", pid))
+        return self.packages.get(pid)
+
     def names(self) -> list[str]:
         return [c[0] for c in self.calls]
 
@@ -269,8 +294,20 @@ def make_platform(api: Any, registry: Any | None = None, *, pid: int = OWN_PID) 
 
 WEBCAM = windows._WEBCAM_KEY
 NON_PACKAGED = f"{WEBCAM}\\NonPackaged"
-IN_USE = {"LastUsedTimeStart": 133_000_000_000_000_000, "LastUsedTimeStop": 0}
-STOPPED = {"LastUsedTimeStart": 133_000_000_000_000_000, "LastUsedTimeStop": 133_000_000_100_000}
+SESSION_START = 133_000_000_000_000_000  # FILETIME of the open camera session
+BOOT = SESSION_START - 3600 * windows.FILETIME_TICKS_PER_S  # booted an hour earlier
+IN_USE = {"LastUsedTimeStart": SESSION_START, "LastUsedTimeStop": 0}
+STOPPED = {"LastUsedTimeStart": SESSION_START, "LastUsedTimeStop": 133_000_000_100_000}
+ZOOM = r"C:\Program Files\Zoom\Zoom.exe"
+ZOOM_KEY = "C:#Program Files#Zoom#Zoom.exe"
+STORE_PYTHON = "PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0"
+
+
+def proc(
+    pid: int, name: str, *, created: int | None = SESSION_START - 600 * 10_000_000
+) -> windows._Process:
+    """A running process, by default started ten minutes before the camera session."""
+    return windows._Process(pid=pid, name=name, created=created)
 
 
 @pytest.fixture
@@ -373,6 +410,26 @@ class TestHelpers:
     )
     def test_is_in_use(self, values: dict[str, Any], expected: bool) -> None:
         assert windows._is_in_use(values) is expected
+        assert (windows._session_start(values) is not None) is expected
+
+    def test_unix_to_filetime(self) -> None:
+        assert windows._unix_to_filetime(0) == 116_444_736_000_000_000
+        assert windows._unix_to_filetime(1.5) == 116_444_736_015_000_000
+
+    def test_process_helpers_read_this_process(self) -> None:
+        """psutil-backed helpers (read-only, any OS)."""
+        processes = make_platform(FakeWin32([]))._processes()
+        assert processes
+        own = next(p for p in processes if p.pid == os.getpid())
+        assert own.name == own.name.lower()
+        assert own.created is not None
+        boot = WindowsPlatform._boot_filetime()
+        assert boot is not None
+        assert boot <= own.created
+        exe = WindowsPlatform._process_exe(os.getpid())
+        assert exe is not None
+        assert Path(exe).name.lower() == own.name
+        assert WindowsPlatform._process_exe(-1) is None
 
 
 # ------------------------------------------------------------- lifecycle
@@ -429,16 +486,49 @@ class TestSessionAndInput:
         plat = make_platform(api)
         assert plat.lock_screen() is True
         assert plat.display_off() is True
-        assert (
-            "post_broadcast",
-            windows.WM_SYSCOMMAND,
-            windows.SC_MONITORPOWER,
-            windows.MONITOR_POWER_OFF,
-        ) in api.calls
         api.cursor = (300, 400)
         assert plat.wake_display() is True
         assert api.names()[-3:] == ["display_required", "nudge", "set_cursor"]
         assert api.cursor == (300, 400)  # restored exactly
+
+    def test_display_off_is_sent_to_a_window_of_our_own(self) -> None:
+        """Nothing is queued in other apps' windows (a paused app would run it much later)."""
+        api = FakeWin32([])
+        assert make_platform(api).display_off() is True
+        assert api.calls == [
+            ("create_window",),
+            (
+                "send_message",
+                0x5150,
+                windows.WM_SYSCOMMAND,
+                windows.SC_MONITORPOWER,
+                windows.MONITOR_POWER_OFF,
+            ),
+            ("destroy_window", 0x5150),
+        ]
+        assert "post_broadcast" not in api.names()
+
+    def test_display_off_falls_back_to_broadcast_without_a_window(self) -> None:
+        api = FakeWin32([])
+        api.can_create_window = False
+        assert make_platform(api).display_off() is True
+        assert api.calls[-1] == (
+            "post_broadcast",
+            windows.WM_SYSCOMMAND,
+            windows.SC_MONITORPOWER,
+            windows.MONITOR_POWER_OFF,
+        )
+        assert "send_message" not in api.names()
+
+    def test_display_off_window_is_destroyed_when_sending_fails(self) -> None:
+        api = FakeWin32([])
+
+        def broken_send(*_args: Any) -> int:
+            raise OSError("send failed")
+
+        api.send_message = broken_send  # type: ignore[method-assign]
+        assert make_platform(api).display_off() is False
+        assert api.calls[-1] == ("destroy_window", 0x5150)
 
     def test_failures_are_reported_not_raised(self) -> None:
         plat = make_platform(ExplodingApi())
@@ -589,9 +679,11 @@ class TestWindows:
 
 
 # ------------------------------------------------------------- activation
-def _activation_setup(unlock: str, *, hung: bool = False, fg_tid: int = 20) -> FakeWin32:
+def _activation_setup(
+    unlock: str, *, hung: bool = False, fg_tid: int = 20, target_hung: bool = False
+) -> FakeWin32:
     current = FakeWindow(1, pid=50, tid=fg_tid, hung=hung)
-    target = FakeWindow(2, pid=60, tid=30)
+    target = FakeWindow(2, pid=60, tid=30, hung=target_hung)
     return FakeWin32([current, target], foreground=1, unlock=unlock)
 
 
@@ -661,6 +753,14 @@ class TestActivation:
         assert make_platform(api).activate_window(WindowRef(handle=2)) is True
         assert _attach_calls(api) == []
 
+    def test_hung_target_is_left_alone(self) -> None:
+        """Raising a window whose thread does not pump would block our UI thread."""
+        api = _activation_setup("any", target_hung=True)
+        assert make_platform(api).activate_window(WindowRef(handle=2)) is False
+        assert api.fg == 1
+        for name in ("set_foreground", "bring_to_top", "attach", "empty_input", "tap_alt"):
+            assert name not in api.names(), name
+
 
 # ------------------------------------------------------------------ camera
 class TestCamera:
@@ -678,41 +778,169 @@ class TestCamera:
         )
         users = windows._active_camera_users(registry)
         assert sorted(users, key=lambda u: u.app) == [
-            windows._CameraUser("C:#Zoom#Zoom.exe", packaged=False),
-            windows._CameraUser("Microsoft.WindowsCamera_8wekyb3d8bbwe", packaged=True),
+            windows._CameraUser("C:#Zoom#Zoom.exe", packaged=False, start=SESSION_START),
+            windows._CameraUser(
+                "Microsoft.WindowsCamera_8wekyb3d8bbwe", packaged=True, start=SESSION_START
+            ),
         ]
 
-    def _platform(self, entries: dict[str, dict[str, Any]], running: set[str]) -> WindowsPlatform:
+    def _platform(
+        self,
+        entries: dict[str, dict[str, Any]],
+        processes: list[windows._Process] | None,
+        *,
+        exes: dict[int, str | None] | None = None,
+        packaged: dict[str, dict[str, Any]] | None = None,
+        api: FakeWin32 | None = None,
+        boot: int | None = BOOT,
+    ) -> WindowsPlatform:
+        """Consent-store entries, running processes (``exes``: pid -> path) and boot time."""
         keys = {("HKCU", f"{NON_PACKAGED}\\{app}"): values for app, values in entries.items()}
-        plat = make_platform(FakeWin32([]), FakeRegistry(keys))
+        keys.update(
+            {("HKCU", f"{WEBCAM}\\{app}"): values for app, values in (packaged or {}).items()}
+        )
+        plat = make_platform(api or FakeWin32([]), FakeRegistry(keys))
         plat._own_paths = frozenset({windows._norm_path(r"C:\Python\python.exe")})
-        plat.running_process_names = lambda: running  # type: ignore[method-assign]
+        plat._processes = lambda: processes  # type: ignore[method-assign]
+        plat._process_exe = (exes or {}).get  # type: ignore[method-assign]
+        plat._boot_filetime = lambda: boot  # type: ignore[method-assign]
         return plat
 
     def test_nobody_using_the_camera(self) -> None:
-        assert self._platform({}, {"zoom.exe"}).camera_in_use_by_other_app() is False
+        plat = self._platform({}, [proc(1, "zoom.exe")], exes={1: ZOOM})
+        assert plat.camera_in_use_by_other_app() is False
 
     def test_own_process_is_ignored(self) -> None:
-        plat = self._platform({"C:#Python#python.exe": IN_USE}, {"python.exe"})
+        plat = self._platform({"C:#Python#python.exe": IN_USE}, [proc(1, "python.exe")])
         assert plat.camera_in_use_by_other_app() is False
 
     def test_other_running_app_counts(self) -> None:
-        plat = self._platform({"C:#Program Files#Zoom#Zoom.exe": IN_USE}, {"zoom.exe"})
+        plat = self._platform({ZOOM_KEY: IN_USE}, [proc(1, "zoom.exe")], exes={1: ZOOM})
         assert plat.camera_in_use_by_other_app() is True
 
     def test_stale_entry_of_exited_app_is_ignored(self) -> None:
-        plat = self._platform({"C:#Program Files#Zoom#Zoom.exe": IN_USE}, {"explorer.exe"})
+        plat = self._platform({ZOOM_KEY: IN_USE}, [proc(1, "explorer.exe")])
         assert plat.camera_in_use_by_other_app() is False
 
-    def test_unknown_process_list_trusts_the_registry(self) -> None:
-        plat = self._platform({"C:#Program Files#Zoom#Zoom.exe": IN_USE}, set())
+    def test_same_name_at_another_path_does_not_count(self) -> None:
+        other = r"C:\Users\me\Downloads\Zoom.exe"
+        plat = self._platform({ZOOM_KEY: IN_USE}, [proc(1, "zoom.exe")], exes={1: other})
+        assert plat.camera_in_use_by_other_app() is False
+
+    def test_app_started_after_the_session_does_not_count(self) -> None:
+        """Chrome crashed mid-call; the Chrome running now never opened the camera."""
+        later = proc(1, "zoom.exe", created=SESSION_START + 60 * windows.FILETIME_TICKS_PER_S)
+        plat = self._platform({ZOOM_KEY: IN_USE}, [later], exes={1: ZOOM})
+        assert plat.camera_in_use_by_other_app() is False
+
+    def test_creation_time_rounding_is_tolerated(self) -> None:
+        close = proc(1, "zoom.exe", created=SESSION_START + windows.FILETIME_TICKS_PER_S)
+        plat = self._platform({ZOOM_KEY: IN_USE}, [close], exes={1: ZOOM})
         assert plat.camera_in_use_by_other_app() is True
 
-    def test_packaged_app_counts(self) -> None:
-        registry = FakeRegistry({("HKCU", f"{WEBCAM}\\Microsoft.WindowsCamera_x"): IN_USE})
-        plat = make_platform(FakeWin32([]), registry)
-        plat._own_paths = frozenset()
+    def test_unreadable_creation_time_or_path_is_trusted(self) -> None:
+        plat = self._platform({ZOOM_KEY: IN_USE}, [proc(1, "zoom.exe", created=None)])
+        assert plat.camera_in_use_by_other_app() is True  # path unreadable (elevated app)
+
+    def test_session_from_before_the_last_boot_is_stale(self) -> None:
+        """Power loss mid-call leaves LastUsedTimeStop at 0 forever."""
+        processes_listed: list[int] = []
+
+        def processes() -> list[windows._Process]:
+            processes_listed.append(1)
+            return [proc(1, "zoom.exe", created=None)]
+
+        next_day = SESSION_START + 24 * 3600 * windows.FILETIME_TICKS_PER_S
+        plat = self._platform({ZOOM_KEY: IN_USE}, None, exes={1: ZOOM}, boot=next_day)
+        plat._processes = processes  # type: ignore[method-assign]
+        assert plat.camera_in_use_by_other_app() is False
+        assert processes_listed == []  # no process scan needed
+
+    def test_session_just_before_the_boot_time_goes_to_the_process_check(self) -> None:
+        """The boot time comes from the current clock, which NTP may have moved."""
+        boot = SESSION_START + 60 * windows.FILETIME_TICKS_PER_S
+        plat = self._platform({ZOOM_KEY: IN_USE}, [proc(1, "zoom.exe")], exes={1: ZOOM}, boot=boot)
         assert plat.camera_in_use_by_other_app() is True
+
+    def test_unknown_boot_time_skips_that_filter(self) -> None:
+        plat = self._platform({ZOOM_KEY: IN_USE}, [proc(1, "zoom.exe")], exes={1: ZOOM}, boot=None)
+        assert plat.camera_in_use_by_other_app() is True
+
+    @pytest.mark.parametrize("processes", [None, []])
+    def test_unknown_process_list_trusts_the_registry(
+        self, processes: list[windows._Process] | None
+    ) -> None:
+        plat = self._platform({ZOOM_KEY: IN_USE}, processes)
+        assert plat.camera_in_use_by_other_app() is True
+
+    def test_packaged_app_counts_while_its_package_runs(self) -> None:
+        api = FakeWin32([])
+        api.packages = {7: "Microsoft.WindowsCamera_8wekyb3d8bbwe"}
+        plat = self._platform(
+            {},
+            [proc(5, "explorer.exe"), proc(7, "windowscamera.exe")],
+            packaged={"microsoft.windowscamera_8wekyb3d8bbwe": IN_USE},
+            api=api,
+        )
+        assert plat.camera_in_use_by_other_app() is True
+
+    def test_stale_packaged_entry_is_ignored(self) -> None:
+        """Teams lost power mid-call: its session stays open in the registry."""
+        api = FakeWin32([])
+        api.packages = {7: "Some.Other_app"}
+        plat = self._platform(
+            {},
+            [proc(7, "ms-teams.exe")],
+            packaged={"MSTeams_8wekyb3d8bbwe": IN_USE},
+            api=api,
+        )
+        assert plat.camera_in_use_by_other_app() is False
+
+    def test_packaged_process_started_after_the_session_does_not_count(self) -> None:
+        api = FakeWin32([])
+        api.packages = {7: "MSTeams_8wekyb3d8bbwe"}
+        late = proc(7, "ms-teams.exe", created=SESSION_START + 60 * windows.FILETIME_TICKS_PER_S)
+        plat = self._platform({}, [late], packaged={"MSTeams_8wekyb3d8bbwe": IN_USE}, api=api)
+        assert plat.camera_in_use_by_other_app() is False
+
+    def test_own_package_identity_is_ignored(self) -> None:
+        """Under the Microsoft Store Python our own session is recorded by package name."""
+        api = FakeWin32([])
+        api.own_package = STORE_PYTHON
+        api.packages = {OWN_PID: STORE_PYTHON}
+        plat = self._platform(
+            {},
+            [proc(OWN_PID, "python.exe")],
+            packaged={STORE_PYTHON.lower(): IN_USE},
+            api=api,
+        )
+        assert plat.camera_in_use_by_other_app() is False
+        assert plat._own_package() == STORE_PYTHON.lower()
+
+    def test_other_package_is_not_mistaken_for_ours(self) -> None:
+        api = FakeWin32([])
+        api.own_package = STORE_PYTHON
+        api.packages = {9: "Microsoft.WindowsCamera_8wekyb3d8bbwe"}
+        plat = self._platform(
+            {},
+            [proc(9, "windowscamera.exe")],
+            packaged={"Microsoft.WindowsCamera_8wekyb3d8bbwe": IN_USE},
+            api=api,
+        )
+        assert plat.camera_in_use_by_other_app() is True
+
+    def test_without_package_identity_packaged_entries_are_others(self) -> None:
+        plat = self._platform({}, [proc(9, "x.exe")])
+        assert plat._own_package() == ""
+        assert not plat._is_own_camera_user(windows._CameraUser("", packaged=True, start=1))
+
+    def test_package_lookup_failure_means_no_package(self) -> None:
+        class NoPackageApi(FakeWin32):
+            def current_package_family_name(self) -> str | None:
+                raise OSError("no appmodel")
+
+        plat = make_platform(NoPackageApi([]))
+        assert plat._own_package() == ""
 
     def test_registry_failure_is_unknown(self) -> None:
         plat = make_platform(FakeWin32([]), RaisingRegistry())
@@ -818,3 +1046,56 @@ class TestLiveReadOnly:
         path = windows._Win32().process_image_path()
         assert path is not None
         assert Path(path).is_file()
+
+    def test_package_identity_queries(self) -> None:
+        api = windows._Win32()
+        own = api.current_package_family_name()
+        assert own is None or "_" in own  # "<name>_<publisher id>" under the Store Python
+        assert api.process_package_family_name(os.getpid()) == own
+        assert api.process_package_family_name(0) is None  # the idle process cannot be opened
+
+    def test_hidden_window_is_created_and_destroyed(self) -> None:
+        """Only our own invisible window is touched; no message is sent to it."""
+        api = windows._Win32()
+        hwnd = api.create_hidden_window()
+        assert hwnd is not None
+        try:
+            assert api.is_window(hwnd)
+            assert not api.is_visible(hwnd)
+            assert api.thread_process(hwnd) == (api.current_thread_id(), os.getpid())
+        finally:
+            assert api.destroy_window(hwnd)
+        assert not api.is_window(hwnd)
+
+    def test_bring_to_top_does_not_wait_for_a_busy_thread(self) -> None:
+        """A synchronous SetWindowPos would block until the owner pumps messages.
+
+        The target is a hidden window of our own, owned by a helper thread that
+        stops pumping for a while, like an app paused in a debugger.
+        """
+        api = windows._Win32()
+        created = threading.Event()
+        release = threading.Event()
+        owned: list[int] = []
+
+        def owner() -> None:
+            hwnd = api.create_hidden_window()
+            if hwnd is not None:
+                owned.append(hwnd)
+            created.set()
+            release.wait(5.0)  # not pumping messages meanwhile
+            if hwnd is not None:
+                api.destroy_window(hwnd)
+
+        thread = threading.Thread(target=owner, daemon=True)
+        thread.start()
+        try:
+            assert created.wait(5.0)
+            assert owned, "could not create the helper window"
+            started = time.perf_counter()
+            api.bring_to_top(owned[0])
+            elapsed = time.perf_counter() - started
+        finally:
+            release.set()
+            thread.join(5.0)
+        assert elapsed < 0.5

@@ -5,7 +5,10 @@ a key logger, so they are deliberately avoided. Instead:
 
 * **Mouse** activity is detected by polling the cursor position. Moves the app
   makes itself (after a monitor switch) are announced through
-  :meth:`InputTracker.note_programmatic_move` and are not user activity.
+  :meth:`InputTracker.note_programmatic_move` and are not user activity. Slow,
+  precise motion (a few pixels per poll, e.g. dragging a slider) counts as soon
+  as the pointer has drifted :data:`DRIFT_DISTANCE_PX` within
+  :data:`DRIFT_WINDOW_S`; one-pixel jitter back and forth never does.
 * **Keyboard** activity comes from the OS "seconds since last key press" where
   one exists (macOS). Elsewhere it is inferred: the OS idle timer was reset but
   the cursor did not move, so the input was most likely a key press. Only
@@ -35,6 +38,12 @@ WARP_WINDOW_S = 0.5
 #: The OS idle timer must jump forward by more than this to count as new input
 #: (absorbs the jitter between sampling ``now`` and sampling the idle time).
 IDLE_RESET_EPS_S = 0.05
+#: Pointer steps too small to be a move on their own count once the pointer has
+#: drifted further than this from where the steps began...
+DRIFT_DISTANCE_PX = 4.0
+#: ...within this time. Measuring the net displacement (not the path length)
+#: keeps jitter around one spot from ever adding up.
+DRIFT_WINDOW_S = 1.0
 
 
 class InputTracker:
@@ -63,6 +72,9 @@ class InputTracker:
         self._warp: tuple[int, int] | None = None
         self._warp_time = -math.inf
         self._warp_polled = False
+        # Where a run of small pointer steps began, and when (see _track_drift).
+        self._drift_anchor: tuple[int, int] | None = None
+        self._drift_since = -math.inf
         # Latest OS input time already attributed to some activity.
         self._os_seen: float | None = None
         self._prev_idle: float | None = None
@@ -118,13 +130,12 @@ class InputTracker:
         changed = had_cursor and (x, y) != prev
         self._manual_move = False
         if had_cursor and math.hypot(x - prev[0], y - prev[1]) > MOVE_THRESHOLD_PX:
-            if self._explained_by_warp(x, y, now):
-                self._warp = None
-            else:
-                self._manual_move = True
-                self._warp = None
-                self._last_mouse = now
-                self._last_any = max(self._last_any, now)
+            self._drift_anchor = None
+            if not self._explained_by_warp(x, y, now):
+                self._register_manual_move(now)
+            self._warp = None
+        elif changed:
+            self._track_drift(prev, x, y, now)
 
         # A warp is given at least one poll to show up, even if polls are slow.
         if self._warp is not None:
@@ -146,6 +157,13 @@ class InputTracker:
         stale = self._prev_idle is not None and idle == self._prev_idle
         self._prev_idle = idle
         if stale:
+            if changed and self._os_seen is not None:
+                # The pointer moved, so this poll did see input although the idle
+                # timer repeats its value: it ticks in coarse steps (15.6 ms on
+                # Windows), so two polls during continuous motion can both read 0.
+                # Consume the reading, or once the pointer stops the next poll
+                # would mistake this very input for a key press.
+                self._os_seen = max(self._os_seen, now - idle)
             return
         input_time = now - idle
         if (
@@ -161,6 +179,30 @@ class InputTracker:
         self._last_any = max(self._last_any, input_time)
 
     # ------------------------------------------------------------- internals
+    def _register_manual_move(self, now: float) -> None:
+        self._manual_move = True
+        self._last_mouse = now
+        self._last_any = max(self._last_any, now)
+
+    def _track_drift(self, prev: tuple[int, int], x: int, y: int, now: float) -> None:
+        """Count slow pointer motion whose single steps are below the move threshold.
+
+        Without this a slow drag (a slider, a precise selection) would register
+        as neither mouse nor keyboard use and the cursor could be warped away
+        in the middle of it.
+        """
+        warp = self._warp
+        if warp is not None and math.hypot(x - warp[0], y - warp[1]) <= WARP_TOLERANCE_PX:
+            self._drift_anchor = None  # our own warp settling onto its target
+            return
+        if self._drift_anchor is None or now - self._drift_since > DRIFT_WINDOW_S:
+            self._drift_anchor = prev
+            self._drift_since = now
+        ax, ay = self._drift_anchor
+        if math.hypot(x - ax, y - ay) > DRIFT_DISTANCE_PX:
+            self._drift_anchor = None
+            self._register_manual_move(now)
+
     def _explained_by_warp(self, x: int, y: int, now: float) -> bool:
         if self._warp is None:
             return False

@@ -42,9 +42,16 @@ __all__ = ["WindowsPlatform"]
 GA_ROOT = 2
 GW_HWNDNEXT = 2
 GWL_EXSTYLE = -20
+WS_POPUP = 0x80000000
 WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
+HWND_TOP = 0
 HWND_BROADCAST = 0xFFFF
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_ASYNCWINDOWPOS = 0x4000
 WM_SYSCOMMAND = 0x0112
 SC_MONITORPOWER = 0xF170
 MONITOR_POWER_OFF = 2
@@ -64,8 +71,16 @@ DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 PROCESS_PER_MONITOR_DPI_AWARE = 2
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+ERROR_SUCCESS = 0
 ERROR_ACCESS_DENIED = 5
+ERROR_INSUFFICIENT_BUFFER = 122
+APPMODEL_ERROR_NO_PACKAGE = 15700
 E_ACCESSDENIED = -2147024891  # HRESULT 0x80070005 as a signed 32-bit value
+#: Seconds from the FILETIME epoch (1601-01-01) to the Unix epoch (1970-01-01).
+FILETIME_UNIX_OFFSET_S = 11_644_473_600
+#: FILETIME counts 100 ns intervals.
+FILETIME_TICKS_PER_S = 10_000_000
 
 #: Desktop and taskbar: "no window here" rather than a window to focus.
 _SHELL_CLASSES = frozenset({"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"})
@@ -95,6 +110,11 @@ _WEBCAM_KEY = (
 )
 _NON_PACKAGED = "NonPackaged"
 _SETTINGS_URIS = {"camera": "ms-settings:privacy-webcam"}
+#: Slack when checking that a process was created before a camera session
+#: started. Both are FILETIMEs from the same clock; this only absorbs rounding.
+_SESSION_START_SLACK = 2 * FILETIME_TICKS_PER_S
+#: Slack when discarding camera sessions opened before the last boot.
+_BOOT_TIME_SLACK = 600 * FILETIME_TICKS_PER_S
 
 
 # --------------------------------------------------------------- structures
@@ -176,6 +196,11 @@ def _elapsed_ms(now_ms: int, last_ms: int) -> int:
 def _norm_path(path: str) -> str:
     """Windows-style case/separator normalisation (works on any host OS)."""
     return ntpath.normcase(ntpath.normpath(path))
+
+
+def _unix_to_filetime(seconds: float) -> int:
+    """Unix time (seconds, as psutil reports it) as a ``FILETIME`` tick count."""
+    return int((seconds + FILETIME_UNIX_OFFSET_S) * FILETIME_TICKS_PER_S)
 
 
 def _hwnd_of(ref: WindowRef | None) -> int | None:
@@ -274,12 +299,45 @@ class _Win32:
         self._IsIconic = _bind(user32, "IsIconic", w.BOOL, hwnd)
         self._IsHungAppWindow = _bind(user32, "IsHungAppWindow", w.BOOL, hwnd, optional=True)
         self._SetForegroundWindow = _bind(user32, "SetForegroundWindow", w.BOOL, hwnd)
-        self._BringWindowToTop = _bind(user32, "BringWindowToTop", w.BOOL, hwnd)
+        self._SetWindowPos = _bind(
+            user32,
+            "SetWindowPos",
+            w.BOOL,
+            hwnd,
+            hwnd,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            w.UINT,
+        )
         self._AllowSetForegroundWindow = _bind(user32, "AllowSetForegroundWindow", w.BOOL, w.DWORD)
         self._AttachThreadInput = _bind(
             user32, "AttachThreadInput", w.BOOL, w.DWORD, w.DWORD, w.BOOL
         )
         self._PostMessageW = _bind(user32, "PostMessageW", w.BOOL, hwnd, w.UINT, w.WPARAM, w.LPARAM)
+        lresult = w.LPARAM  # LRESULT: pointer-sized signed integer
+        self._SendMessageW = _bind(
+            user32, "SendMessageW", lresult, hwnd, w.UINT, w.WPARAM, w.LPARAM
+        )
+        self._CreateWindowExW = _bind(
+            user32,
+            "CreateWindowExW",
+            hwnd,
+            w.DWORD,
+            w.LPCWSTR,
+            w.LPCWSTR,
+            w.DWORD,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            hwnd,
+            w.HMENU,
+            w.HINSTANCE,
+            w.LPVOID,
+        )
+        self._DestroyWindow = _bind(user32, "DestroyWindow", w.BOOL, hwnd)
         # input
         self._SendInput = _bind(
             user32, "SendInput", w.UINT, w.UINT, ctypes.POINTER(INPUT), ctypes.c_int
@@ -319,6 +377,27 @@ class _Win32:
         self._SetThreadExecutionState = _bind(kernel32, "SetThreadExecutionState", w.DWORD, w.DWORD)
         self._GetModuleFileNameW = _bind(
             kernel32, "GetModuleFileNameW", w.DWORD, hmodule, w.LPWSTR, w.DWORD
+        )
+        self._GetModuleHandleW = _bind(kernel32, "GetModuleHandleW", hmodule, w.LPCWSTR)
+        self._OpenProcess = _bind(kernel32, "OpenProcess", w.HANDLE, w.DWORD, w.BOOL, w.DWORD)
+        self._CloseHandle = _bind(kernel32, "CloseHandle", w.BOOL, w.HANDLE)
+        # Package identity (MSIX / Store apps): Windows 8 and later.
+        self._GetCurrentPackageFamilyName = _bind(
+            kernel32,
+            "GetCurrentPackageFamilyName",
+            w.LONG,
+            ctypes.POINTER(ctypes.c_uint32),
+            w.LPWSTR,
+            optional=True,
+        )
+        self._GetPackageFamilyName = _bind(
+            kernel32,
+            "GetPackageFamilyName",
+            w.LONG,
+            w.HANDLE,
+            ctypes.POINTER(ctypes.c_uint32),
+            w.LPWSTR,
+            optional=True,
         )
         self._DwmGetWindowAttribute = _bind(
             dwmapi,
@@ -409,7 +488,14 @@ class _Win32:
         return bool(self._SetForegroundWindow(hwnd))
 
     def bring_to_top(self, hwnd: int) -> bool:
-        return bool(self._BringWindowToTop(hwnd))
+        """Raise ``hwnd`` to the top of the z-order without waiting for its thread.
+
+        ``BringWindowToTop`` (a synchronous ``SetWindowPos``) blocks the caller
+        until the window's thread processes the request, which is forever for a
+        busy or debugger-paused app. ``SWP_ASYNCWINDOWPOS`` posts it instead.
+        """
+        flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
+        return bool(self._SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, flags))
 
     def allow_set_foreground_any(self) -> None:
         self._AllowSetForegroundWindow(ASFW_ANY)
@@ -422,6 +508,35 @@ class _Win32:
 
     def post_broadcast(self, msg: int, wparam: int, lparam: int) -> bool:
         return bool(self._PostMessageW(HWND_BROADCAST, msg, wparam, lparam))
+
+    def create_hidden_window(self) -> int | None:
+        """A hidden, never-activated top-level window owned by the calling thread.
+
+        Uses the predefined ``STATIC`` class, whose window procedure hands system
+        commands to ``DefWindowProc``, so no class has to be registered.
+        """
+        hwnd = self._CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            "STATIC",
+            None,
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            self._GetModuleHandleW(None),
+            None,
+        )
+        return int(hwnd) if hwnd else None
+
+    def send_message(self, hwnd: int, msg: int, wparam: int, lparam: int) -> int:
+        """``SendMessageW``; only used on windows of the calling thread (a direct call)."""
+        return int(self._SendMessageW(hwnd, msg, wparam, lparam))
+
+    def destroy_window(self, hwnd: int) -> bool:
+        return bool(self._DestroyWindow(hwnd))
 
     # --------------------------------------------------------------- input
     def _send(self, inputs: list[INPUT]) -> bool:
@@ -540,6 +655,46 @@ class _Win32:
         n = self._GetModuleFileNameW(None, buf, len(buf))
         return buf.value if 0 < n < len(buf) else None
 
+    def current_package_family_name(self) -> str | None:
+        """Package family name of this process, ``None`` without package identity.
+
+        A process installed as an MSIX package (the Microsoft Store Python, for
+        instance) is recorded under this name in the camera consent store.
+        """
+        if self._GetCurrentPackageFamilyName is None:
+            return None
+        return self._read_package_name(
+            lambda length, buf: int(self._GetCurrentPackageFamilyName(length, buf))
+        )
+
+    def process_package_family_name(self, pid: int) -> str | None:
+        """Package family name of process ``pid``; ``None`` when it has none or is inaccessible."""
+        if self._GetPackageFamilyName is None:
+            return None
+        process = self._OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not process:
+            return None
+        try:
+            return self._read_package_name(
+                lambda length, buf: int(self._GetPackageFamilyName(process, length, buf))
+            )
+        finally:
+            self._CloseHandle(process)
+
+    @staticmethod
+    def _read_package_name(call: Callable[[Any, Any], int]) -> str | None:
+        """Run a ``Get*PackageFamilyName``-style call: ask for the size, then the name."""
+        length = ctypes.c_uint32(0)
+        status = call(ctypes.byref(length), None)
+        # APPMODEL_ERROR_NO_PACKAGE: no package identity. Anything but "buffer
+        # too small" (with the size filled in) means there is no name to read.
+        if status != ERROR_INSUFFICIENT_BUFFER or length.value == 0:
+            return None
+        buf = ctypes.create_unicode_buffer(length.value)
+        if call(ctypes.byref(length), buf) != ERROR_SUCCESS:
+            return None
+        return buf.value or None
+
 
 # ------------------------------------------------------------------ registry
 class _Registry(Protocol):
@@ -607,16 +762,35 @@ class _CameraUser:
 
     app: str  # package family name, or '#'-separated executable path for desktop apps
     packaged: bool
+    #: ``LastUsedTimeStart`` of the open session (``FILETIME``, UTC); 0 if unknown.
+    start: int = 0
 
     @property
     def executable(self) -> str:
         return self.app if self.packaged else self.app.replace("#", "\\")
 
 
-def _is_in_use(values: dict[str, Any]) -> bool:
+@dataclass(frozen=True, slots=True)
+class _Process:
+    """A running process, as far as it matters for camera-session liveness."""
+
+    pid: int
+    name: str  # lower-case executable name
+    #: Creation time as a ``FILETIME`` tick count (``None`` when unreadable).
+    created: int | None
+
+
+def _session_start(values: dict[str, Any]) -> int | None:
+    """``LastUsedTimeStart`` of a session that is still open, else ``None``."""
     start = values.get("LastUsedTimeStart")
     stop = values.get("LastUsedTimeStop")
-    return isinstance(start, int) and start > 0 and isinstance(stop, int) and stop == 0
+    if isinstance(start, int) and start > 0 and isinstance(stop, int) and stop == 0:
+        return start
+    return None
+
+
+def _is_in_use(values: dict[str, Any]) -> bool:
+    return _session_start(values) is not None
 
 
 def _active_camera_users(registry: _Registry) -> list[_CameraUser]:
@@ -631,10 +805,13 @@ def _active_camera_users(registry: _Registry) -> list[_CameraUser]:
         path = f"{_WEBCAM_KEY}\\{name}"
         if name.lower() == _NON_PACKAGED.lower():
             for app in registry.subkeys("HKCU", path):
-                if _is_in_use(registry.values("HKCU", f"{path}\\{app}")):
-                    users.append(_CameraUser(app, packaged=False))
-        elif _is_in_use(registry.values("HKCU", path)):
-            users.append(_CameraUser(name, packaged=True))
+                start = _session_start(registry.values("HKCU", f"{path}\\{app}"))
+                if start is not None:
+                    users.append(_CameraUser(app, packaged=False, start=start))
+        else:
+            start = _session_start(registry.values("HKCU", path))
+            if start is not None:
+                users.append(_CameraUser(name, packaged=True, start=start))
     return users
 
 
@@ -665,6 +842,7 @@ class WindowsPlatform(PlatformServices):
         self._registry: _Registry = registry if registry is not None else _WinRegistry()
         self._pid = os.getpid()
         self._own_paths: frozenset[str] | None = None
+        self._own_package_name: str | None = None
 
     @property
     def _api(self) -> _Win32:
@@ -730,10 +908,25 @@ class WindowsPlatform(PlatformServices):
 
     @_best_effort(False)
     def display_off(self) -> bool:
-        # Posted rather than sent: a broadcast SendMessageTimeout waits up to its
-        # timeout for *each* slow window, while a posted message returns at once
-        # and any top-level window's DefWindowProc powers the monitors down.
-        return self._api.post_broadcast(WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_POWER_OFF)
+        """Power the monitors down through ``DefWindowProc`` of a window of our own.
+
+        Any top-level window's ``DefWindowProc`` handles ``SC_MONITORPOWER``, so
+        a throw-away hidden window on the calling thread is enough, and sending
+        to it is a plain function call. Broadcasting instead would queue the
+        request in every window of the system: a suspended or debugger-paused
+        app would run it whenever it next pumps messages, possibly long after
+        the user came back, blacking the screens out again.
+        """
+        api = self._api
+        hwnd = api.create_hidden_window()
+        if hwnd is None:
+            log.debug("Could not create a window for SC_MONITORPOWER; broadcasting instead")
+            return api.post_broadcast(WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_POWER_OFF)
+        try:
+            api.send_message(hwnd, WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_POWER_OFF)
+        finally:
+            api.destroy_window(hwnd)
+        return True
 
     @_best_effort(False)
     def wake_display(self) -> bool:
@@ -851,6 +1044,12 @@ class WindowsPlatform(PlatformServices):
             return False
         if api.foreground() == hwnd:
             return True
+        if api.is_hung(hwnd):
+            # An app that stopped pumping messages cannot take focus anyway, and
+            # waiting on it would freeze our UI thread. (Windows only reports a
+            # window as hung after ~5 s; bring_to_top never waits regardless.)
+            log.debug("Not activating window %#x: it is not responding", hwnd)
+            return False
         api.allow_set_foreground_any()
 
         if self._activate_attached(hwnd):
@@ -921,24 +1120,124 @@ class WindowsPlatform(PlatformServices):
             self._own_paths = frozenset(_norm_path(p) for p in candidates if p)
         return self._own_paths
 
+    def _own_package(self) -> str:
+        """Lower-cased package family name of this process; ``""`` without package identity."""
+        if self._own_package_name is None:
+            name: str | None = None
+            try:
+                name = self._api.current_package_family_name()
+            except Exception:
+                log.debug("Could not read the package identity", exc_info=True)
+            self._own_package_name = (name or "").lower()
+        return self._own_package_name
+
+    def _is_own_camera_user(self, user: _CameraUser) -> bool:
+        if user.packaged:
+            # With package identity (e.g. the Microsoft Store Python) our own
+            # session is recorded under the package family name, not a path.
+            own = self._own_package()
+            return bool(own) and user.app.lower() == own
+        return _norm_path(user.executable) in self._own_executables()
+
     @_best_effort(None)
     def camera_in_use_by_other_app(self) -> bool | None:
-        own = self._own_executables()
-        others = [
-            user
-            for user in _active_camera_users(self._registry)
-            if user.packaged or _norm_path(user.executable) not in own
-        ]
+        users = _active_camera_users(self._registry)
+        others = [user for user in users if not self._is_own_camera_user(user)]
         if not others:
             return False
-        if any(user.packaged for user in others):
-            return True
-        # An app that crashed mid-session never records its stop time; only
-        # trust desktop-app entries whose executable is actually running.
-        running = self.running_process_names()
-        if not running:
-            return True
-        return any(ntpath.basename(user.executable).lower() in running for user in others)
+        # An app that crashed, or a machine that lost power, mid-session never
+        # records the stop time, and the registry keeps that open session across
+        # reboots. Sessions opened before this boot are certainly over.
+        boot = self._boot_filetime()
+        if boot is not None:
+            # Generous slack: the boot time is derived from the current clock,
+            # which NTP may have moved since. The process check below is exact.
+            others = [u for u in others if u.start >= boot - _BOOT_TIME_SLACK]
+            if not others:
+                return False
+        processes = self._processes()
+        if not processes:
+            return True  # cannot tell live sessions from stale ones: trust the registry
+        return any(self._session_is_live(user, processes) for user in others)
+
+    def _session_is_live(self, user: _CameraUser, processes: list[_Process]) -> bool:
+        """Whether a process that can own ``user``'s session is still running.
+
+        The process must match the entry (full executable path, or package
+        family) and must have been started before the session was: a copy of
+        the app launched after a crash never touched the camera.
+        """
+        slack = _SESSION_START_SLACK
+        candidates = [p for p in processes if p.created is None or p.created <= user.start + slack]
+        api = self._api
+        if user.packaged:
+            family = user.app.lower()
+            return any(
+                (api.process_package_family_name(p.pid) or "").lower() == family for p in candidates
+            )
+        target = _norm_path(user.executable)
+        name = ntpath.basename(target)
+        for process in candidates:
+            if process.name != name:
+                continue
+            exe = self._process_exe(process.pid)
+            # A path we may not read (an elevated process) gets the benefit of the doubt.
+            if exe is None or _norm_path(exe) == target:
+                return True
+        return False
+
+    def _processes(self) -> list[_Process] | None:
+        """Running processes with name and creation time; ``None`` if they cannot be listed."""
+        try:
+            import psutil
+        except Exception:
+            return None
+        processes: list[_Process] = []
+        try:
+            for proc in psutil.process_iter(["name", "create_time"]):
+                info = proc.info
+                name = info.get("name")
+                if not name:
+                    continue
+                created = info.get("create_time")
+                processes.append(
+                    _Process(
+                        pid=int(proc.pid),
+                        name=str(name).lower(),
+                        created=_unix_to_filetime(created)
+                        if isinstance(created, (int, float))
+                        else None,
+                    )
+                )
+        except Exception:
+            log.debug("Could not list processes", exc_info=True)
+            return None
+        return processes
+
+    @staticmethod
+    def _process_exe(pid: int) -> str | None:
+        """Full executable path of ``pid``; ``None`` when it is gone or not readable."""
+        try:
+            import psutil
+
+            exe = psutil.Process(pid).exe()
+        except Exception:
+            return None
+        return str(exe) if exe else None
+
+    @staticmethod
+    def _boot_filetime() -> int | None:
+        """System boot time as a ``FILETIME`` tick count.
+
+        With Fast Startup this is the last full boot (resuming from hibernation
+        keeps the uptime), so it is early rather than late: safe as a filter.
+        """
+        try:
+            import psutil
+
+            return _unix_to_filetime(psutil.boot_time())
+        except Exception:
+            return None
 
     # -------------------------------------------------------------- permissions
     def permissions(self) -> dict[str, bool | None]:

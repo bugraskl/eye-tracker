@@ -72,6 +72,22 @@ def _default_autostart() -> AutostartBackend:
     return autostart
 
 
+#: Menu text and tooltip of "Start at login" by :func:`autostart_status` value.
+_AUTOSTART_TEXTS: dict[str, tuple[str, str]] = {
+    "": ("Start at login", f"Start {APP_NAME} quietly in the tray when you log in"),
+    "stale": (
+        "Start at login (needs repair)",
+        f"The login item starts a copy of {APP_NAME} that no longer exists or will be "
+        "gone after a restart. Click to point it at this copy.",
+    ),
+    "other-profile": (
+        "Start at login (another profile)",
+        f"The login item starts {APP_NAME} with another settings folder (--config-dir). "
+        "Click to start this one instead.",
+    ),
+}
+
+
 def _number(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -255,6 +271,11 @@ class TrayIcon(QObject):
         """
         self._muted_until = self._clock() + max(0.0, float(seconds))
 
+    @property
+    def muted_for(self) -> float:
+        """Seconds until :meth:`mute_notifications` ends (0 when not muted)."""
+        return max(0.0, self._muted_until - self._clock())
+
     # ------------------------------------------------------------------ building
     def _add_action(
         self, text: str, slot: Callable[..., None], *, checkable: bool = False
@@ -422,12 +443,18 @@ class TrayIcon(QObject):
 
     def _refresh_autostart(self) -> None:
         backend = self._autostart
+        status = ""
         try:
             supported = bool(getattr(backend, "is_supported", lambda: True)())
             enabled = supported and bool(backend.is_enabled())
+            if supported and not enabled:
+                status = util.autostart_status(backend)
         except Exception:
             log.debug("Reading the start-at-login state failed", exc_info=True)
             supported, enabled = True, False
+        text, tip = _AUTOSTART_TEXTS.get(status, _AUTOSTART_TEXTS[""])
+        self.action_autostart.setText(text)
+        self.action_autostart.setToolTip(tip)
         self.action_autostart.setVisible(supported)
         self.action_autostart.setChecked(enabled)
 

@@ -82,10 +82,32 @@ def test_gaze_mode_uses_gaze_inside_monitor() -> None:
     assert choose_cursor_target("gaze", RIGHT, mem, (2500.4, 900.6), None) == (2500, 901)
 
 
-def test_gaze_mode_clamps_into_monitor() -> None:
+def test_gaze_mode_clamps_into_monitor_away_from_the_edges() -> None:
+    # Never onto the outermost row, column or corner (auto-hide taskbars, docks
+    # and hot corners react to it): 2 % of 2560 x 1440 is a 51 x 29 px inset.
     mem = WindowMemory()
     target = choose_cursor_target("gaze", RIGHT, mem, (5000.0, -40.0), None)
-    assert target == (RIGHT.rect.right - 1, 0)
+    assert target == (RIGHT.rect.right - 1 - 51, 29)
+    assert RIGHT.rect.contains(*target)
+
+
+@pytest.mark.parametrize(
+    ("gaze", "expected"),
+    [
+        ((-150.0, -100.0), (38, 22)),  # hot corner at the top left
+        ((960.0, 1200.0), (960, 1079 - 22)),  # auto-hidden taskbar at the bottom
+        ((1925.0, 500.0), (1919 - 38, 500)),  # the edge next to the other monitor
+    ],
+)
+def test_gaze_mode_keeps_the_minimum_inset_on_1080p(
+    gaze: tuple[float, float], expected: tuple[int, int]
+) -> None:
+    assert choose_cursor_target("gaze", LEFT, WindowMemory(), gaze, None) == expected
+
+
+def test_gaze_mode_inset_on_a_small_monitor_uses_the_minimum() -> None:
+    small = Monitor(3, "small", Rect(0, 0, 400, 300))
+    assert choose_cursor_target("gaze", small, WindowMemory(), (-5.0, 999.0), None) == (16, 283)
 
 
 @pytest.mark.parametrize("gaze", [None, (float("nan"), 3.0)])

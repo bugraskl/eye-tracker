@@ -5,11 +5,19 @@ triggered with ``settings.privacy.guard_action == "curtain"``, or the ``"lock"``
 action could not lock the screen. Hidden when the guard clears, when the camera
 is switched off (the guard could never clear then), when the guard is turned
 off in the settings, or when the user dismisses it with Esc or the button.
+
+Esc only works in the window that has keyboard focus. The curtain appears in
+response to the camera, not to input to this app, so Windows' foreground lock
+may refuse to activate it: the curtain then asks the platform layer to activate
+it (as gaze switching does for other apps' windows), and while none of its
+windows has keyboard focus the text says to click Dismiss instead of promising
+that Esc works; the Esc would go to the application hidden underneath.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from PySide6.QtCore import QObject, QPointF, QRect, QRectF, Qt, QTimer, Signal
@@ -29,15 +37,22 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QPushButton, QWidget
 
 from ..config import Settings
-from ..types import Monitor, Rect, TrackingState, monitor_at
+from ..platform.base import PlatformServices
+from ..types import Monitor, Rect, TrackingState, WindowRef, monitor_at
 from . import icons, util
 
 log = logging.getLogger(__name__)
 
-__all__ = ["PrivacyCurtain"]
+__all__ = ["HINT", "HINT_NO_KEYBOARD", "PrivacyCurtain"]
 
 TITLE = "Someone is looking over your shoulder"
+#: Shown while a curtain window has keyboard focus (Esc reaches it).
 HINT = "Your screens stay covered until they leave. Press Esc to dismiss."
+#: Shown while keyboard focus is elsewhere: Esc would go to the hidden window.
+HINT_NO_KEYBOARD = "Your screens stay covered until they leave. Click Dismiss to close."
+#: Activation completes asynchronously on some platforms, and a refused one
+#: reports no focus change at all, so the hint is checked again after this.
+FOCUS_RECHECK_MS = 300
 
 #: States in which the camera is off, so the guard can no longer clear.
 _CAMERA_OFF_STATES = frozenset(
@@ -55,7 +70,9 @@ class _CurtainWindow(QWidget):
         util.make_floating(self, accept_focus=True, translucent=False)
         self.setObjectName(f"privacyCurtain{monitor.index}")
         self.setAccessibleName("Privacy curtain")
-        self.setAccessibleDescription(f"{TITLE}. {HINT}")
+        #: What the window tells the user about dismissing it (see set_keyboard_ready).
+        self.hint = HINT_NO_KEYBOARD
+        self.setAccessibleDescription(f"{TITLE}. {self.hint}")
         self.monitor = monitor
         screen = util.screen_for_monitor(monitor)
         if screen is not None:
@@ -88,6 +105,14 @@ class _CurtainWindow(QWidget):
         self.button.clicked.connect(self.dismiss_requested.emit)
         r = monitor.rect
         self.setGeometry(QRect(r.x, r.y, r.w, r.h))
+
+    def set_keyboard_ready(self, ready: bool) -> None:
+        """Promise that Esc works only while a curtain window receives the keyboard."""
+        hint = HINT if ready else HINT_NO_KEYBOARD
+        if hint != self.hint:
+            self.hint = hint
+            self.setAccessibleDescription(f"{TITLE}. {hint}")
+            self.update()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Escape:
@@ -150,7 +175,7 @@ class _CurtainWindow(QWidget):
         painter.drawText(title, int(Qt.AlignmentFlag.AlignCenter), TITLE)
         painter.setFont(self.hint_font)
         painter.setPen(util.qcolor(util.TEXT_MUTED))
-        painter.drawText(hint, int(Qt.AlignmentFlag.AlignCenter), HINT)
+        painter.drawText(hint, int(Qt.AlignmentFlag.AlignCenter), self.hint)
         painter.end()
 
 
@@ -169,6 +194,8 @@ class PrivacyCurtain(QObject):
         self._controller = controller
         self._settings: Settings = util.controller_settings(controller)
         self._windows: list[_CurtainWindow] = []
+        #: The window that should get keyboard focus (until that is checked).
+        self._focus_target: _CurtainWindow | None = None
         self._rebuild_pending = False
         for name, slot in (
             ("guard_changed", self._on_guard_changed),
@@ -182,6 +209,7 @@ class PrivacyCurtain(QObject):
         if isinstance(app, QGuiApplication):
             app.screenAdded.connect(self._on_screen_added)
             app.screenRemoved.connect(self._on_screens_changed)
+            app.focusWindowChanged.connect(self._update_hints)
             for screen in QGuiApplication.screens():
                 screen.geometryChanged.connect(self._on_screens_changed)
 
@@ -194,6 +222,12 @@ class PrivacyCurtain(QObject):
     def windows(self) -> list[QWidget]:
         """The curtain windows currently shown (one per monitor)."""
         return list(self._windows)
+
+    @property
+    def has_keyboard(self) -> bool:
+        """Whether a curtain window has keyboard focus (so Esc dismisses it)."""
+        focus = QGuiApplication.focusWindow()
+        return focus is not None and any(w.windowHandle() is focus for w in self._windows)
 
     def show_curtain(self) -> None:
         """Cover every monitor (idempotent)."""
@@ -275,8 +309,39 @@ class PrivacyCurtain(QObject):
         # Keyboard focus is what makes Esc work; the button works without it.
         target.activateWindow()
         target.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        self._focus_target = target
+        self._update_hints()
+        # Activation is reported asynchronously; a refused one never is.
+        QTimer.singleShot(FOCUS_RECHECK_MS, self, self._ensure_keyboard)
+
+    def _ensure_keyboard(self) -> None:
+        """If Qt's activation was refused, ask the platform layer to activate the curtain."""
+        target, self._focus_target = self._focus_target, None
+        if target is not None and target in self._windows and not self.has_keyboard:
+            # Qt's request is a plain SetForegroundWindow on Windows, which the
+            # foreground lock refuses while the user works in another app.
+            self._activate_with_platform(target)
+            QTimer.singleShot(FOCUS_RECHECK_MS, self, self._update_hints)
+        self._update_hints()
+
+    def _activate_with_platform(self, window: QWidget) -> None:
+        """Activate ``window`` the way gaze switching activates other apps' windows."""
+        platform = getattr(self._controller, "platform", None)
+        if not isinstance(platform, PlatformServices):
+            return
+        try:
+            if not platform.activate_window(WindowRef(int(window.winId()), os.getpid())):
+                log.debug("The privacy curtain could not take keyboard focus")
+        except Exception:
+            log.debug("Activating the privacy curtain failed", exc_info=True)
+
+    def _update_hints(self, *_args: object) -> None:
+        ready = self.has_keyboard
+        for window in self._windows:
+            window.set_keyboard_ready(ready)
 
     def _destroy_windows(self) -> None:
+        self._focus_target = None
         for window in self._windows:
             window.hide()
             window.deleteLater()

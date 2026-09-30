@@ -8,6 +8,7 @@ manager. Qt runs offscreen; config and calibration files live in a temp dir.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import threading
 from collections.abc import Callable, Iterator
@@ -23,7 +24,12 @@ from eye_tracker.engine import controller as controller_module
 from eye_tracker.engine.controller import COMMANDS, UI_COMMANDS, Controller, QtCursor, qt_monitors
 from eye_tracker.gaze.calibration import CalibrationSample
 from eye_tracker.gaze.model import GazeModel
-from eye_tracker.gaze.store import CalibrationData, load_calibration, save_calibration
+from eye_tracker.gaze.store import (
+    CalibrationData,
+    CalibrationLibrary,
+    load_calibration,
+    save_calibration,
+)
 from eye_tracker.platform.base import PlatformServices
 from eye_tracker.types import (
     Monitor,
@@ -41,6 +47,7 @@ RIGHT = Monitor(1, "right", Rect(1920, 0, 1920, 1080))
 MONITORS = [LEFT, RIGHT]
 BACKEND = ("fake", "fake-1")
 RIGHT_CENTRE = (2880, 540)
+LEFT_CENTRE = (960, 540)
 # Synthetic features: the gaze point in kilo-pixels, so a linear model is exact.
 FEATURE_SCALE = 1000.0
 
@@ -65,13 +72,16 @@ class FakeCursor:
         self.position = pos
         self.moves: list[tuple[int, int]] = []
         self.allow = True
+        # False: moves succeed but pos() keeps reporting the old position, like
+        # an XWayland client whose pointer went over a native Wayland window.
+        self.track = True
 
     def pos(self) -> tuple[int, int]:
         return self.position
 
     def set_pos(self, x: int, y: int) -> bool:
         self.moves.append((x, y))
-        if self.allow:
+        if self.allow and self.track:
             self.position = (x, y)
         return self.allow
 
@@ -150,6 +160,11 @@ class FakePlatform(PlatformServices):
         self.foreground: WindowRef | None = None
         self.window_under: WindowRef | None = None
         self.lock_ok = True
+        self.activate_ok = True
+        self.cursor_reliable = True
+        self.accessibility: str | None = None  # None: not applicable (not macOS)
+        self.camera_permission: bool | None = None
+        self.background: list[bool] = []
 
     def names(self) -> list[str]:
         return [c[0] for c in self.calls]
@@ -187,7 +202,7 @@ class FakePlatform(PlatformServices):
 
     def activate_window(self, ref: WindowRef) -> bool:
         self.calls.append(("activate_window", ref.handle))
-        return True
+        return self.activate_ok
 
     def is_window_valid(self, ref: WindowRef) -> bool:
         return True
@@ -201,6 +216,19 @@ class FakePlatform(PlatformServices):
     def running_process_names(self) -> set[str]:
         return set(self.processes)
 
+    def cursor_position_reliable(self) -> bool:
+        return self.cursor_reliable
+
+    def permissions(self) -> dict[str, bool | None]:
+        return {"camera": self.camera_permission, "accessibility": None}
+
+    def accessibility_status(self) -> str | None:
+        return self.accessibility
+
+    def set_background_activity(self, active: bool) -> bool:
+        self.background.append(active)
+        return True
+
 
 class FakeHotkeys:
     supported = True
@@ -209,6 +237,7 @@ class FakeHotkeys:
     def __init__(self) -> None:
         self.bindings: dict[str, tuple[str, Callable[[], None]]] = {}
         self.fail: set[str] = set()
+        self.errors: dict[str, str] = {}
         self.stopped = False
 
     def register(self, name: str, hotkey: Any, callback: Callable[[], None]) -> bool:
@@ -216,6 +245,9 @@ class FakeHotkeys:
             return False
         self.bindings[name] = (str(hotkey), callback)
         return True
+
+    def last_error(self, name: str) -> str | None:
+        return self.errors.get(name)
 
     def unregister_all(self) -> None:
         self.bindings.clear()
@@ -238,7 +270,9 @@ def no_face() -> Observation:
     return Observation(timestamp=0.0, face_count=0)
 
 
-def make_calibration(monitors: list[Monitor] = MONITORS) -> CalibrationData:
+def make_calibration(
+    monitors: list[Monitor] = MONITORS, nonlinear: tuple[int, ...] | None = None
+) -> CalibrationData:
     samples: list[CalibrationSample] = []
     point = 0
     for m in monitors:
@@ -251,7 +285,9 @@ def make_calibration(monitors: list[Monitor] = MONITORS) -> CalibrationData:
                 point += 1
     X = np.vstack([s.features for s in samples])
     Y = np.array([(s.x, s.y) for s in samples])
-    model = GazeModel(degree=1, alpha=0.0).fit(X, Y, bounds=virtual_bounds(monitors))
+    model = GazeModel(degree=1, alpha=0.0, nonlinear=nonlinear).fit(
+        X, Y, bounds=virtual_bounds(monitors)
+    )
     return CalibrationData(
         backend=BACKEND[0],
         feature_version=BACKEND[1],
@@ -482,14 +518,25 @@ def test_typing_guard_suppresses_switch_until_it_expires(
     make_controller: Callable[..., Harness],
 ) -> None:
     h = make_controller()
-    h.platform.key_idle = 0.1  # the user keeps typing
-    h.feed(gaze_obs(RIGHT_CENTRE), 1.5)
-    assert h.events["switched"] == []
-
-    h.platform.key_idle = 1000.0  # typing stopped; the guard runs out after 2 s
+    h.platform.key_idle = 0.1  # the user keeps typing on the left monitor
+    h.feed(gaze_obs(LEFT_CENTRE), 1.5)
+    h.platform.key_idle = 1000.0  # typing stopped as the user looks right
     h.feed(gaze_obs(RIGHT_CENTRE), 1.0)
     assert h.events["switched"] == []
-    h.feed(gaze_obs(RIGHT_CENTRE), 1.2)
+    h.feed(gaze_obs(RIGHT_CENTRE), 1.2)  # the typing grace (2 s) is over
+    assert h.events["switched"] == [1]
+
+
+def test_reading_pause_does_not_move_focus_to_the_reading_monitor(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller()
+    h.platform.key_idle = 0.1  # typing on the left while reading the right monitor
+    h.feed(gaze_obs(RIGHT_CENTRE), 1.5)
+    h.platform.key_idle = 1000.0  # a reading pause
+    h.feed(gaze_obs(RIGHT_CENTRE), 4.0)
+    assert h.events["switched"] == []
+    h.feed(gaze_obs(RIGHT_CENTRE), 2.5)  # reading grace (6 s) over
     assert h.events["switched"] == [1]
 
 
@@ -733,13 +780,13 @@ def test_begin_calibration_turns_privacy_off(make_controller: Callable[..., Harn
 def test_backend_change_revalidates_calibration(make_controller: Callable[..., Harness]) -> None:
     h = make_controller()
     new = h.controller.settings.copy()
-    new.general.backend = "opencv"
+    new.general.backend = "lite"
     h.controller.apply_settings(new)
     source, backend = h.worker.reconfigures[-1]
     assert source is None
     assert backend is not None
     # The worker still reports the old backend; the settings decide meanwhile.
-    assert h.controller.backend_info()[0] == "opencv"
+    assert h.controller.backend_info()[0] == "lite"
     assert h.state is S.NEEDS_CALIBRATION
     assert "fake" in h.events["calibration_required"][-1]
 
@@ -927,10 +974,30 @@ def test_observations_from_worker_thread(
 
 def test_hotkey_registration_failure_notifies(make_controller: Callable[..., Harness]) -> None:
     hotkeys = FakeHotkeys()
-    hotkeys.fail = {"ctrl+alt+c"}
+    hotkeys.fail = {Settings().hotkeys.recalibrate}  # this platform's default
     h = make_controller(hotkeys=hotkeys)
     assert "recalibrate" not in hotkeys.bindings
-    assert h.events["notify"][-1][0] == "Hotkey unavailable"
+    title, message = h.events["notify"][-1]
+    assert title == "Hotkey unavailable"
+    assert "used by another app" in message
+
+
+def test_hotkey_failure_notification_gives_the_managers_reason(
+    make_controller: Callable[..., Harness],
+) -> None:
+    hotkeys = FakeHotkeys()
+    s = make_settings()
+    s.hotkeys.recalibrate = "ctrl+alt+t"
+    hotkeys.fail = {"ctrl+alt+t"}
+    hotkeys.errors["recalibrate"] = (
+        "Ctrl+Alt+T is AltGr+T, which types '\u20ba' on the Turkish Q keyboard layout."
+    )
+    h = make_controller(s, hotkeys=hotkeys)
+    assert h.events["notify"][-1] == (
+        "Hotkey unavailable",
+        "Ctrl+Alt+T is AltGr+T, which types '\u20ba' on the Turkish Q keyboard layout. "
+        "Choose another in Settings \u2192 Hotkeys.",
+    )
 
 
 def test_hotkeys_disabled(make_controller: Callable[..., Harness]) -> None:
@@ -1065,3 +1132,833 @@ def test_platform_property_and_hotkey_suspension(qapp, app_dirs) -> None:
         assert fired == ["hotkey"]
     finally:
         controller.shutdown()
+
+
+# ======================================================== review regressions
+THIRD = Monitor(2, "third", Rect(3840, 0, 1920, 1080))
+USER_BOX = (0.35, 0.25, 0.3, 0.4)
+ONLOOKER_BOX = (0.8, 0.1, 0.1, 0.13)
+
+
+def blind_obs() -> Observation:
+    """A frame too dark or uniform to judge (lens covered, shutter closed)."""
+    return Observation(timestamp=0.0, face_count=0, blind=True)
+
+
+def with_size(obs: Observation, size: tuple[int, int]) -> Observation:
+    return dataclasses.replace(obs, frame_size=size)
+
+
+def boxed_obs(faces: int, box: tuple[float, float, float, float]) -> Observation:
+    return dataclasses.replace(gaze_obs((500, 500), faces=faces), face_box=box)
+
+
+def guard_settings(action: str) -> Settings:
+    s = make_settings()
+    s.privacy.shoulder_guard = True
+    s.privacy.guard_action = action
+    return s
+
+
+def lock_session(h: Harness) -> None:
+    h.platform.locked = True
+    h.tick(2.1)
+    assert h.state is S.LOCKED
+
+
+def unlock_session(h: Harness) -> None:
+    h.platform.locked = False
+    h.tick(2.1)
+
+
+def ticks(h: Harness, seconds: float, step: float = 0.5) -> None:
+    for _ in range(round(seconds / step)):
+        h.tick(step)
+
+
+def titles(h: Harness) -> list[str]:
+    return [title for title, _ in h.events["notify"]]
+
+
+class FakeBackend:
+    """What the worker builds through the controller's backend factory."""
+
+    name = BACKEND[0]
+    feature_version = BACKEND[1]
+    feature_names = ("gaze_x", "gaze_y")
+    gaze_features = ("gaze_x", "gaze_y")
+
+
+@pytest.fixture
+def fake_backends(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Backend factories build a :class:`FakeBackend` whatever the setting says
+    (like ``auto`` falling back); returns the backend names requested."""
+    requested: list[str] = []
+
+    def backend_factory(settings: Settings, max_faces: int) -> Callable[[], FakeBackend]:
+        name = settings.general.backend
+
+        def create() -> FakeBackend:
+            requested.append(name)
+            return FakeBackend()
+
+        return create
+
+    monkeypatch.setattr(controller_module, "_backend_factory", backend_factory)
+    return requested
+
+
+# ------------------------------------------ unreliable pointer / refused warps
+def test_unreliable_pointer_position_follows_the_last_switch(
+    make_controller: Callable[..., Harness],
+) -> None:
+    platform = FakePlatform()
+    platform.cursor_reliable = False
+    h = make_controller(platform=platform)
+    h.cursor.track = False  # pos() keeps saying "left" (XWayland over a Wayland window)
+    h.feed(gaze_obs(RIGHT_CENTRE), 0.5)
+    assert h.events["switched"] == [1]
+    h.feed(gaze_obs(RIGHT_CENTRE), 10.0)
+    # No re-warp every cooldown although the reported position never changed.
+    assert h.events["switched"] == [1]
+    assert len(h.cursor.moves) == 1
+    h.feed(gaze_obs(LEFT_CENTRE), 1.0)
+    assert h.events["switched"] == [1, 0]
+
+
+def test_unreliable_pointer_position_is_not_learned_from(
+    make_controller: Callable[..., Harness],
+) -> None:
+    platform = FakePlatform()
+    platform.cursor_reliable = False
+    h = make_controller(platform=platform)
+    h.cursor.track = False
+    h.feed(gaze_obs(RIGHT_CENTRE), 0.5)
+    assert h.events["switched"] == [1]
+    h.cursor.position = (400, 400)  # a stale position shows up
+    h.tick()
+    h.push(gaze_obs((400, 400)), dt=0.4)
+    h.tick(3.0)
+    assert h.controller._learner.samples == []  # not a learning label
+    assert h.controller._drift.event_count == 0  # not an undone (or kept) switch
+
+
+def test_refused_pointer_moves_are_not_switches_and_back_off(
+    make_controller: Callable[..., Harness],
+) -> None:
+    limit = controller_module.WARP_REFUSAL_LIMIT
+    h = make_controller()
+    h.platform.window_under = WindowRef(handle=9, pid=1, rect=Rect(1920, 0, 1920, 1080))
+    h.cursor.allow = False
+    h.feed(gaze_obs(RIGHT_CENTRE), 3.0)
+    assert len(h.cursor.moves) == limit
+    assert h.events["switched"] == []
+    assert h.controller.status()["switches"] == 0
+    assert "activate_window" not in h.platform.names()  # nothing moved, nothing focused
+    assert titles(h) == ["Cannot move the cursor"]
+
+    h.feed(gaze_obs(RIGHT_CENTRE), 55.0, step=0.5)
+    assert len(h.cursor.moves) == limit  # switching is paused
+    h.feed(gaze_obs(RIGHT_CENTRE), 5.0, step=0.5)  # the pause is over: one more try
+    assert len(h.cursor.moves) == limit + 1
+    assert titles(h) == ["Cannot move the cursor"]  # told once
+
+    h.cursor.allow = True  # e.g. ydotoold was started
+    h.feed(gaze_obs(RIGHT_CENTRE), 2 * controller_module.WARP_BACKOFF_S, step=0.5)
+    assert h.events["switched"] == [1]
+    assert ("activate_window", 9) in h.platform.calls
+
+
+# --------------------------------------------------------------- shoulder guard
+def test_guard_does_not_lock_again_right_after_the_user_unlocked(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller(guard_settings("lock"))
+    two = gaze_obs((500, 500), faces=2)
+    h.feed(two, 2.5)
+    assert h.platform.names().count("lock_screen") == 1
+    lock_session(h)
+    unlock_session(h)
+    assert h.state is S.TRACKING
+    h.feed(two, 5.0)  # the colleague is still there
+    assert h.platform.names().count("lock_screen") == 1
+    assert h.events["guard_changed"] == [True]  # the curtain covers the screens instead
+    h.feed(gaze_obs((500, 500)), 2.0)  # they leave
+    assert h.events["guard_changed"] == [True, False]
+    h.feed(two, 2.5)  # someone else looks over the shoulder: lock again
+    assert h.platform.names().count("lock_screen") == 2
+
+
+def test_no_switching_under_the_privacy_curtain(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller(guard_settings("curtain"))
+    h.platform.window_under = WindowRef(handle=42, pid=1, rect=Rect(1920, 0, 1920, 1080))
+    h.feed(gaze_obs((500, 500), faces=2), 2.5)
+    assert h.events["guard_changed"] == [True]
+    h.feed(gaze_obs(RIGHT_CENTRE, faces=2), 2.0)  # is the other screen covered too?
+    assert h.events["switched"] == []
+    assert h.cursor.moves == []
+    assert "window_at" not in h.platform.names()
+    assert "activate_window" not in h.platform.names()
+
+    h.controller.dismiss_curtain()  # Esc: the user carries on
+    assert h.events["guard_changed"] == [True, False]
+    assert h.controller.guard_active
+    h.feed(gaze_obs(RIGHT_CENTRE, faces=2), 1.0)
+    assert h.events["switched"] == [1]
+
+
+def test_guard_run_does_not_span_a_calibration(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller(guard_settings("lock"))
+    two = gaze_obs((500, 500), faces=2)
+    h.feed(two, 1.8)
+    h.controller.begin_calibration()
+    h.feed(two, 1.0)
+    h.controller.finish_calibration(None)
+    h.push(two)
+    assert "lock_screen" not in h.platform.names()
+    h.feed(two, 2.5)  # a fresh, continuous run
+    assert h.platform.names().count("lock_screen") == 1
+
+
+def test_guard_run_does_not_span_a_camera_error(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller(guard_settings("lock"))
+    two = gaze_obs((500, 500), faces=2)
+    h.feed(two, 1.8)
+    h.worker.on_stats(WorkerStats(camera_open=False, last_error="Camera stopped"))
+    assert h.state is S.CAMERA_ERROR
+    h.tick(1.0)
+    h.worker.on_stats(WorkerStats(camera_open=True))
+    h.push(two)
+    assert "lock_screen" not in h.platform.names()
+
+
+def test_onlooker_left_alone_counts_as_nobody_at_the_keyboard(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller(guard_settings("curtain"))
+    h.feed(boxed_obs(2, USER_BOX), 2.5)
+    assert h.events["guard_changed"] == [True]
+    h.feed(boxed_obs(1, ONLOOKER_BOX), 5.5, step=0.5)  # the user left, the onlooker stayed
+    assert h.events["guard_changed"] == [True]
+    assert h.events["away_warning"]  # the walk-away countdown runs
+
+
+def test_user_left_alone_clears_the_guard(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller(guard_settings("curtain"))
+    h.feed(boxed_obs(2, USER_BOX), 2.5)
+    h.feed(boxed_obs(1, USER_BOX), 5.5, step=0.5)  # the onlooker left
+    assert h.events["guard_changed"] == [True, False]
+    assert h.events["away_warning"] == []
+
+
+# ----------------------------------------------------------------- camera yield
+@pytest.mark.parametrize("leave", ["resume", "privacy-off", "unlock"])
+def test_camera_in_use_is_checked_before_the_camera_reopens(
+    make_controller: Callable[..., Harness], leave: str
+) -> None:
+    h = make_controller()
+    c = h.controller
+    if leave == "resume":
+        c.pause()
+    elif leave == "privacy-off":
+        c.set_privacy(True)
+    else:
+        lock_session(h)
+    assert not h.worker.is_active
+    h.platform.camera_in_use = True  # a video call starts meanwhile
+    h.tick(5.0)
+    opened = h.worker.active.count(True)
+    if leave == "resume":
+        c.resume()
+    elif leave == "privacy-off":
+        c.set_privacy(False)
+    else:
+        unlock_session(h)
+    assert h.state is S.YIELDED
+    assert h.worker.active.count(True) == opened  # the call's camera was never grabbed
+
+
+# --------------------------------------------------------------- camera errors
+def test_camera_failing_again_after_a_pause_is_noticed(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller()
+    failing = WorkerStats(camera_open=False, last_error="Camera 0 could not be opened")
+    h.worker.stats = failing
+    h.worker.on_stats(failing)
+    assert h.state is S.CAMERA_ERROR
+    h.controller.pause()
+    h.controller.resume()
+    assert h.state is S.TRACKING  # judged afresh
+    # The worker fails with the same message again, so it publishes nothing new.
+    h.tick(controller_module.CAMERA_ERROR_RECHECK_S - 1.0)
+    assert h.state is S.TRACKING  # a slow camera gets time to open
+    h.tick(1.5)
+    assert h.state is S.CAMERA_ERROR
+    assert titles(h).count("Camera unavailable") == 2
+
+
+def test_camera_working_after_a_pause_is_no_error(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller()
+    h.worker.on_stats(WorkerStats(camera_open=False, last_error="Camera 0 could not be opened"))
+    h.controller.pause()
+    h.controller.resume()
+    h.worker.stats = WorkerStats(camera_open=True)
+    h.tick(controller_module.CAMERA_ERROR_RECHECK_S + 1.0)
+    assert h.state is S.TRACKING
+
+
+def test_failing_backend_is_a_camera_error(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller()
+    h.worker.on_stats(
+        WorkerStats(
+            camera_open=True,
+            last_error="Vision backend keeps failing: boom",
+            extra={"backend_failing": True},
+        )
+    )
+    assert h.state is S.CAMERA_ERROR
+    h.worker.on_stats(WorkerStats(camera_open=True, extra={"backend_failing": False}))
+    assert h.state is S.TRACKING
+
+
+def test_blocked_camera_permission_is_explained(make_controller: Callable[..., Harness]) -> None:
+    platform = FakePlatform()
+    platform.camera_permission = False
+    h = make_controller(platform=platform)
+    needed: list[str] = []
+    h.controller.permission_needed.connect(needed.append)
+    h.worker.on_stats(WorkerStats(camera_open=False, last_error="Camera 0 could not be opened"))
+    assert h.state is S.CAMERA_ERROR
+    assert titles(h) == ["Camera access blocked"]
+    assert needed == ["camera"]
+
+
+def test_input_ends_away_when_the_camera_failed_meanwhile(
+    make_controller: Callable[..., Harness],
+) -> None:
+    s = make_settings()
+    s.presence.action = "display_off"
+    h = make_controller(s)
+    h.feed(no_face(), 10.0, step=0.5)
+    assert h.state is S.AWAY
+    h.worker.on_stats(WorkerStats(camera_open=False, last_error="Camera unplugged"))
+    ticks(h, 10.0)
+    assert h.state is S.AWAY  # nobody there
+    h.platform.idle = 0.2  # the user is back at the keyboard
+    h.tick()
+    assert h.state is S.CAMERA_ERROR
+    assert h.platform.names() == ["display_off", "wake_display"]
+
+
+# ------------------------------------------------------------------ blind camera
+def test_covered_camera_pauses_walk_away_detection(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller()
+    h.feed(gaze_obs((500, 500)), 1.0)
+    h.feed(blind_obs(), 60.0, step=0.5)  # shutter closed; the user keeps reading
+    assert h.events["away_warning"] == []
+    assert "lock_screen" not in h.platform.names()
+    assert titles(h) == ["Camera appears covered"]
+
+
+def test_darkness_after_the_user_left_still_locks(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller()
+    h.feed(no_face(), 4.0, step=0.5)  # the user left, then the lights went out
+    h.feed(blind_obs(), 7.0, step=0.5)
+    assert h.platform.names().count("lock_screen") == 1
+    assert "Camera appears covered" not in titles(h)
+
+
+def test_covered_camera_locks_after_a_long_time_without_input(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller()
+    h.feed(gaze_obs((500, 500)), 1.0)
+    h.feed(blind_obs(), controller_module.BLIND_FREEZE_MAX_S - 1.0, step=0.5)
+    assert h.events["away_warning"] == []
+    h.feed(blind_obs(), 12.0, step=0.5)  # desk lamp off and gone: lock eventually
+    assert h.platform.names().count("lock_screen") == 1
+
+
+def test_covered_camera_keeps_the_curtain_up(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller(guard_settings("curtain"))
+    h.feed(gaze_obs((500, 500), faces=2), 2.5)
+    assert h.events["guard_changed"] == [True]
+    h.feed(blind_obs(), 5.0, step=0.5)  # covering the camera does not uncover the screens
+    assert h.events["guard_changed"] == [True]
+    h.feed(no_face(), 2.0)
+    assert h.events["guard_changed"] == [True, False]
+
+
+# ---------------------------------------------------------------- look-away
+def test_glance_below_the_screens_is_off_screen(make_controller: Callable[..., Harness]) -> None:
+    save_calibration(paths.calibration_file(), make_calibration(nonlinear=(0, 1)))
+    h = make_controller(calibrated=False)
+    assert h.state is S.TRACKING
+    h.feed(gaze_obs(LEFT_CENTRE), 0.5)
+    h.feed(gaze_obs((2500, 4000)), 2.0)  # the phone on the desk, below the right monitor
+    assert h.events["switched"] == []
+    assert h.controller._last_decision is not None
+    assert h.controller._last_decision.reason == "off_screen"
+    assert h.events["gaze_changed"][-1] is None
+    assert h.controller._learner.samples == []
+
+
+def test_glance_below_the_screens_without_gaze_features_is_not_detected(
+    make_controller: Callable[..., Harness],
+) -> None:
+    # The control: a model that does not know its gaze features, with a backend
+    # that declares none, clips the estimate to just below the right monitor.
+    h = make_controller()
+    h.feed(gaze_obs((2500, 4000)), 2.0)
+    assert h.events["switched"] == [1]
+
+
+def test_backend_gaze_features_detect_looking_away_with_an_old_model(
+    make_controller: Callable[..., Harness], fake_backends: list[str]
+) -> None:
+    h = make_controller()  # its model predates ``nonlinear``
+    h.worker.backend_factory()  # the worker builds the backend
+    h.tick()
+    assert h.controller.gaze_feature_indices() == (0, 1)
+    h.feed(gaze_obs((2500, 4000)), 2.0)
+    assert h.events["switched"] == []
+
+
+def test_phone_below_the_monitors_does_not_switch_with_realistic_features(
+    make_controller: Callable[..., Harness],
+) -> None:
+    from gaze_synth import GAZE, TWO, below_points, calibration_samples, synth_features
+
+    rng = np.random.default_rng(7)
+    samples = calibration_samples(TWO, rng, noise=0.5)
+    X = np.vstack([s.features for s in samples])
+    Y = np.array([(s.x, s.y) for s in samples])
+    # Degree 3 is what calibration selects for such data; clipped and bent, its
+    # estimates for a glance at the phone land just below the right monitor,
+    # well within the decider's off-screen margin.
+    model = GazeModel(degree=3, alpha=1.0, nonlinear=GAZE).fit(X, Y, bounds=virtual_bounds(TWO))
+    cal = dataclasses.replace(make_calibration(TWO), samples=samples, model=model)
+    save_calibration(paths.calibration_file(), cal)
+    h = make_controller(calibrated=False)
+    assert h.state is S.TRACKING
+    for cm in (60.0, 80.0):
+        phone = below_points([RIGHT], rng, 40, cm)  # the cursor is on the left monitor
+        for features in synth_features(phone, rng, noise=0.5):
+            h.push(Observation(timestamp=0.0, face_count=1, features=features, quality=1.0))
+            h.controller.tick()
+    assert h.events["switched"] == []
+
+
+# --------------------------------------------------------- backend identity
+def test_new_backend_with_the_old_identity_is_accepted(
+    make_controller: Callable[..., Harness], fake_backends: list[str]
+) -> None:
+    h = make_controller()
+    old_factory = h.worker.backend_factory
+    old_factory()
+    h.tick()
+    assert h.controller.backend_info() == BACKEND
+    new = h.controller.settings.copy()
+    new.general.backend = "lite"
+    h.controller.apply_settings(new)
+    assert h.controller.backend_info()[0] == "lite"  # the settings decide meanwhile
+    assert h.state is S.NEEDS_CALIBRATION
+    old_factory()  # the old backend recreated before the swap: not the new one
+    h.tick()
+    assert h.controller.backend_info()[0] == "lite"
+    _source, new_factory = h.worker.reconfigures[-1]
+    new_factory()  # "lite" was unavailable and the same backend came back
+    h.tick()
+    assert fake_backends == ["auto", "auto", "lite"]
+    assert h.controller.backend_info() == BACKEND
+    assert h.state is S.TRACKING
+
+
+def test_frames_of_the_previous_backend_do_not_invalidate_the_calibration(
+    make_controller: Callable[..., Harness],
+) -> None:
+    limit = controller_module.FEATURE_MISMATCH_LIMIT
+    h = make_controller()
+    stale = Observation(timestamp=0.0, face_count=1, features=np.full(3, 0.5), quality=1.0)
+    for _ in range(limit - 1):
+        h.push(stale)
+    h.push(gaze_obs((500, 500)))  # the new backend's features fit
+    for _ in range(limit - 1):
+        h.push(stale)
+    assert h.state is S.TRACKING
+    assert h.events["calibration_required"] == []
+    h.push(stale)  # consistently wrong: the calibration really does not fit
+    assert h.state is S.NEEDS_CALIBRATION
+    assert h.events["calibration_required"] == [
+        "the camera features no longer match the calibration"
+    ]
+
+
+# --------------------------------------------------- calibration announcements
+def test_layout_change_while_locked_is_announced_after_unlock(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller()
+    lock_session(h)
+    h.monitors.append(THIRD)
+    h.controller.refresh_monitors()  # docked while locked
+    assert h.events["calibration_required"] == []
+    unlock_session(h)
+    assert h.state is S.NEEDS_CALIBRATION
+    h.tick(1.0)
+    assert h.events["calibration_required"] == []  # the layout gets time to settle
+    ticks(h, 2.0)
+    assert h.events["calibration_required"] == ["the monitor layout changed"]
+    ticks(h, 5.0)
+    assert h.events["calibration_required"] == ["the monitor layout changed"]
+
+
+def test_layout_restored_while_locked_is_not_announced(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller()
+    lock_session(h)
+    h.monitors.append(THIRD)
+    h.controller.refresh_monitors()
+    del h.monitors[2]
+    h.controller.refresh_monitors()
+    unlock_session(h)
+    ticks(h, 5.0)
+    assert h.state is S.TRACKING
+    assert h.events["calibration_required"] == []
+
+
+def test_layout_change_while_away_is_announced_on_return(
+    make_controller: Callable[..., Harness],
+) -> None:
+    s = make_settings()
+    s.presence.action = "display_off"
+    h = make_controller(s)
+    h.feed(no_face(), 10.0, step=0.5)
+    assert h.state is S.AWAY
+    h.monitors.append(THIRD)
+    h.controller.refresh_monitors()
+    assert h.events["calibration_required"] == []
+    h.feed(gaze_obs((500, 500)), 3.0, step=0.5)
+    assert h.state is S.NEEDS_CALIBRATION
+    assert h.events["calibration_required"] == ["the monitor layout changed"]
+
+
+def test_unusable_calibration_is_recalled_when_the_user_comes_back(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller()
+    h.monitors.append(THIRD)
+    h.controller.refresh_monitors()
+    assert h.events["calibration_required"] == ["the monitor layout changed"]
+    lock_session(h)
+    unlock_session(h)
+    ticks(h, 3.0)
+    assert len(h.events["calibration_required"]) == 1  # said a moment ago
+    lock_session(h)
+    h.tick(controller_module.CALIBRATION_REMINDER_S)  # the night passes
+    unlock_session(h)
+    ticks(h, 3.0)
+    assert h.events["calibration_required"] == ["the monitor layout changed"] * 2
+
+
+def test_never_calibrated_is_not_recalled(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller(calibrated=False)
+    lock_session(h)
+    h.tick(controller_module.CALIBRATION_REMINDER_S)
+    unlock_session(h)
+    ticks(h, 3.0)
+    assert h.events["calibration_required"] == []  # the app offers it at start instead
+
+
+# ------------------------------------------------------- calibration profiles
+def test_calibration_profiles_follow_the_desk(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller()
+    office = h.controller.calibration()
+    h.monitors.append(THIRD)
+    h.controller.refresh_monitors()
+    assert h.state is S.NEEDS_CALIBRATION
+    h.controller.begin_calibration()
+    h.controller.finish_calibration(make_calibration(h.monitors))
+    home = h.controller.calibration()
+    assert h.state is S.TRACKING
+    assert len(h.controller.calibrations()) == 2
+
+    del h.monitors[2]  # back at the office
+    h.controller.refresh_monitors()
+    assert h.state is S.TRACKING
+    assert h.controller.calibration() is office
+    h.monitors.append(THIRD)  # and home again
+    h.controller.refresh_monitors()
+    assert h.state is S.TRACKING
+    assert h.controller.calibration() is home
+    assert h.events["calibration_required"] == ["the monitor layout changed"]  # once, ever
+
+    stored = CalibrationLibrary.load(paths.calibration_file())
+    assert len(stored) == 2
+    assert stored.latest is not None
+    assert stored.latest.layout_signature == home.layout_signature  # most recently used
+    assert h.controller.status()["calibration"]["profiles"] == 2
+
+
+def test_learned_samples_stay_with_their_profile(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller()
+    h.tick()
+    for i in range(3):  # three "move the mouse, let it rest" moments at the office
+        point = (300 + 200 * i, 400)
+        h.cursor.position = point
+        h.tick()
+        h.push(gaze_obs(point), dt=0.4)
+    assert len(h.controller._learner.samples) == 3
+
+    h.monitors.append(THIRD)
+    h.controller.refresh_monitors()
+    h.controller.begin_calibration()
+    h.controller.finish_calibration(make_calibration(h.monitors))
+    assert h.controller._learner.samples == []  # a new desk learns afresh
+
+    del h.monitors[2]
+    h.controller.refresh_monitors()
+    assert len(h.controller._learner.samples) == 3
+    office = [p for p in CalibrationLibrary.load(paths.calibration_file()) if len(p.monitors) == 2]
+    assert len(office[0].implicit_samples) == 3  # saved with the office profile
+
+
+def test_start_uses_the_profile_for_the_current_layout(
+    make_controller: Callable[..., Harness],
+) -> None:
+    save_calibration(paths.calibration_file(), make_calibration())
+    save_calibration(paths.calibration_file(), make_calibration([*MONITORS, THIRD]))
+    h = make_controller(calibrated=False)  # started at the two-monitor desk
+    assert h.state is S.TRACKING
+    cal = h.controller.calibration()
+    assert cal is not None
+    assert cal.layout_signature == layout_signature(MONITORS)
+    stored = CalibrationLibrary.load(paths.calibration_file()).latest
+    assert stored is not None
+    assert stored.layout_signature == layout_signature(MONITORS)
+
+
+# ------------------------------------------------------------------- camera
+def test_calibration_records_the_camera(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller(calibrated=False)
+    h.controller.begin_calibration()
+    for _ in range(3):
+        h.push(with_size(gaze_obs((500, 500)), (640, 480)))
+    assert h.controller.camera_identity() == ("0", (640, 480))
+    h.controller.finish_calibration(make_calibration())
+    stored = load_calibration(paths.calibration_file())
+    assert stored is not None
+    assert stored.camera == "0"
+    assert stored.frame_size == (640, 480)
+    assert h.state is S.TRACKING
+
+
+def test_another_camera_needs_another_calibration(
+    make_controller: Callable[..., Harness],
+) -> None:
+    save_calibration(paths.calibration_file(), dataclasses.replace(make_calibration(), camera="0"))
+    h = make_controller(calibrated=False)
+    assert h.state is S.TRACKING
+    new = h.controller.settings.copy()
+    new.camera.device = "1"
+    h.controller.apply_settings(new)
+    assert h.state is S.NEEDS_CALIBRATION
+    assert h.controller.calibration_reason == "the camera changed"
+    assert h.events["calibration_required"] == ["the camera changed"]
+    back = h.controller.settings.copy()
+    back.camera.device = "0"
+    h.controller.apply_settings(back)
+    assert h.state is S.TRACKING
+
+
+def test_each_camera_has_its_own_profile(make_controller: Callable[..., Harness]) -> None:
+    for device in ("0", "1"):
+        save_calibration(
+            paths.calibration_file(), dataclasses.replace(make_calibration(), camera=device)
+        )
+    h = make_controller(calibrated=False)
+    cal = h.controller.calibration()
+    assert h.state is S.TRACKING
+    assert cal is not None
+    assert cal.camera == "0"
+    new = h.controller.settings.copy()
+    new.camera.device = "1"
+    h.controller.apply_settings(new)
+    cal = h.controller.calibration()
+    assert h.state is S.TRACKING
+    assert cal is not None
+    assert cal.camera == "1"
+
+
+def test_camera_aspect_change_needs_another_calibration(
+    make_controller: Callable[..., Harness],
+) -> None:
+    save_calibration(
+        paths.calibration_file(),
+        dataclasses.replace(make_calibration(), camera="0", frame_size=(640, 480)),
+    )
+    h = make_controller(calibrated=False)
+    h.push(with_size(gaze_obs((500, 500)), (1280, 960)))  # same shape, more pixels
+    assert h.state is S.TRACKING
+    h.push(with_size(gaze_obs((500, 500)), (1280, 720)))  # 16:9: another field of view
+    assert h.state is S.NEEDS_CALIBRATION
+    assert h.controller.calibration_reason.startswith("the camera's aspect ratio changed")
+    assert len(h.events["calibration_required"]) == 1
+    h.push(with_size(gaze_obs((500, 500)), (640, 480)))
+    assert h.state is S.TRACKING
+
+
+# ------------------------------------------------------ calibration + privacy
+@pytest.mark.parametrize("saved", [False, True])
+def test_calibration_restores_privacy_mode(
+    make_controller: Callable[..., Harness], saved: bool
+) -> None:
+    h = make_controller()
+    h.controller.set_privacy(True)
+    h.controller.begin_calibration()
+    assert h.worker.is_active
+    h.controller.finish_calibration(make_calibration() if saved else None)
+    assert h.controller.privacy
+    assert h.state is S.PRIVACY
+    assert not h.worker.is_active
+
+
+def test_privacy_changed_during_calibration_wins(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller()
+    h.controller.set_privacy(True)
+    h.controller.begin_calibration()
+    h.controller.set_privacy(False)  # e.g. `eye-tracker ctl privacy-off`
+    h.controller.finish_calibration(None)
+    assert not h.controller.privacy
+    assert h.state is S.TRACKING
+
+
+# ------------------------------------------------------------------ learning
+def test_implausible_learning_labels_are_ignored(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller()
+    h.tick()
+    h.cursor.position = (3700, 1000)  # the pointer parked on the right ...
+    h.tick()
+    h.push(gaze_obs((200, 100)), dt=0.4)  # ... while the user reads on the left
+    assert h.controller._learner.samples == []
+    assert h.controller._drift.event_count == 1  # still evidence about accuracy
+    h.cursor.position = (3000, 600)
+    h.tick()
+    h.push(gaze_obs((3000, 600)), dt=0.4)
+    assert len(h.controller._learner.samples) == 1
+
+
+def test_kept_switch_counts_as_correct(make_controller: Callable[..., Harness]) -> None:
+    s = make_settings()
+    s.switching.cursor_target = "center"
+    h = make_controller(s)
+    h.feed(gaze_obs(RIGHT_CENTRE), 0.5)
+    assert h.events["switched"] == [1]
+    h.feed(gaze_obs(RIGHT_CENTRE), 2.5)
+    assert h.controller._drift.event_count == 1
+    assert h.controller._drift.error_rate == 0.0
+
+
+def test_smaller_learning_capacity_refits_the_model(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller()
+    h.tick()
+    for i in range(25):  # enough settles for one refit
+        point = (300 + 40 * i, 400)
+        h.cursor.position = point
+        h.tick()
+        h.push(gaze_obs(point), dt=0.4)
+    cal = h.controller.calibration()
+    assert cal is not None
+    refined = cal.model
+    assert len(cal.implicit_samples) == 25
+    new = h.controller.settings.copy()
+    new.learning.max_samples = 0
+    h.controller.apply_settings(new)
+    assert cal.implicit_samples == []
+    assert cal.model is not refined
+    assert h.controller._model is cal.model
+    stored = load_calibration(paths.calibration_file())
+    assert stored is not None
+    assert stored.implicit_samples == []
+
+
+# -------------------------------------------------------------------- preview
+def test_preview_consumers_are_counted(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller()
+    window, wizard = object(), object()
+    h.controller.set_preview(True, window)
+    h.controller.set_preview(True, wizard)
+    h.controller.set_preview(False, window)  # the preview window is hidden
+    assert h.worker.previews == [True]
+    assert h.controller.preview_enabled
+    frame = np.zeros((4, 4, 3), np.uint8)
+    h.worker.on_preview(frame)
+    assert h.events["preview_frame"] == [frame]  # the wizard still gets frames
+    h.controller.set_preview(False, wizard)
+    assert h.worker.previews == [True, False]
+    assert not h.controller.preview_enabled
+
+
+# ------------------------------------------------------------- macOS specifics
+@pytest.mark.parametrize("status", ["stale", "missing"])
+def test_missing_accessibility_is_reported_at_start(
+    make_controller: Callable[..., Harness], status: str
+) -> None:
+    platform = FakePlatform()
+    platform.accessibility = status
+    h = make_controller(platform=platform, start=False)
+    needed: list[str] = []
+    h.controller.permission_needed.connect(needed.append)
+    h.controller.start()
+    assert titles(h) == ["Accessibility access needed"]
+    assert needed == ["accessibility"]
+    assert ("remove Eye Tracker" in h.events["notify"][0][1]) is (status == "stale")
+
+
+def test_accessibility_is_not_needed_without_window_focus(
+    make_controller: Callable[..., Harness],
+) -> None:
+    platform = FakePlatform()
+    platform.accessibility = "missing"
+    s = make_settings()
+    s.switching.focus_window = False
+    h = make_controller(s, platform=platform)
+    assert h.events["notify"] == []
+
+
+def test_failed_activations_report_missing_accessibility(
+    make_controller: Callable[..., Harness],
+) -> None:
+    platform = FakePlatform()
+    platform.accessibility = "granted"
+    s = make_settings()
+    s.switching.cursor_target = "center"
+    h = make_controller(s, platform=platform)
+    platform.window_under = WindowRef(handle=9, pid=1, rect=Rect(0, 0, 3840, 1080))
+    platform.activate_ok = False
+    platform.accessibility = "missing"  # revoked while running
+    for point in (RIGHT_CENTRE, LEFT_CENTRE, RIGHT_CENTRE):
+        h.feed(gaze_obs(point), 1.0)
+    assert h.events["switched"] == [1, 0, 1]
+    assert titles(h) == ["Accessibility access needed"]
+
+
+def test_app_nap_is_allowed_only_while_paused_or_private(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller()
+    assert h.platform.background == [True]
+    h.controller.pause()
+    assert h.platform.background == [True, False]
+    h.controller.resume()
+    assert h.platform.background == [True, False, True]
+    lock_session(h)  # unlocking must still be noticed promptly
+    unlock_session(h)
+    h.controller.set_privacy(True)
+    assert h.platform.background == [True, False, True, False]

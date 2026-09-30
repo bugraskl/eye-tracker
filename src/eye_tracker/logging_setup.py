@@ -5,10 +5,11 @@ started at login), so the rotating log file is the only place where problems
 become visible. This module therefore also routes Qt's own messages and
 uncaught exceptions (main thread and worker threads) into that file.
 
-Native libraries log through their own channels: MediaPipe uses glog/absl and
-OpenCV its own logger, both writing straight to stderr. They are quietened with
-environment variables, which must be set before those libraries are loaded, so
-:func:`setup_logging` is meant to run first thing at startup.
+OpenCV logs through its own channel, straight to stderr (for example a warning
+for every camera index that does not exist, or OpenCV 5's note about its new
+DNN graph engine each time a face detector is created). It reads its log level
+from an environment variable when it is first imported, so :func:`setup_logging`
+is meant to run first thing at startup, before anything imports ``cv2``.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ BACKUP_COUNT = 3
 LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 #: Third-party Python loggers that are chatty at INFO level.
-_NOISY_LOGGERS = ("absl", "PIL", "matplotlib", "asyncio")
+_NOISY_LOGGERS = ("PIL", "matplotlib", "asyncio")
 #: Marks handlers installed by this module so repeated calls replace them.
 _HANDLER_FLAG = "_eye_tracker_handler"
 
@@ -178,14 +179,13 @@ def _apply_level(numeric: int) -> None:
 
 
 def _quiet_native_libraries(*, debug: bool) -> None:
-    """Silence MediaPipe/TensorFlow Lite and OpenCV stderr chatter unless debugging."""
+    """Silence OpenCV's stderr chatter unless debugging."""
     if debug:
         return
-    # glog/absl (MediaPipe) and TFLite read these when they are first loaded.
-    os.environ.setdefault("GLOG_minloglevel", "2")
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-    # OpenCV reads this on first use. Without it, probing a camera index that does
-    # not exist prints "[ WARN ] VIDEOIO(DSHOW) ... can't be used to capture by index".
+    # OpenCV reads this when it is imported. Without it, probing a camera index
+    # that does not exist prints "[ WARN ] VIDEOIO(DSHOW) ... can't be used to
+    # capture by index", and OpenCV 5 warns about its graph engine whenever a
+    # YuNet detector is created.
     os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
     # Importing cv2 costs ~0.4 s, so it is only adjusted here when already loaded
     # (the environment variable covers a later import).

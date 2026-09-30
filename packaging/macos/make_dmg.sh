@@ -1,15 +1,26 @@
 #!/usr/bin/env bash
-# Sign "Eye Tracker.app" ad hoc and wrap it in a drag-to-install disk image.
+# Sign "Eye Tracker.app" and wrap it in a drag-to-install disk image.
 #
 # Usage (from the repository root, after PyInstaller):
-#   bash packaging/macos/make_dmg.sh [--app "dist/Eye Tracker.app"] [--out FILE.dmg] [--version X.Y.Z]
+#   bash packaging/macos/make_dmg.sh [--app "dist/Eye Tracker.app"] [--out FILE.dmg]
+#        [--version X.Y.Z] [--identity NAME] [--keychain PATH]
 #
 # Defaults: --app dist/Eye Tracker.app, --version from the app's Info.plist,
-# --out dist/EyeTracker-<version>-macos-<arch>.dmg.
+# --out dist/EyeTracker-<version>-macos-<arch>.dmg, --identity "-" (ad hoc) or
+# $MACOS_SIGN_IDENTITY, --keychain $MACOS_SIGN_KEYCHAIN (default: the search list).
 #
-# The signature is ad hoc ("-"): it makes the bundle valid for Gatekeeper's
-# integrity checks and for camera/accessibility permissions, but it is not a
-# Developer ID signature, so the first launch needs "Open Anyway" in
+# Why the identity matters: macOS stores Camera and Accessibility permissions
+# against the app's designated requirement. An ad-hoc signature ("-") pins that
+# to the exact build (its cdhash), so after every update the Accessibility
+# switch still looks on but no longer applies; users must remove Eye Tracker
+# with "-" in System Settings > Privacy & Security > Accessibility and add it
+# again. Signing every release with the same certificate keeps the permissions:
+# a Developer ID certificate, or a persistent self-signed one, e.g. created in
+# Keychain Access > Certificate Assistant > Create a Certificate... (Identity
+# Type "Self Signed Root", Certificate Type "Code Signing"), exported as .p12
+# and stored in the repository secrets MACOS_SIGNING_CERT_P12 (base64) and
+# MACOS_SIGNING_CERT_PASSWORD; the release workflow imports it when present.
+# Neither kind is notarized, so the first launch still needs "Open Anyway" in
 # System Settings > Privacy & Security.
 set -euo pipefail
 
@@ -22,13 +33,17 @@ APP="$ROOT/dist/Eye Tracker.app"
 OUT=""
 VERSION=""
 VOLUME_NAME="Eye Tracker"
+IDENTITY="${MACOS_SIGN_IDENTITY:--}"
+KEYCHAIN="${MACOS_SIGN_KEYCHAIN:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --app) APP="${2:?--app needs a path}"; shift 2 ;;
     --out) OUT="${2:?--out needs a path}"; shift 2 ;;
     --version) VERSION="${2:?--version needs a value}"; shift 2 ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    --identity) IDENTITY="${2:?--identity needs a name (or - for ad hoc)}"; shift 2 ;;
+    --keychain) KEYCHAIN="${2:?--keychain needs a path}"; shift 2 ;;
+    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -44,12 +59,28 @@ ARCH="$(uname -m)"
 OUT="${OUT:-$ROOT/dist/EyeTracker-$VERSION-macos-$ARCH.dmg}"
 mkdir -p "$(dirname "$OUT")"
 
-echo "==> Signing $APP (ad hoc)"
+SIGN_ARGS=(--force --deep --sign "$IDENTITY" --timestamp=none)
+if [[ -n "$KEYCHAIN" ]]; then
+  SIGN_ARGS+=(--keychain "$KEYCHAIN")
+fi
+if [[ "$IDENTITY" == "-" ]]; then
+  echo "==> Signing $APP (ad hoc)"
+  echo "make_dmg: warning: ad-hoc signature: users must re-grant Accessibility after" \
+    "every update (pass --identity to sign with a stable certificate)" >&2
+else
+  echo "==> Signing $APP with \"$IDENTITY\""
+fi
 # Extended attributes (quarantine, Finder info) make codesign fail with
 # "resource fork, Finder information, or similar detritus not allowed".
 xattr -cr "$APP"
-codesign --force --deep --sign - --timestamp=none "$APP"
+codesign "${SIGN_ARGS[@]}" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
+# The designated requirement is what TCC (Camera, Accessibility) remembers.
+REQUIREMENT="$(codesign --display --requirements - "$APP" 2>&1 | sed -n 's/^designated => //p')"
+echo "    designated requirement: ${REQUIREMENT:-unknown}"
+if [[ "$IDENTITY" != "-" && "$REQUIREMENT" == *cdhash* ]]; then
+  die "signed with \"$IDENTITY\" but the designated requirement is still build-specific"
+fi
 
 STAGING="$(mktemp -d "${TMPDIR:-/tmp}/eye-tracker-dmg.XXXXXX")"
 trap 'rm -rf "$STAGING"' EXIT

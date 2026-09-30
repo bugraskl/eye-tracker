@@ -382,7 +382,12 @@ def _cmd_autostart(args: argparse.Namespace) -> int:
             _out("Start at login: not supported on this system")
             return EXIT_OK
         status = autostart.status(config_dir=profile)
-        _out(f"Start at login: {_AUTOSTART_STATUS_TEXT.get(status.value, status.value)}")
+        # The value itself (enabled, disabled, stale, other-profile) is what
+        # scripts and bug reports quote; the explanation says what to do.
+        _out(f"Start at login: {status.value}")
+        explanation = _AUTOSTART_STATUS_HELP.get(status.value)
+        if explanation:
+            _out(f"  {explanation}")
         _out(f"Entry:      {autostart.location()}")
         registered = autostart.registered_command()
         if registered:
@@ -408,14 +413,13 @@ def _cmd_autostart(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-#: ``autostart status`` wording by :class:`~eye_tracker.platform.autostart.Status` value.
-_AUTOSTART_STATUS_TEXT = {
-    "enabled": "enabled",
-    "disabled": "disabled",
-    "stale": "broken (the registered program no longer exists or is in a temporary "
-    "location; run 'autostart enable' to repair it)",
-    "other-profile": "set up for another profile (--config-dir); "
-    "run 'autostart enable' to start this one instead",
+#: What ``autostart status`` adds for a :class:`~eye_tracker.platform.autostart.Status`
+#: value that needs an explanation.
+_AUTOSTART_STATUS_HELP = {
+    "stale": "Broken: the registered program no longer exists or is in a temporary "
+    "location. Run 'eye-tracker autostart enable' to repair it.",
+    "other-profile": "The entry starts another profile (--config-dir). Run "
+    "'eye-tracker autostart enable' to start this one instead.",
 }
 
 

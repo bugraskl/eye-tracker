@@ -24,6 +24,17 @@ log = logging.getLogger(__name__)
 
 CONFIG_VERSION = 1
 
+#: Vision backend names of earlier versions and what they are called now. The
+#: MediaPipe-runtime backend became the self-contained "facemesh" one (same
+#: landmark model), the OpenCV/YuNet one became "lite".
+LEGACY_BACKENDS: dict[str, str] = {"mediapipe": "facemesh", "opencv": "lite"}
+#: The hotkey defaults of earlier versions (``hotkeys.toggle_tracking``,
+#: ``toggle_privacy``, ``recalibrate``). Ctrl+Alt+letter is AltGr+letter on many
+#: Windows layouts and opens a terminal on Linux desktops, so a file that still
+#: holds all three unchanged gets today's platform defaults instead.
+LEGACY_HOTKEYS: tuple[str, str, str] = ("ctrl+alt+t", "ctrl+alt+p", "ctrl+alt+c")
+_HOTKEY_FIELDS = ("toggle_tracking", "toggle_privacy", "recalibrate")
+
 
 def _opt(
     default: Any,
@@ -55,7 +66,10 @@ class GeneralSettings:
 class CameraSettings:
     device: str = _opt(
         "0",
-        doc="Camera index ('0', '1', …) or a video/image file path (useful for testing).",
+        doc="Camera index ('0', '1', …) or a local video/image file path (useful for "
+        "testing). On Linux also /dev/videoN or a stable link such as /dev/v4l/by-id/…, "
+        "which keeps finding a camera that was re-plugged under another number. URLs and "
+        "other network sources are refused: Eye Tracker works fully offline.",
     )
     width: int = _opt(640, lo=160, hi=1920, doc="Requested capture width.")
     height: int = _opt(480, lo=120, hi=1080, doc="Requested capture height.")
@@ -251,7 +265,7 @@ class Settings:
         if not isinstance(data, dict):
             log.warning("Settings root is not an object; using defaults")
             return settings
-        _apply(settings, data, prefix="")
+        _apply(settings, _migrate(data), prefix="")
         settings.version = CONFIG_VERSION
         return settings
 
@@ -320,6 +334,39 @@ def describe_settings() -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------- internals
+def _migrate(data: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite values written by earlier versions (before validation).
+
+    Returns ``data`` itself when nothing changes, otherwise a shallow copy with
+    fresh copies of the sections that changed: the caller's dict is never
+    modified.
+    """
+    general = data.get("general")
+    backend = general.get("backend") if isinstance(general, dict) else None
+    if isinstance(general, dict) and isinstance(backend, str) and backend in LEGACY_BACKENDS:
+        renamed = LEGACY_BACKENDS[backend]
+        log.info("Setting general.backend=%r is now called %r", backend, renamed)
+        data = {**data, "general": {**general, "backend": renamed}}
+
+    hotkeys = data.get("hotkeys")
+    if isinstance(hotkeys, dict):
+        stored = tuple(hotkeys.get(name) for name in _HOTKEY_FIELDS)
+        if all(isinstance(v, str) for v in stored) and (
+            tuple(str(v).strip().lower() for v in stored) == LEGACY_HOTKEYS
+        ):
+            # All three still at the old defaults: the user never chose them.
+            defaults = HotkeySettings()
+            fresh = {name: getattr(defaults, name) for name in _HOTKEY_FIELDS}
+            # On macOS today's defaults are the old ones: nothing to say there.
+            if tuple(fresh.values()) != LEGACY_HOTKEYS:
+                log.info(
+                    "Hotkeys at the defaults of an earlier version; using today's defaults (%s)",
+                    ", ".join(fresh.values()),
+                )
+                data = {**data, "hotkeys": {**hotkeys, **fresh}}
+    return data
+
+
 def _to_dict(obj: Any) -> Any:
     if is_dataclass(obj) and not isinstance(obj, type):
         return {f.name: _to_dict(getattr(obj, f.name)) for f in fields(obj)}

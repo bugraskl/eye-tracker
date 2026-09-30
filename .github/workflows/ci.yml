@@ -51,6 +51,14 @@ jobs:
       - name: Mypy (package)
         run: uv run --no-sync mypy
 
+      # This job runs on Linux, where mypy skips the code behind
+      # `sys.platform == "win32"` / `"darwin"` checks; check it as those platforms too.
+      - name: Mypy (package, as on Windows)
+        run: uv run --no-sync mypy --platform win32
+
+      - name: Mypy (package, as on macOS)
+        run: uv run --no-sync mypy --platform darwin
+
       - name: Mypy (build scripts)
         run: uv run --no-sync mypy scripts packaging/pyinstaller/entry.py
 

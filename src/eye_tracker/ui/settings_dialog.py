@@ -225,10 +225,20 @@ def camera_in_use(controller: object) -> set[int]:
     """The camera index the controller has applied, as a ``skip`` set for probing.
 
     Uses the *applied* settings, not a value being edited in a dialog: that is
-    the device the vision worker may hold open. Empty for a video file.
+    the device the vision worker may hold open. On Linux a ``/dev/videoN`` path
+    or a stable ``/dev/v4l/by-id/…`` link counts as the index it leads to.
+    Empty for a video file.
     """
     device = str(settings_from_controller(controller).camera.device).strip()
-    return {int(device)} if device.isdigit() else set()
+    if device.isdigit():
+        return {int(device)}
+    if not device.startswith("/dev/"):
+        return set()
+    # Imported only for device paths: the camera module loads OpenCV.
+    from ..vision.camera import device_index
+
+    index = device_index(device)
+    return {index} if index is not None else set()
 
 
 def load_diagnostics_text() -> str:

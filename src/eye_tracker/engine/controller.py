@@ -14,7 +14,9 @@ Threading
 ---------
 Worker and hotkey callbacks arrive on foreign threads. They are marshalled to
 the main thread through private queued signals; a callback that already runs on
-the main thread is handled directly. Everything else runs on the main thread,
+the main thread is handled directly. Locking the screen can block for seconds,
+so it runs on a short-lived thread whose result comes back the same way.
+Everything else runs on the main thread,
 so no locking is needed beyond the hand-off of preview frames and the record of
 the backend the worker built.
 
@@ -127,6 +129,8 @@ if TYPE_CHECKING:
     ]
     MonitorsProvider = Callable[[], list[Monitor]]
     HotkeyManagerFactory = Callable[[], HotkeyManager]
+    #: Runs a job off the GUI thread (see ``Controller(lock_runner=...)``).
+    JobRunner = Callable[[Callable[[], None]], None]
 
 log = logging.getLogger(__name__)
 
@@ -207,6 +211,12 @@ CAMERA_ERROR_RECHECK_S = 8.0
 #: Consecutive failed window activations after which a missing Accessibility
 #: permission (macOS) is reported.
 ACTIVATION_FAILURE_LIMIT = 3
+#: How long :meth:`Controller.shutdown` waits for a screen lock still in progress.
+LOCK_JOIN_TIMEOUT_S = 2.0
+#: Walk-away actions that lock the session or blank the displays. Until the
+#: first-run setup is finished they only notify: the owner of a PC who never
+#: saw the setup assistant must not be locked out by an app they just installed.
+_DISRUPTIVE_AWAY_ACTIONS = frozenset({"lock", "lock_and_display_off", "display_off"})
 
 #: IPC commands handled by :meth:`Controller.handle_command`.
 COMMANDS = (
@@ -456,6 +466,10 @@ class Controller(QObject):
         clock: Monotonic time source in seconds.
         hotkey_manager_factory: ``() -> HotkeyManager``; defaults to
             ``platform.hotkeys.create_hotkey_manager``.
+        trace_path: Write a per-frame trace (JSON lines) to this file.
+        lock_runner: ``(job) -> None`` that runs ``job`` off the GUI thread, where
+            the screen is locked (``lock_screen`` can block for seconds); defaults
+            to a short-lived thread. Tests pass a synchronous runner.
         parent: Qt parent.
 
     Call :meth:`start` once signals are connected and :meth:`shutdown` before exit.
@@ -507,6 +521,7 @@ class Controller(QObject):
     _stats_received = Signal(object)
     _preview_ready = Signal()
     _hotkey_pressed = Signal(str)
+    _lock_done = Signal(bool)
 
     def __init__(
         self,
@@ -519,6 +534,7 @@ class Controller(QObject):
         clock: Callable[[], float] = time.monotonic,
         hotkey_manager_factory: HotkeyManagerFactory | None = None,
         trace_path: str | Path | None = None,
+        lock_runner: JobRunner | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -637,6 +653,10 @@ class Controller(QObject):
         self._curtain = False
         self._guard_locked = False
         self._guard_relock_until = -math.inf
+        # Screen lock requests in flight ("away", "guard"; see _request_lock).
+        self._lock_runner: JobRunner = lock_runner or self._run_lock_thread
+        self._lock_purposes: set[str] = set()
+        self._lock_thread: threading.Thread | None = None
 
         # Housekeeping schedule (set in start()).
         self._next_window_poll = math.inf
@@ -666,6 +686,7 @@ class Controller(QObject):
         self._stats_received.connect(self._handle_worker_stats, queued)
         self._preview_ready.connect(self._deliver_preview, queued)
         self._hotkey_pressed.connect(self._handle_hotkey, queued)
+        self._lock_done.connect(self._finish_lock, queued)
 
     # ================================================================== lifecycle
     def start(self) -> None:
@@ -744,6 +765,10 @@ class Controller(QObject):
                 self._worker.stop()
             except Exception:
                 log.warning("Stopping the vision worker failed", exc_info=True)
+        lock_thread = self._lock_thread
+        if lock_thread is not None and lock_thread.is_alive():
+            # Let a lock in progress finish before this object may be deleted.
+            lock_thread.join(LOCK_JOIN_TIMEOUT_S)
         if self._implicit_dirty and self._calibration is not None:
             self._save_calibration(self._calibration, quiet=True)
         if self._trace is not None:
@@ -1891,12 +1916,15 @@ class Controller(QObject):
         log.info("User away; action: %s", action)
         if action == "none":
             return
+        setup_pending = not self._settings.general.first_run_done
+        if setup_pending and action in _DISRUPTIVE_AWAY_ACTIONS:
+            log.info("First-run setup not finished: notifying instead of %s", action)
+            action = "notify"
         if action == "notify":
-            self._notify(
-                "Are you still there?",
-                "Nobody has been at the computer for a while.",
-                force=True,
-            )
+            message = "Nobody has been at the computer for a while."
+            if setup_pending:
+                message += " Finish the setup to choose what happens when you walk away."
+            self._notify("Are you still there?", message, force=True)
             return
         lock = action in ("lock", "lock_and_display_off") and not self._session_locked
         display_off = action in ("display_off", "lock_and_display_off")
@@ -1913,16 +1941,7 @@ class Controller(QObject):
                         force=True,
                     )
         if lock:
-            if self._platform_call("lock_screen", default=False):
-                # Notice the lock soon so the camera is released promptly.
-                self._next_lock_check = min(self._next_lock_check, self._clock() + 0.5)
-            else:
-                log.warning("Locking the screen is not supported here")
-                self._notify(
-                    "Could not lock the screen",
-                    "This system does not allow it; choose another walk-away action.",
-                    force=True,
-                )
+            self._request_lock("away")  # the result arrives in _finish_lock
         self._displays_off_only = display_off and displays_ok and not lock
 
     def _hide_countdown(self) -> None:
@@ -1954,13 +1973,8 @@ class Controller(QObject):
                 log.info("Shoulder guard: showing the curtain instead of locking again")
                 self._show_curtain(True)
                 return
-            if self._platform_call("lock_screen", default=False):
-                self._guard_locked = True
-                # Notice the lock soon so the camera is released promptly.
-                self._next_lock_check = min(self._next_lock_check, now + 0.5)
-                return
-            log.warning("Could not lock the screen; showing the privacy curtain instead")
-            self._show_curtain(True)
+            # If locking fails, _finish_lock shows the privacy curtain instead.
+            self._request_lock("guard")
         elif action == "curtain":
             self._show_curtain(True)
         else:
@@ -1979,6 +1993,70 @@ class Controller(QObject):
     def _clear_guard(self) -> None:
         self._guard.reset()
         self._show_curtain(False)
+
+    # ============================================================== screen lock
+    def _request_lock(self, purpose: str) -> None:
+        """Lock the session without blocking the GUI thread.
+
+        ``lock_screen`` may take seconds (a D-Bus call to a busy screensaver,
+        ``loginctl``, AppleScript) and is safe on any thread, so it runs through
+        ``lock_runner`` and the result comes back to :meth:`_finish_lock` on the
+        main thread. ``purpose`` (``"away"`` or ``"guard"``) decides what a
+        failure does; a request while another is in flight joins it.
+        """
+        first = not self._lock_purposes
+        self._lock_purposes.add(purpose)
+        if not first:
+            return
+        log.info("Locking the screen (%s)", purpose)
+        try:
+            self._lock_runner(self._lock_job)
+        except Exception:
+            log.warning("Could not start locking the screen", exc_info=True)
+            self._finish_lock(False)
+
+    def _lock_job(self) -> None:  # lock thread (or the main thread, see lock_runner)
+        try:
+            ok = bool(self._platform.lock_screen())
+        except Exception:
+            log.debug("lock_screen failed", exc_info=True)
+            ok = False
+        if self._on_main_thread():
+            self._finish_lock(ok)
+            return
+        if self._closed:
+            return
+        with contextlib.suppress(RuntimeError):  # deleted after a shutdown timed out
+            self._lock_done.emit(ok)
+
+    def _run_lock_thread(self, job: Callable[[], None]) -> None:
+        """Default ``lock_runner``: a short-lived daemon thread."""
+        thread = threading.Thread(target=job, name="eye-tracker-lock", daemon=True)
+        self._lock_thread = thread
+        thread.start()
+
+    def _finish_lock(self, ok: bool) -> None:
+        """The screen lock requested by :meth:`_request_lock` has finished."""
+        purposes, self._lock_purposes = self._lock_purposes, set()
+        if self._closed or not purposes:
+            return
+        if ok:
+            if "guard" in purposes:
+                self._guard_locked = True
+            # Notice the lock soon so the camera is released promptly.
+            self._next_lock_check = min(self._next_lock_check, self._clock() + 0.5)
+            return
+        log.warning("Locking the screen failed or is not supported here")
+        if "away" in purposes:
+            self._notify(
+                "Could not lock the screen",
+                "This system does not allow it; choose another walk-away action.",
+                force=True,
+            )
+        if "guard" in purposes and self._guard.active:
+            # The onlooker is still there: cover the screens instead.
+            log.warning("Showing the privacy curtain instead of the lock")
+            self._show_curtain(True)
 
     # ===================================================================== state
     def _derive_state(self) -> TrackingState:
@@ -2498,11 +2576,8 @@ class Controller(QObject):
     @staticmethod
     def _hotkey_error(manager: HotkeyManager, name: str) -> str | None:
         """The manager's explanation of why ``name`` is not registered, if it has one."""
-        getter = getattr(manager, "last_error", None)
-        if not callable(getter):
-            return None
         try:
-            reason = getter(name)
+            reason = manager.last_error(name)
         except Exception:
             log.debug("Reading the hotkey error failed", exc_info=True)
             return None
@@ -2596,8 +2671,8 @@ class Controller(QObject):
     def _platform_call(self, name: str, *args: Any, default: Any = None) -> Any:
         """Call a platform method; the contract says they never raise, but be safe.
 
-        A method this platform does not have (an optional, platform-specific one
-        such as ``accessibility_status``) returns ``default``.
+        A method the object does not have (a partial test double) returns
+        ``default``.
         """
         method = getattr(self._platform, name, None)
         if method is None:

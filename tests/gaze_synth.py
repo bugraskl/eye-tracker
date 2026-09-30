@@ -2,7 +2,7 @@
 
 A user ~65 cm from 24" 1080p panels (53 cm wide). The head turns part of the way
 towards the target (a random share, as people do) and the eyes do the rest; the
-webcam reports head pose, head position and iris offsets like the MediaPipe
+webcam reports head pose, head position and iris offsets like the face-mesh
 backend. Flat screens make pixels ~ tan(angle): the mapping is non-linear.
 """
 
@@ -71,7 +71,8 @@ def grid_dataset(
     camera_x: float = 1920.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Calibration-like data: a 3x3 grid per monitor, ``per_point`` samples each."""
-    points, groups = [], []
+    points: list[tuple[float, float]] = []
+    groups: list[int] = []
     for m in monitors:
         for ny in (0.1, 0.5, 0.9):
             for nx in (0.1, 0.5, 0.9):

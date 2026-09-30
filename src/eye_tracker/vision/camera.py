@@ -630,6 +630,24 @@ def open_source(
     return file_source
 
 
+def device_index(device: str) -> int | None:
+    """The camera index a ``camera.device`` setting selects right now, or ``None``.
+
+    ``"0"``, ``"1"``, … and, on Linux, ``/dev/videoN`` or a stable link to one
+    (``/dev/v4l/by-id/…``, resolved now). ``None`` for a video or image file and
+    for a device path that does not lead to a camera. Never raises.
+    """
+    spec = device.strip()
+    if spec.isdigit():
+        return int(spec)
+    if sys.platform.startswith("linux") and spec.startswith("/dev/") and not os.path.isfile(spec):
+        try:
+            return _v4l2_index(spec)
+        except (CameraError, OSError, ValueError):
+            return None
+    return None
+
+
 def _resolve_link(path: str) -> str:
     """``os.path.realpath`` (replaceable in tests)."""
     return os.path.realpath(path)

@@ -60,6 +60,13 @@ _DISTRIBUTIONS = {
     "platformdirs": ("platformdirs",),
 }
 
+#: Distributions Eye Tracker never uses that are a problem when installed next to
+#: it, with the reason. The MediaPipe runtime is not needed (its models run in
+#: OpenCV) and ships a usage logger (telemetry), which the offline rule excludes.
+_UNWANTED_DISTRIBUTIONS: dict[str, str] = {
+    "mediapipe": "Eye Tracker does not use it, and it contains a usage logger (telemetry)",
+}
+
 #: Things worth knowing on Linux that are not problems (shown under "OS integration").
 _LINUX_CAMERA_NOTE = (
     "apps that open /dev/video* are noticed (refused attempts too, via fanotify on "
@@ -290,7 +297,24 @@ def _libraries_section() -> dict[str, Any]:
                 break
             except importlib.metadata.PackageNotFoundError:
                 continue
+    unwanted = _unwanted_distributions()
+    if unwanted:
+        versions["unwanted"] = unwanted
     return versions
+
+
+def _unwanted_distributions() -> dict[str, str]:
+    """``{name: version}`` of the installed :data:`_UNWANTED_DISTRIBUTIONS`."""
+    found: dict[str, str] = {}
+    for name in _UNWANTED_DISTRIBUTIONS:
+        try:
+            found[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        except Exception:  # a broken installation record still means "installed"
+            log.debug("Reading the version of %s failed", name, exc_info=True)
+            found[name] = "unknown version"
+    return found
 
 
 def _backends_section(settings: Settings) -> dict[str, Any]:
@@ -365,12 +389,9 @@ def _platform_section(services: PlatformServices) -> dict[str, Any]:
 
 
 def _accessibility_status(services: PlatformServices) -> str:
-    """``accessibility_status()`` where the platform has it (macOS), else ``"unknown"``."""
-    getter = getattr(services, "accessibility_status", None)
-    if not callable(getter):
-        return "unknown"
+    """``accessibility_status()`` (only macOS knows more than ``"unknown"``)."""
     try:
-        return str(getter())
+        return str(services.accessibility_status())
     except Exception:
         log.debug("accessibility_status() failed", exc_info=True)
         return "unknown"
@@ -446,9 +467,7 @@ def _paths_section() -> dict[str, Any]:
 
 def _profile_override() -> bool:
     """Whether a ``--config-dir`` profile is in use."""
-    getter = getattr(paths, "base_override", None)
-    override = getter() if callable(getter) else paths._override
-    return override is not None
+    return paths.base_override() is not None
 
 
 def _settings_section() -> tuple[Settings, dict[str, Any]]:
@@ -576,6 +595,14 @@ def _problems(report: dict[str, Any]) -> list[str]:
     for key, section in report.items():
         if isinstance(section, dict) and "error" in section and len(section) == 1:
             problems.append(f"Could not collect {key} information: {section['error']}")
+
+    libraries = report.get("libraries") or {}
+    for name, version in (libraries.get("unwanted") or {}).items():
+        why = _UNWANTED_DISTRIBUTIONS.get(name, "Eye Tracker does not use it")
+        problems.append(
+            f"The {name} package ({version}) is installed in this Python environment. "
+            f"{why}; uninstall it (pip uninstall {name})."
+        )
 
     backends = report.get("backends") or {}
     if backends.get("available") == []:

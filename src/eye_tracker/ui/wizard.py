@@ -741,13 +741,14 @@ class FirstRunWizard(QWizard):
         if self._preview_on:
             return
         self._preview_on = True
-        self._call_controller("set_preview", True)
+        # One owner among others (the preview window): see Controller.set_preview.
+        self._call_controller("set_preview", True, self)
 
     def _stop_preview(self) -> None:
         if not self._preview_on:
             return
         self._preview_on = False
-        self._call_controller("set_preview", False)
+        self._call_controller("set_preview", False, self)
         self.camera_page.preview.clear()
 
     def _on_preview_frame(self, frame: object) -> None:
@@ -918,11 +919,8 @@ class FirstRunWizard(QWizard):
 
         Only macOS implements it; elsewhere, or when it fails, ``"unknown"``.
         """
-        getter = getattr(self._platform, "accessibility_status", None)
-        if not callable(getter):
-            return "unknown"
         try:
-            return str(getter())
+            return str(self._platform.accessibility_status())
         except Exception:
             log.debug("accessibility_status() failed", exc_info=True)
             return "unknown"

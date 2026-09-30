@@ -52,6 +52,7 @@ from .config import Settings
 from .logging_setup import install_qt_message_handler, set_level, setup_logging
 from .platform import get_platform
 from .platform.base import PlatformServices
+from .types import TrackingState
 
 if TYPE_CHECKING:
     from .engine.controller import Controller
@@ -83,9 +84,17 @@ STARTUP_QUIET_S = 20.0
 #: Clicking a "calibration needed" or "finish setup" notification later than
 #: this does nothing.
 PROMPT_CLICK_WINDOW_S = 600.0
-#: Kinds of our own notifications that open a window when clicked.
+#: Kinds of notifications that do something when clicked: open the calibration,
+#: the setup assistant, or the OS privacy settings of a missing permission.
 PROMPT_CALIBRATE = "calibrate"
 PROMPT_SETUP = "setup"
+PROMPT_PERMISSION = "permission"
+#: A ``permission_needed`` belongs to the controller notification emitted this
+#: recently (the controller emits both back to back).
+_PERMISSION_NOTICE_S = 1.0
+#: States the user is absent in. Entering one forgets which calibration reasons
+#: were announced, so the controller's reminder on their return is shown.
+_ABSENT_STATES = frozenset({TrackingState.AWAY, TrackingState.LOCKED, TrackingState.PRIVACY})
 #: How often Python gets control during the event loop, so Ctrl+C is handled.
 SIGNAL_POLL_MS = 500
 #: Delay before quitting on an IPC ``quit``, so the reply reaches the client.
@@ -214,8 +223,13 @@ def build_app(
     request = "calibrate" if options.calibrate else "show"
     lock = ipc.InstanceLock()
     owner = lock.acquire()
-    # The owner asks too: an instance of a version without the lock answers.
-    reply = ipc.send_command(request, wait_ms=0 if owner else ipc.STARTUP_WAIT_MS)
+    try:
+        # The owner asks too: an instance of a version without the lock answers.
+        # A launch that lost the lock waits for the winner to start listening.
+        reply = ipc.send_command(request, wait_ms=0 if owner else ipc.STARTUP_WAIT_MS)
+    except BaseException:
+        lock.release()  # never keep a later launch out after failing here
+        raise
     if reply is not None:
         lock.release()
         if reply.startswith("error"):
@@ -228,6 +242,7 @@ def build_app(
         _show_error(qt_app, f"{APP_NAME} is already running but does not respond.")
         return AppContext(qt_app, exit_code=1)
 
+    app: EyeTrackerApp | None = None
     try:
         app = _create_app(
             qt_app,
@@ -239,10 +254,13 @@ def build_app(
             controller_factory=controller_factory,
             controller_kwargs=controller_kwargs,
         )
+        # From here on the server owns the lock and releases it in close().
+        server = ipc.InstanceServer(app.handle_command, app, lock=lock)
     except BaseException:
         lock.release()  # never keep a later launch out after failing here
+        if app is not None:
+            app.shutdown()
         raise
-    server = ipc.InstanceServer(app.handle_command, app, lock=lock)
     if not server.listen():
         if server.another_instance_running:
             # Only possible where files cannot be locked: another instance
@@ -376,10 +394,19 @@ class EyeTrackerApp(QObject):
         #: Reasons announced with a "calibration needed" notification since the
         #: calibration was last usable (cleared when it is usable again).
         self._announced: set[str] = set()
-        #: The notification of ours on screen: (``PROMPT_*`` kind, when shown).
+        #: The clickable notification on screen: (``PROMPT_*`` kind, when shown).
         self._prompt: tuple[str, float] | None = None
+        #: The permission a ``PROMPT_PERMISSION`` notification is about.
+        self._prompt_permission: str | None = None
+        #: When the controller's latest notification was shown (see
+        #: _on_permission_needed); ``None`` once used or when it was not shown.
+        self._last_notice_at: float | None = None
+        #: The controller's latest notification, shown or not: (title, message, when).
+        self._last_notice: tuple[str, str, float] | None = None
         #: A reason that could not be announced while notifications were muted.
         self._deferred_reason: str | None = None
+        #: A permission notice swallowed by the startup mute: (name, title, message).
+        self._deferred_permission: tuple[str, str, str] | None = None
 
     # ---------------------------------------------------------------- accessors
     @property
@@ -447,7 +474,8 @@ class EyeTrackerApp(QObject):
         self._tray = tray
         self._overlay = GazeOverlay(controller, self)
         self._countdown = CountdownToast(controller)
-        self._curtain = PrivacyCurtain(controller, self)
+        curtain = PrivacyCurtain(controller, self)
+        self._curtain = curtain
         # Connected after the tray: any other notification replaces ours.
         controller.notify.connect(self._on_controller_notify)
 
@@ -457,6 +485,9 @@ class EyeTrackerApp(QObject):
         tray.open_about.connect(self.open_about)
         tray.quit_requested.connect(self.quit)
         tray.tray.messageClicked.connect(self._on_message_clicked)
+        # Esc or the button on the curtain: switching resumes (the guard stays on).
+        curtain.dismissed.connect(controller.dismiss_curtain)
+        controller.permission_needed.connect(self._on_permission_needed)
         if self._options.background:
             tray.mute_notifications(STARTUP_QUIET_S)
         tray.show()
@@ -697,21 +728,90 @@ class EyeTrackerApp(QObject):
         else:
             log.debug("Ignoring unknown UI request %r", command)
 
-    def _on_state_changed(self, _state: object) -> None:
+    def _on_state_changed(self, state: object) -> None:
         controller = self._controller
-        if controller is not None and controller.is_calibrated and self._announced:
+        if not self._announced or controller is None:
+            return
+        if controller.is_calibrated or state in _ABSENT_STATES:
             # Usable again (recalibrated, or back at a known desk): the next time
             # it stops being usable deserves a notification, even for a reason
             # announced before (docking at a new desk is "the monitor layout
-            # changed" every time).
+            # changed" every time). And after being away, locked or private,
+            # the controller reminds the user of a calibration that is still
+            # unusable, with the same reason as before: that must be shown too.
             self._announced.clear()
 
-    def _on_controller_notify(self, _title: str, _message: str) -> None:
+    def _on_controller_notify(self, title: str, message: str) -> None:
         # The tray shows one message at a time; ours has been replaced.
         self._prompt = None
+        self._prompt_permission = None
+        tray = self._tray
+        now = self._clock()
+        shown = tray is not None and tray.muted_for <= 0
+        self._last_notice_at = now if shown else None
+        self._last_notice = (str(title), str(message), now)
+
+    def _on_permission_needed(self, name: str) -> None:
+        """Make the notification that explains a missing permission clickable.
+
+        The controller emits ``permission_needed`` right after that ``notify``
+        (or without one when notifications are off, and then there is nothing to
+        click). Clicking opens the OS privacy settings for ``name``.
+
+        The controller says it only once, so a notice swallowed by the quiet
+        period of a login start (typically the Accessibility check at startup)
+        is shown once that period is over, if the permission is still missing.
+        """
+        shown_at, self._last_notice_at = self._last_notice_at, None
+        notice, self._last_notice = self._last_notice, None
+        now = self._clock()
+        if shown_at is not None and now - shown_at <= _PERMISSION_NOTICE_S:
+            self._prompt = (PROMPT_PERMISSION, now)
+            self._prompt_permission = str(name)
+            return
+        tray = self._tray
+        if (
+            notice is None
+            or now - notice[2] > _PERMISSION_NOTICE_S
+            or tray is None
+            or tray.muted_for <= 0
+        ):
+            return  # nothing was said (notifications off), so nothing to repeat
+        if self._deferred_permission is None:
+            self._after_quiet_period(self._announce_deferred_permission)
+        # One slot: a click can only open the settings of the notice shown last.
+        self._deferred_permission = (str(name), notice[0], notice[1])
+
+    def _announce_deferred_permission(self) -> None:
+        deferred, self._deferred_permission = self._deferred_permission, None
+        tray = self._tray
+        if deferred is None or self._closed or tray is None:
+            return
+        name, title, message = deferred
+        if not self._permission_still_needed(name):
+            return
+        # The controller applied the notifications setting when it sent it.
+        if tray.notify(title, message, force=True):
+            self._prompt = (PROMPT_PERMISSION, self._clock())
+            self._prompt_permission = name
+
+    def _permission_still_needed(self, name: str) -> bool:
+        """Whether permission ``name`` still blocks something (see _on_permission_needed)."""
+        controller = self._controller
+        if controller is None:
+            return False
+        if name == "camera":
+            return controller.state is TrackingState.CAMERA_ERROR
+        if name == "accessibility":
+            try:
+                return str(self._services.accessibility_status()) in ("missing", "stale")
+            except Exception:
+                log.debug("accessibility_status() failed", exc_info=True)
+        return True
 
     def _on_message_clicked(self) -> None:
         prompt, self._prompt = self._prompt, None
+        permission, self._prompt_permission = self._prompt_permission, None
         controller = self._controller
         if prompt is None or controller is None:
             return
@@ -722,6 +822,8 @@ class EyeTrackerApp(QObject):
             self.open_wizard()
         elif kind == PROMPT_CALIBRATE and not controller.is_calibrated:
             self.open_calibration("notification")
+        elif kind == PROMPT_PERMISSION and permission:
+            self._open_permission_settings(permission)
 
     # ------------------------------------------------------------------ helpers
     def _make_controller(self) -> Controller:
@@ -820,6 +922,16 @@ class EyeTrackerApp(QObject):
             return False
         calibration.start()  # only raises and refocuses the existing surfaces
         return True
+
+    def _open_permission_settings(self, name: str) -> None:
+        """Open the OS privacy settings page for permission ``name``. Never raises."""
+        try:
+            opened = self._services.open_permission_settings(name)
+        except Exception:
+            log.warning("Could not open the %s privacy settings", name, exc_info=True)
+            return
+        if not opened:
+            log.info("No privacy settings page to open for %s here", name)
 
     def _refresh_autostart(self) -> None:
         """Point the login item at this copy of the app if it moved (e.g. an

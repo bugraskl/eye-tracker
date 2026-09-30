@@ -354,7 +354,7 @@ def _active_profile() -> Path | None:
 
     ``paths`` keeps the override resolved (see ``paths.set_base_override``).
     """
-    return paths._override
+    return paths.base_override()
 
 
 def _profile_dir(config_dir: Path | str | None) -> Path | None:

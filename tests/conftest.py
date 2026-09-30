@@ -12,8 +12,9 @@ from pathlib import Path
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-os.environ.setdefault("GLOG_minloglevel", "2")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+# OpenCV reports every capture backend it probes for a missing camera or file on
+# stderr; the tests open such sources on purpose, so keep the output readable.
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 
 
 @pytest.fixture(scope="session")
@@ -21,7 +22,8 @@ def qapp():
     """A process-wide QApplication (created once, offscreen)."""
     from PySide6.QtWidgets import QApplication
 
-    app = QApplication.instance() or QApplication(["eye-tracker-tests"])
+    existing = QApplication.instance()
+    app = existing if isinstance(existing, QApplication) else QApplication(["eye-tracker-tests"])
     app.setQuitOnLastWindowClosed(False)
     return app
 

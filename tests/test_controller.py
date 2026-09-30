@@ -258,6 +258,11 @@ class FakeHotkeys:
 
 
 # --------------------------------------------------------------------------- helpers
+def run_now(job: Callable[[], None]) -> None:
+    """Synchronous ``lock_runner``."""
+    job()
+
+
 def features_for(x: float, y: float) -> np.ndarray:
     return np.array([x / FEATURE_SCALE, y / FEATURE_SCALE])
 
@@ -302,6 +307,7 @@ def make_calibration(
 
 def make_settings() -> Settings:
     s = Settings()
+    s.general.first_run_done = True  # walk-away actions only notify before that
     s.switching.smoothing = 0.0  # gaze == model output, exactly
     s.presence.away_timeout_s = 10
     s.presence.warning_s = 5
@@ -368,6 +374,7 @@ def make_controller(qapp: Any, app_dirs: Any) -> Iterator[Callable[..., Harness]
         platform: FakePlatform | None = None,
         hotkeys: FakeHotkeys | None = None,
         start: bool = True,
+        threaded_locks: bool = False,
     ) -> Harness:
         if calibrated:
             save_calibration(paths.calibration_file(), make_calibration())
@@ -391,6 +398,9 @@ def make_controller(qapp: Any, app_dirs: Any) -> Iterator[Callable[..., Harness]
             cursor=cursor,
             clock=clock,
             hotkey_manager_factory=lambda: hotkeys,
+            # Screen locks run on a thread in the app; synchronously here unless
+            # a test is about that thread.
+            lock_runner=None if threaded_locks else run_now,
         )
         created.append(controller)
         h = Harness(controller, platform, cursor, clock, hotkeys, monitors, workers)
@@ -1962,3 +1972,160 @@ def test_app_nap_is_allowed_only_while_paused_or_private(
     unlock_session(h)
     h.controller.set_privacy(True)
     assert h.platform.background == [True, False, True, False]
+
+
+# ------------------------------------------------------------- screen lock thread
+class SlowLockPlatform(FakePlatform):
+    """``lock_screen`` blocks until the test releases it (a hung screensaver)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.lock_threads: list[int] = []
+
+    def lock_screen(self) -> bool:
+        self.lock_threads.append(threading.get_ident())
+        self.entered.set()
+        assert self.release.wait(5.0), "the test never released the lock call"
+        return super().lock_screen()
+
+
+def finish_lock(h: Harness, qapp: Any) -> None:
+    """Let a slow lock call return and deliver its result to the main thread."""
+    platform = h.platform
+    assert isinstance(platform, SlowLockPlatform)
+    platform.release.set()
+    thread = h.controller._lock_thread
+    assert thread is not None
+    thread.join(5.0)
+    assert not thread.is_alive()
+    qapp.processEvents()  # the queued result
+
+
+def test_walk_away_lock_does_not_block_the_gui_thread(
+    make_controller: Callable[..., Harness], qapp: Any
+) -> None:
+    platform = SlowLockPlatform()
+    h = make_controller(platform=platform, threaded_locks=True)
+    h.feed(no_face(), 10.0, step=0.5)  # returns although lock_screen is still blocked
+    assert platform.entered.wait(5.0)
+    assert platform.lock_threads != [threading.get_ident()]
+    assert h.state is S.AWAY
+    h.feed(no_face(), 5.0, step=0.5)  # still away, still one lock request in flight
+    assert len(platform.lock_threads) == 1
+    finish_lock(h, qapp)
+    assert h.platform.names() == ["lock_screen"]
+    assert titles(h) == []
+    # The lock is noticed soon, so the camera is released promptly.
+    h.platform.locked = True
+    h.tick(0.6)
+    assert h.state is S.LOCKED
+
+
+def test_failed_walk_away_lock_notifies_from_the_thread_result(
+    make_controller: Callable[..., Harness], qapp: Any
+) -> None:
+    platform = SlowLockPlatform()
+    platform.lock_ok = False
+    h = make_controller(platform=platform, threaded_locks=True)
+    h.feed(no_face(), 10.0, step=0.5)
+    assert platform.entered.wait(5.0)
+    assert titles(h) == []  # nothing known yet
+    finish_lock(h, qapp)
+    assert titles(h) == ["Could not lock the screen"]
+
+
+def test_guard_lock_runs_on_a_thread_and_falls_back_to_the_curtain(
+    make_controller: Callable[..., Harness], qapp: Any
+) -> None:
+    platform = SlowLockPlatform()
+    platform.lock_ok = False
+    h = make_controller(guard_settings("lock"), platform=platform, threaded_locks=True)
+    h.feed(gaze_obs((500, 500), faces=2), 2.5)
+    assert platform.entered.wait(5.0)
+    assert h.events["guard_changed"] == []
+    finish_lock(h, qapp)
+    assert h.events["guard_changed"] == [True]  # the onlooker is still there
+
+
+def test_failed_guard_lock_after_the_onlooker_left_shows_no_curtain(
+    make_controller: Callable[..., Harness], qapp: Any
+) -> None:
+    platform = SlowLockPlatform()
+    platform.lock_ok = False
+    h = make_controller(guard_settings("lock"), platform=platform, threaded_locks=True)
+    h.feed(gaze_obs((500, 500), faces=2), 2.5)
+    assert platform.entered.wait(5.0)
+    h.feed(gaze_obs((500, 500)), 2.0)  # gone before the lock call returned
+    assert not h.controller.guard_active
+    finish_lock(h, qapp)
+    assert h.events["guard_changed"] == []
+
+
+def test_successful_guard_lock_from_the_thread_arms_the_relock_grace(
+    make_controller: Callable[..., Harness], qapp: Any
+) -> None:
+    platform = SlowLockPlatform()
+    h = make_controller(guard_settings("lock"), platform=platform, threaded_locks=True)
+    two = gaze_obs((500, 500), faces=2)
+    h.feed(two, 2.5)
+    assert platform.entered.wait(5.0)
+    finish_lock(h, qapp)
+    lock_session(h)
+    unlock_session(h)
+    h.feed(two, 5.0)  # the colleague is still there: the curtain, not another lock
+    assert h.platform.names().count("lock_screen") == 1
+    assert h.events["guard_changed"] == [True]
+
+
+def test_shutdown_waits_briefly_for_a_lock_in_progress(
+    make_controller: Callable[..., Harness],
+) -> None:
+    platform = SlowLockPlatform()
+    h = make_controller(platform=platform, threaded_locks=True)
+    h.feed(no_face(), 10.0, step=0.5)
+    assert platform.entered.wait(5.0)
+    thread = h.controller._lock_thread
+    assert thread is not None
+    threading.Timer(0.1, platform.release.set).start()
+    h.controller.shutdown()
+    assert not thread.is_alive()
+    assert titles(h) == []  # no result is handled after shutdown
+
+
+# ------------------------------------------------------------ first-run safety
+@pytest.mark.parametrize("action", ["lock", "lock_and_display_off", "display_off"])
+def test_walk_away_only_notifies_before_the_setup_is_finished(
+    make_controller: Callable[..., Harness], action: str
+) -> None:
+    """journeys-05: never lock (or blank) a PC whose owner has not finished setup."""
+    s = make_settings()
+    s.general.first_run_done = False
+    s.presence.action = action
+    h = make_controller(s)
+    h.feed(no_face(), 10.0, step=0.5)
+    assert h.state is S.AWAY
+    assert h.platform.names() == []  # neither locked nor displays off
+    assert titles(h) == ["Are you still there?"]
+    assert "Finish the setup" in h.events["notify"][0][1]
+
+    finished = h.controller.settings.copy()
+    finished.general.first_run_done = True
+    h.controller.apply_settings(finished)
+    h.push(gaze_obs((500, 500)))  # back ...
+    h.feed(no_face(), 10.0, step=0.5)  # ... and away again, after the setup
+    assert h.platform.names()[0] == ("display_off" if "display" in action else "lock_screen")
+
+
+def test_no_action_stays_silent_before_the_setup_is_finished(
+    make_controller: Callable[..., Harness],
+) -> None:
+    s = make_settings()
+    s.general.first_run_done = False
+    s.presence.action = "none"
+    h = make_controller(s)
+    h.feed(no_face(), 10.0, step=0.5)
+    assert h.state is S.AWAY
+    assert h.events["notify"] == []
+    assert h.platform.names() == []

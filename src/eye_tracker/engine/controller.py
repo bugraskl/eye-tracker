@@ -15,7 +15,8 @@ Threading
 Worker and hotkey callbacks arrive on foreign threads. They are marshalled to
 the main thread through private queued signals; a callback that already runs on
 the main thread is handled directly. Everything else runs on the main thread,
-so no locking is needed beyond the hand-off of preview frames.
+so no locking is needed beyond the hand-off of preview frames and the record of
+the backend the worker built.
 
 State
 -----
@@ -30,6 +31,28 @@ priority order::
 Deriving instead of transitioning means overlapping causes (paused *and* the
 session locked, say) resolve naturally when one of them ends. Whether the camera
 is open follows directly from the state (``TrackingState.camera_active``).
+Before the camera reopens after a pause, privacy mode or a locked session, the
+"another app uses the camera" check runs first, so a call that started
+meanwhile never has its camera grabbed.
+
+Calibrations
+------------
+The calibration file holds one profile per setup (monitor layout, vision
+backend, camera; see :class:`~eye_tracker.gaze.store.CalibrationLibrary`). The
+controller uses the profile that fits the current setup and switches profiles
+by itself when the setup changes (a laptop moving between docks), so a
+recalibration is only needed for a setup that was never calibrated. When the
+calibration becomes unusable ``calibration_required`` is emitted; if the user
+cannot be interrupted at that moment (away, locked, privacy mode, displays off)
+the announcement is delivered once they are back and the monitor layout has
+settled.
+
+Unreliable pointer position
+---------------------------
+On Wayland the pointer position Qt reports can be stale (an XWayland client
+only sees the pointer over X11 windows). There the monitor the pointer is on is
+taken to be the target of the last successful switch, and nothing is learned
+from the pointer position (manual moves, implicit labels, undone switches).
 
 Housekeeping
 ------------
@@ -37,7 +60,8 @@ A ``QTimer`` ticks every 100 ms while tracking (cursor polling resolution for th
 mouse/typing guards) and every 500 ms otherwise. Each tick polls input, records
 the focused window per monitor, checks for a locked session and for other apps
 wanting the camera (on slower schedules), advances the walk-away timers, adapts
-the camera frame rate and publishes statistics.
+the camera frame rate, delivers deferred calibration announcements and
+publishes statistics.
 """
 
 from __future__ import annotations
@@ -61,8 +85,9 @@ from PySide6.QtGui import QCursor, QGuiApplication
 from .. import __version__, paths
 from ..config import Settings
 from ..gaze.filters import PointFilter
-from ..gaze.learning import DriftMonitor, ImplicitLearner, refit_model
-from ..gaze.store import CalibrationData, load_calibration, save_calibration
+from ..gaze.learning import DriftMonitor, ImplicitLearner, plausible_label, refit_model
+from ..gaze.model import gaze_feature_indices
+from ..gaze.store import CalibrationData, CalibrationLibrary
 from ..platform.base import PlatformServices
 from ..trace import TraceWriter
 from ..types import (
@@ -123,7 +148,8 @@ SCREEN_DEBOUNCE_MS = 1000
 #: The worker interval is only updated when it changes by more than this fraction.
 RATE_TOLERANCE = 0.05
 #: Moving the mouse back to the previous monitor this soon after an automatic
-#: switch marks that switch as wrong (drift evidence).
+#: switch marks that switch as wrong (drift evidence); a switch left alone this
+#: long counts as correct.
 WRONG_SWITCH_S = 2.0
 #: During a blink the last gaze point is held for this long, so a blink does not
 #: restart the dwell toward another monitor.
@@ -142,6 +168,45 @@ STALE_OBSERVATION_S = 2.5
 TYPING_RATE_WINDOW_S = 2.0
 #: Minimum time between two "accuracy dropped" notifications.
 DRIFT_ALERT_COOLDOWN_S = 1800.0
+#: Consecutive observations the gaze model must reject (wrong feature vector)
+#: before the calibration is declared unusable. After a backend change a few
+#: frames analysed by the old backend are still on their way; they must not
+#: invalidate a calibration that fits the new one.
+FEATURE_MISMATCH_LIMIT = 5
+#: After the user unlocks a session the shoulder guard locked, a second face in
+#: view shows the privacy curtain instead of locking again for this long (or
+#: until the onlooker has left): otherwise a colleague sitting down next to the
+#: user would lock the screen again two seconds after every unlock.
+GUARD_RELOCK_GRACE_S = 300.0
+#: Consecutive refused pointer moves after which switching pauses (backing off
+#: from ``WARP_BACKOFF_S``, doubling up to ``WARP_BACKOFF_MAX_S``) instead of
+#: retrying after every cooldown.
+WARP_REFUSAL_LIMIT = 3
+WARP_BACKOFF_S = 60.0
+WARP_BACKOFF_MAX_S = 1800.0
+#: A deferred "calibration needed" announcement is delivered once the user could
+#: be interrupted for this long and no monitor change is pending: displays that
+#: drop out during sleep come back unchanged and must not prompt.
+ANNOUNCE_SETTLE_S = 2 * SCREEN_DEBOUNCE_MS / 1000.0
+#: When the user comes back (from away, a locked session or privacy mode) to a
+#: calibration that is still unusable, they are reminded, at most this often.
+CALIBRATION_REMINDER_S = 1800.0
+#: Blindness (lens covered, shutter closed, dark room) that begins within this
+#: many seconds of seeing the user's face or their input means the user covered
+#: the camera: walk-away detection then pauses instead of counting "no face".
+BLIND_ONSET_S = 3.0
+#: ...but for at most this long without any keyboard or mouse input: someone who
+#: switched the desk lamp off and left must still be locked out eventually.
+BLIND_FREEZE_MAX_S = 300.0
+#: Minimum time between two "camera appears covered" notifications.
+BLIND_NOTICE_COOLDOWN_S = 600.0
+#: The worker reports a camera failure only when its message changes, so a camera
+#: that still fails the same way after a pause would go unnoticed. With no frame
+#: this long after the camera was switched on, the worker's error is read back.
+CAMERA_ERROR_RECHECK_S = 8.0
+#: Consecutive failed window activations after which a missing Accessibility
+#: permission (macOS) is reported.
+ACTIVATION_FAILURE_LIMIT = 3
 
 #: IPC commands handled by :meth:`Controller.handle_command`.
 COMMANDS = (
@@ -166,6 +231,18 @@ HOTKEY_ACTIONS = ("toggle_tracking", "toggle_privacy", "recalibrate")
 _CAMERA_OFF = frozenset(
     {TrackingState.PAUSED, TrackingState.PRIVACY, TrackingState.LOCKED, TrackingState.YIELDED}
 )
+#: Camera-off states in which the camera-in-use check is skipped; leaving one
+#: re-runs it before the camera opens.
+_UNCHECKED_CAMERA_OFF = frozenset(
+    {TrackingState.PAUSED, TrackingState.PRIVACY, TrackingState.LOCKED}
+)
+#: States the user "comes back" from; a still unusable calibration is then
+#: announced again (see CALIBRATION_REMINDER_S).
+_ABSENT_STATES = frozenset({TrackingState.AWAY, TrackingState.LOCKED, TrackingState.PRIVACY})
+#: States in which the app may be napped by macOS: the user stopped tracking,
+#: and only their own action (hotkey, tray, IPC) resumes it. A locked session is
+#: not one: its end must be noticed promptly.
+_NAPPABLE_STATES = frozenset({TrackingState.PAUSED, TrackingState.PRIVACY})
 
 
 # ---------------------------------------------------------------------------- seams
@@ -310,12 +387,59 @@ def _backend_factory(settings: Settings, max_faces: int) -> BackendFactory:
     return factory
 
 
+def _backend_gaze_indices(backend: object) -> tuple[int, ...] | None:
+    """Indices of a backend's (class's or instance's) gaze-direction features."""
+    try:
+        return gaze_feature_indices(
+            tuple(getattr(backend, "feature_names", ())),
+            tuple(getattr(backend, "gaze_features", ())),
+        )
+    except Exception:
+        log.debug("Cannot read the gaze features of %r", backend, exc_info=True)
+        return None
+
+
+@functools.cache
+def _named_backend_gaze_indices(name: str) -> tuple[int, ...] | None:
+    """:func:`_backend_gaze_indices` for a backend known only by name (``None`` if unknown)."""
+    try:
+        from ..vision.backends import backend_class
+
+        cls = backend_class(name)
+    except Exception:
+        return None
+    return _backend_gaze_indices(cls)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _BuiltBackend:
+    """A backend the worker built through one of our factories."""
+
+    #: Which factory built it (see ``Controller._make_backend_factory``).
+    generation: int
+    #: ``(name, feature_version)``.
+    info: tuple[str, str]
+    #: Indices of its gaze-direction features (``None``: not declared).
+    gaze_indices: tuple[int, ...] | None
+
+
 def _layout_key(monitors: list[Monitor]) -> tuple[tuple[int, int, int, int, int], ...]:
     return tuple((m.index, m.rect.x, m.rect.y, m.rect.w, m.rect.h) for m in monitors)
 
 
 def _finite(value: float, digits: int = 2) -> float | None:
     return round(float(value), digits) if math.isfinite(value) else None
+
+
+def _known_size(size: tuple[int, int] | None) -> tuple[int, int] | None:
+    """``size`` as ``(w, h)`` ints if both are positive, else ``None`` (unknown)."""
+    if size is None:
+        return None
+    try:
+        w, h = int(size[0]), int(size[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    return (w, h) if w > 0 and h > 0 else None
 
 
 # ------------------------------------------------------------------------ controller
@@ -353,16 +477,30 @@ class Controller(QObject):
     away_warning = Signal(float)
     #: The countdown is over (the user came back, or it elapsed); hide the toast.
     away_cancelled = Signal()
-    #: Shoulder-guard curtain on/off (only emitted when ``guard_action == "curtain"``).
+    #: Shoulder-guard curtain on/off (for the "curtain" action, and as the fallback
+    #: of the "lock" action).
     guard_changed = Signal(bool)
     #: Annotated camera frame (BGR ``np.ndarray``) while the preview is enabled.
     preview_frame = Signal(object)
     #: A (re)calibration is needed or was requested; the argument is the reason.
+    #:
+    #: Emitted for explicit requests (``"hotkey"``, ``"ipc"``), when a usable
+    #: calibration becomes unusable (deferred until the user can be interrupted),
+    #: and as a reminder, at most every :data:`CALIBRATION_REMINDER_S`, when the
+    #: user comes back from away, a locked session or privacy mode to a
+    #: calibration that is still unusable. The same reason can therefore arrive
+    #: more than once; each emission is meant to be shown.
     calibration_required = Signal(str)
     #: Settings were applied (the new :class:`Settings`).
     settings_changed = Signal(object)
     #: An IPC command only the UI can perform: ``"show"``, ``"settings"`` or ``"quit"``.
     ui_requested = Signal(str)
+    #: A feature is blocked by an OS permission (``"camera"`` or
+    #: ``"accessibility"``). Emitted right after the ``notify`` that explains it
+    #: (also when informational notifications are turned off and that ``notify``
+    #: was not emitted), so the UI can open
+    #: ``platform.open_permission_settings(name)`` when the notification is clicked.
+    permission_needed = Signal(str)
 
     # Hand-off from foreign threads to the main thread (queued connections).
     _observation_received = Signal(object)
@@ -413,7 +551,10 @@ class Controller(QObject):
         self._yield_reason = ""
         self._away = False
         self._camera_error = False
-        self._preview = False
+        # Privacy mode as it was when a calibration began (restored afterwards).
+        self._privacy_before_calibration = False
+        # Consumers of preview frames (id of each owner, see set_preview).
+        self._preview_owners: set[int] = set()
 
         # Decision engine.
         self._decider = SwitchDecider([], SwitchConfig.from_settings(s.switching))
@@ -426,16 +567,26 @@ class Controller(QObject):
         self._learner = ImplicitLearner(max_samples=s.learning.max_samples)
         self._drift = DriftMonitor()
 
-        # Calibration.
+        # Calibration: every saved profile, and the one in use.
+        self._library = CalibrationLibrary()
         self._calibration: CalibrationData | None = None
         self._model: GazeModel | None = None  # set only while the calibration is usable
         self._calibration_reason = "not calibrated yet"
         self._implicit_dirty = False
+        self._feature_mismatches = 0
+        # "Calibration needed" announcements (see _announce_calibration).
+        self._announce_pending: str | None = None
+        self._interruptible_since: float | None = None
+        self._last_announce = -math.inf
 
         # What we know about the vision backend (for calibration compatibility).
         self._reported_backend: tuple[str, str] | None = None
-        self._stale_backend: tuple[str, str] | None = None
         self._expected_cache: tuple[str, tuple[str, str] | None] | None = None
+        # Every backend factory handed to the worker gets a generation number; the
+        # factory records what it built (on the worker thread, hence the lock).
+        self._backend_lock = threading.Lock()
+        self._backend_generation = 0
+        self._built_backend: _BuiltBackend | None = None
 
         # Worker.
         self._worker: WorkerLike | None = None
@@ -443,30 +594,55 @@ class Controller(QObject):
         self._mode = ""
         self._worker_stats = WorkerStats()
         self._camera_error_message: str | None = None
+        self._camera_on_since: float | None = None
+        self._frame_size: tuple[int, int] | None = None  # of the latest analysed frame
         self._preview_lock = threading.Lock()
         self._preview_pending: np.ndarray | None = None
 
         # Tracking transients.
         self._last_obs_time: float | None = None
         self._last_face: bool | None = None
+        self._face_seen_at: float | None = None
         self._last_gaze: tuple[float, float] | None = None
         self._last_gaze_time: float | None = None
+        self._looking_away = False
         self._gaze_none_sent = True
         self._gaze_moving_until = -math.inf
         self._pending = False
         self._last_switch: tuple[float, int | None, int] | None = None
         self._switch_count = 0
+
+        # Pointer: whether its reported position can be trusted (not on Wayland),
+        # and otherwise the monitor we last moved it to.
+        self._cursor_reliable = True
+        self._assumed_monitor: int | None = None
+        # Refused pointer moves (see _move_cursor).
+        self._warp_refusals = 0
+        self._warp_suspensions = 0
+        self._switching_suspended_until = -math.inf
         self._cursor_warning_shown = False
+        # Window activation failures (macOS Accessibility, see _check_accessibility).
+        self._activation_failures = 0
+        self._accessibility_notice_shown = False
+        self._background_active: bool | None = None
+
+        # Blind camera (see _face_verdict).
+        self._blind_since: float | None = None
+        self._blind_freeze = False
+        self._blind_notice_at = -math.inf
 
         # Presence / guard side effects.
         self._warning_shown = False
         self._displays_off_only = False
         self._curtain = False
+        self._guard_locked = False
+        self._guard_relock_until = -math.inf
 
         # Housekeeping schedule (set in start()).
         self._next_window_poll = math.inf
         self._next_lock_check = math.inf
         self._next_yield_check = math.inf
+        self._yield_checked_at = -math.inf
         self._next_stats = math.inf
         self._process: Any = None
         self._cpu_count = 1
@@ -498,6 +674,12 @@ class Controller(QObject):
             return
         now = self._clock()
         s = self._settings
+        self._cursor_reliable = bool(self._platform_call("cursor_position_reliable", default=True))
+        if not self._cursor_reliable:
+            log.info(
+                "The pointer position cannot be read reliably here (Wayland); the "
+                "current monitor is taken from the last switch"
+            )
         self._set_monitors(self._read_monitors())
         self._presence.reset(now)
         self._paused = self._paused or bool(s.general.start_paused)
@@ -505,7 +687,7 @@ class Controller(QObject):
 
         worker = self._worker_factory(
             _source_factory(s),
-            _backend_factory(s, self._max_faces()),
+            self._make_backend_factory(s),
             self._on_worker_observation,
             self._on_worker_stats,
             self._on_worker_preview,
@@ -515,7 +697,7 @@ class Controller(QObject):
         # locked session, privacy mode set before start()).
         worker.set_active(False)
         worker.set_max_faces(self._max_faces())
-        if self._preview:
+        if self._preview_owners:
             worker.set_preview(True)
         self._started = True
         self._apply_motion_gate()
@@ -536,6 +718,7 @@ class Controller(QObject):
         self._setup_hotkeys()
         self._connect_screens()
         self._timer.start(self._tick_interval())
+        self._check_accessibility()
         log.info(
             "Controller started: %s, %d monitor(s), calibration %s",
             self._state.value,
@@ -562,7 +745,6 @@ class Controller(QObject):
             except Exception:
                 log.warning("Stopping the vision worker failed", exc_info=True)
         if self._implicit_dirty and self._calibration is not None:
-            self._calibration.implicit_samples = self._learner.samples
             self._save_calibration(self._calibration, quiet=True)
         if self._trace is not None:
             self._trace.close()
@@ -591,7 +773,8 @@ class Controller(QObject):
 
     @property
     def preview_enabled(self) -> bool:
-        return self._preview
+        """At least one consumer wants preview frames (see :meth:`set_preview`)."""
+        return bool(self._preview_owners)
 
     @property
     def is_calibrated(self) -> bool:
@@ -655,8 +838,13 @@ class Controller(QObject):
         return list(self._monitors)
 
     def calibration(self) -> CalibrationData | None:
-        """The loaded calibration (also when it is not usable with the current layout)."""
+        """The calibration in use, or the most recent one when none fits the current
+        setup (then it is not usable; see :attr:`calibration_reason`)."""
         return self._calibration
+
+    def calibrations(self) -> list[CalibrationData]:
+        """Every saved calibration profile, most recently used first."""
+        return self._library.profiles
 
     def backend_info(self) -> tuple[str, str]:
         """``(name, feature_version)`` of the vision backend in use (or expected).
@@ -665,6 +853,31 @@ class Controller(QObject):
         """
         info = self._current_backend()
         return info if info is not None else ("", "")
+
+    def gaze_feature_indices(self) -> tuple[int, ...] | None:
+        """Indices of the gaze-direction features of the backend in use (or expected).
+
+        What ``calibration.evaluate(..., nonlinear=...)`` takes, so that a new
+        calibration applies nonlinear terms only to where the user looks, not to
+        where their head is. ``None`` when the backend declares none (or is unknown).
+        """
+        with self._backend_lock:
+            built = self._built_backend
+        if built is not None and built.generation == self._backend_generation:
+            return built.gaze_indices
+        info = self._current_backend()
+        return _named_backend_gaze_indices(info[0]) if info is not None else None
+
+    def camera_identity(self) -> tuple[str, tuple[int, int]]:
+        """``(device, (width, height))`` of the camera in use.
+
+        ``device`` is the camera device setting and the size is that of the frames
+        analysed most recently (``(0, 0)`` before the first). A new calibration
+        records both (``CalibrationData.camera`` and ``frame_size``) so that it is
+        only used with this camera; :meth:`finish_calibration` fills them in when
+        they are missing.
+        """
+        return (str(self._settings.camera.device), self._frame_size or (0, 0))
 
     def away_remaining(self) -> float:
         """Seconds until the walk-away action (meaningful during a countdown)."""
@@ -698,6 +911,8 @@ class Controller(QObject):
     def set_privacy(self, enabled: bool) -> None:
         """Privacy mode: the camera is fully released (its light goes off)."""
         enabled = bool(enabled)
+        # An explicit choice made during a calibration is what applies afterwards.
+        self._privacy_before_calibration = False
         if enabled == self._privacy:
             return
         self._privacy = enabled
@@ -707,28 +922,50 @@ class Controller(QObject):
     def toggle_privacy(self) -> None:
         self.set_privacy(not self._privacy)
 
-    def set_preview(self, enabled: bool) -> None:
-        """Deliver annotated camera frames through ``preview_frame`` (and sample faster)."""
-        enabled = bool(enabled)
-        if enabled == self._preview:
+    def set_preview(self, enabled: bool, owner: object | None = None) -> None:
+        """Deliver annotated camera frames through ``preview_frame`` (and sample faster).
+
+        Several consumers (the preview window, the first-run wizard) can want
+        frames at once; each passes itself as ``owner`` and frames flow while at
+        least one of them has enabled the preview. Calls without an owner share
+        one anonymous owner.
+        """
+        before = bool(self._preview_owners)
+        if enabled:
+            self._preview_owners.add(id(owner))
+        else:
+            self._preview_owners.discard(id(owner))
+        active = bool(self._preview_owners)
+        if active == before:
             return
-        self._preview = enabled
         if self._worker is not None:
-            self._worker.set_preview(enabled)
-        if not enabled:
+            self._worker.set_preview(active)
+        if not active:
             with self._preview_lock:
                 self._preview_pending = None
         self._update_rate(self._clock())
+
+    def dismiss_curtain(self) -> None:
+        """The user dismissed the privacy curtain: monitor switching resumes.
+
+        The shoulder guard stays active; it shows the curtain again only after the
+        second face has left and come back.
+        """
+        if self._curtain:
+            log.info("Privacy curtain dismissed by the user")
+            self._show_curtain(False)
 
     def begin_calibration(self) -> None:
         """Enter ``CALIBRATING``: the camera runs at the calibration rate and every
         observation is forwarded through ``observation``.
 
         An explicit calibration request needs the camera, so privacy mode is turned
-        off; a user pause is kept and resumes after the calibration.
+        off meanwhile; like a user pause, it applies again once the calibration is
+        finished or cancelled (unless it was changed during the calibration).
         """
         if self._calibrating:
             return
+        self._privacy_before_calibration = self._privacy
         if self._privacy:
             log.info("Privacy mode turned off to calibrate")
             self._privacy = False
@@ -737,15 +974,16 @@ class Controller(QObject):
         self._update_state()
 
     def finish_calibration(self, data: CalibrationData | None) -> None:
-        """Leave ``CALIBRATING``. ``data`` is saved and used; ``None`` means cancelled."""
+        """Leave ``CALIBRATING``. ``data`` is saved and used; ``None`` means cancelled.
+
+        ``data.camera`` and ``data.frame_size`` are filled in from
+        :meth:`camera_identity` when they are unknown. The calibration is stored
+        as the profile of the current setup; profiles of other setups are kept.
+        """
         if data is not None:
+            data = self._with_camera_identity(data)
+            self._use_profile(data, save=False)
             self._save_calibration(data, quiet=False)
-            self._calibration = data
-            self._learner.clear()
-            if data.implicit_samples:
-                self._learner.load(data.implicit_samples)
-            self._implicit_dirty = False
-            self._drift.reset()
             self._model = None  # force a fresh validation below
             self._validate_calibration(announce=False)
             self._reset_tracking()
@@ -755,6 +993,13 @@ class Controller(QObject):
                 log.info("Calibration saved (%s)", data.grade or "ungraded")
         elif self._calibrating:
             log.info("Calibration cancelled")
+            # The camera may have changed its frame size meanwhile (not judged
+            # during the calibration).
+            self._validate_calibration(announce=True)
+        if self._privacy_before_calibration and not self._privacy:
+            log.info("Privacy mode on again after the calibration")
+            self._privacy = True
+        self._privacy_before_calibration = False
         self._calibrating = False
         self._update_state()
         self._apply_motion_gate()
@@ -775,27 +1020,27 @@ class Controller(QObject):
         self._presence.set_config(PresenceConfig.from_settings(new.presence))
         self._guard.set_config(GuardConfig.from_settings(new.privacy))
         self._policy.set_profile(new.performance.profile)
-        self._learner.set_max_samples(new.learning.max_samples)
+        if self._learner.set_max_samples(new.learning.max_samples):
+            # The model still carries the influence of the dropped samples.
+            self._refit_after_trim()
 
         backend_changed = old.general.backend != new.general.backend
+        source_changed = old.camera != new.camera or _camera_fps(old) != _camera_fps(new)
         if backend_changed:
             self._expected_cache = None
+            # Unknown until the worker has built the new backend (which may even
+            # have the same identity as the old one); the settings decide meanwhile.
+            self._reported_backend = None
+        if source_changed:
+            self._frame_size = None  # known again with the first frame of the new source
         worker = self._worker
         if worker is not None:
             worker.set_max_faces(self._max_faces())
             self._apply_motion_gate()
-            source_changed = old.camera != new.camera or _camera_fps(old) != _camera_fps(new)
-            if backend_changed:
-                # The worker keeps reporting the old backend until the new one
-                # exists; ignore those reports meanwhile.
-                self._stale_backend = self._safe_backend_info()
-                self._reported_backend = None
             if source_changed or backend_changed:
                 worker.reconfigure(
                     source_factory=_source_factory(new) if source_changed else None,
-                    backend_factory=(
-                        _backend_factory(new, self._max_faces()) if backend_changed else None
-                    ),
+                    backend_factory=self._make_backend_factory(new) if backend_changed else None,
                 )
         if old.hotkeys != new.hotkeys and self._hotkeys is not None:
             self._register_hotkeys()
@@ -806,12 +1051,14 @@ class Controller(QObject):
                 self._update_guard(now, None)  # a disabled guard clears at once
             if old.privacy != new.privacy:
                 self._next_yield_check = now
-            if backend_changed:
+            if backend_changed or source_changed:
+                # Another backend or camera may need another calibration profile.
                 self._validate_calibration(announce=True)
             self._update_presence(now)
             self._update_state()
             self._update_rate(now, force=True)
             self._update_timer()
+            self._check_accessibility()
         log.info("Settings applied")
         self.settings_changed.emit(new)
 
@@ -886,6 +1133,7 @@ class Controller(QObject):
                 "backend": cal.backend,
                 "usable": self._model is not None,
                 "reason": self.calibration_reason,
+                "profiles": len(self._library),
             },
             "backend": self.backend_info()[0],
             "monitors": len(self._monitors),
@@ -905,6 +1153,7 @@ class Controller(QObject):
             return
         now = self._clock()
         self._poll_input(now)
+        self._settle_last_switch(now)
         if now >= self._next_window_poll:
             self._next_window_poll = now + WINDOW_POLL_S
             self._record_foreground_window()
@@ -915,8 +1164,10 @@ class Controller(QObject):
             self._next_yield_check = now + YIELD_POLL_S
             self._check_camera_yield(now)
         self._sync_backend_info()
+        self._recheck_camera_error(now)
         self._update_presence(now)
         self._update_state()
+        self._deliver_calibration_notice(now)
         self._update_rate(now)
         self._update_timer()
         if now >= self._next_stats:
@@ -928,7 +1179,9 @@ class Controller(QObject):
         if pos is None:
             return
         self._input.poll(now, pos)
-        if self._input.manual_move:
+        # A stale position (Wayland) says nothing about where the user put the
+        # pointer: no remembered positions, learning labels or undone switches.
+        if self._input.manual_move and self._cursor_reliable:
             self._on_manual_move(pos, now)
 
     def _on_manual_move(self, pos: tuple[int, int], now: float) -> None:
@@ -943,12 +1196,24 @@ class Controller(QObject):
         switched_at, source, _target = last
         if now - switched_at > WRONG_SWITCH_S:
             self._last_switch = None
+            self._drift.record_switch(True)
         elif monitor is not None and source is not None and monitor.index == source:
             # The user dragged the pointer straight back: that switch was wrong.
             self._last_switch = None
             self._drift.record_wrong_switch()
             log.debug("Automatic switch undone by the user")
             self._check_drift(now)
+
+    def _settle_last_switch(self, now: float) -> None:
+        """A switch the user left alone for WRONG_SWITCH_S was a correct one.
+
+        Recording those as well keeps the drift statistics honest: with adaptive
+        learning off, undone switches would otherwise be the only events.
+        """
+        last = self._last_switch
+        if last is not None and now - last[0] > WRONG_SWITCH_S:
+            self._last_switch = None
+            self._drift.record_switch(True)
 
     def _record_foreground_window(self) -> None:
         if self._state is not TrackingState.TRACKING or not self._settings.switching.focus_window:
@@ -977,15 +1242,26 @@ class Controller(QObject):
         self._away = False
         self._displays_off_only = False
         self._hide_countdown()
+        if self._guard_locked:
+            # The user just unlocked a lock the shoulder guard caused. If the
+            # onlooker is still there, cover the screens rather than lock again.
+            self._guard_locked = False
+            self._guard_relock_until = now + GUARD_RELOCK_GRACE_S
 
-    def _check_camera_yield(self, now: float) -> None:
-        if self._state in (
+    def _check_camera_yield(self, now: float, *, force: bool = False) -> None:
+        """Decide whether another app needs the camera (``_yield_reason``).
+
+        Skipped while the camera is off anyway or explicitly wanted, unless
+        ``force`` (the camera is about to be switched back on).
+        """
+        if not force and self._state in (
             TrackingState.PRIVACY,
             TrackingState.LOCKED,
             TrackingState.PAUSED,
             TrackingState.CALIBRATING,
         ):
-            return  # the camera is off anyway, or explicitly wanted
+            return
+        self._yield_checked_at = now
         p = self._settings.privacy
         apps = [a for a in p.pause_for_apps if a.strip()]
         reason = ""
@@ -1081,7 +1357,7 @@ class Controller(QObject):
     def _deliver_preview(self) -> None:
         with self._preview_lock:
             frame, self._preview_pending = self._preview_pending, None
-        if frame is not None and self._preview and not self._closed:
+        if frame is not None and self._preview_owners and not self._closed:
             self.preview_frame.emit(frame)
 
     def _handle_worker_stats(self, stats: WorkerStats) -> None:
@@ -1090,9 +1366,37 @@ class Controller(QObject):
         self._worker_stats = stats
         self._sync_backend_info()
         if self._state.camera_active:
-            error = bool(stats.last_error) and not stats.camera_open
-            self._set_camera_error(error, stats.last_error)
+            self._judge_camera(stats)
         self._update_state()
+
+    def _judge_camera(self, stats: WorkerStats) -> None:
+        """Set the camera error from the worker's statistics.
+
+        A backend that keeps failing counts too: the camera would look healthy
+        while nothing is analysed.
+        """
+        error = bool(stats.last_error) and (
+            not stats.camera_open or bool(stats.extra.get("backend_failing"))
+        )
+        self._set_camera_error(error, stats.last_error)
+
+    def _recheck_camera_error(self, now: float) -> None:
+        """Read the worker's error back when the camera stays silent after switching on.
+
+        The worker publishes an error only when its message changes, so a camera
+        that fails the same way as before a pause, lock or yield would otherwise
+        leave the state at TRACKING with no frames and walk-away detection frozen.
+        """
+        since = self._camera_on_since
+        if (
+            since is None
+            or self._camera_error
+            or self._last_obs_time is not None
+            or not self._state.camera_active
+            or now - since < CAMERA_ERROR_RECHECK_S
+        ):
+            return
+        self._judge_camera(self._safe_worker_stats())
 
     def _set_camera_error(self, error: bool, message: str | None) -> None:
         if error == self._camera_error:
@@ -1101,27 +1405,49 @@ class Controller(QObject):
             return
         self._camera_error = error
         self._camera_error_message = message if error else None
-        if error:
-            log.warning("Camera problem: %s", message)
-            self._notify("Camera unavailable", message or "The camera could not be opened.")
-        else:
+        if not error:
             log.info("Camera working again")
+            return
+        log.warning("Camera problem: %s", message)
+        permissions = self._platform_call("permissions", default=None)
+        if isinstance(permissions, dict) and permissions.get("camera") is False:
+            self._notify(
+                "Camera access blocked",
+                "The system privacy settings do not allow Eye Tracker to use the camera. "
+                "Allow camera access there; tracking starts by itself afterwards.",
+            )
+            self.permission_needed.emit("camera")
+        else:
+            self._notify("Camera unavailable", message or "The camera could not be opened.")
 
     # ============================================================== observations
     def _handle_observation(self, obs: Observation) -> None:
         if self._closed or not self._started or not self._state.camera_active:
             return  # a frame analysed just before the camera was switched off
         now = self._clock()
+        previous = self._last_obs_time
         self._last_obs_time = now
-        self._last_face = bool(obs.face_present)
         if self._camera_error:
             self._set_camera_error(False, None)  # frames arrive, so the camera works
             self._update_state()
+        face = self._face_verdict(obs, now)
+        self._note_frame_size(obs)
         self.observation.emit(obs)
         if self._state is TrackingState.CALIBRATING:
+            self._last_face = face
+            # The guard sees nothing meanwhile: no multi-face run may span the
+            # calibration and trigger on the first frame after it.
+            self._update_guard(now, None)
             self._update_rate(now)
             return
-        self._update_guard(now, int(obs.face_count))
+        if previous is None or now - previous > max(
+            STALE_OBSERVATION_S, 2.5 * (self._interval or 0.0)
+        ):
+            self._update_guard(now, None)  # the stream was interrupted: nothing is "continuous"
+        self._update_guard(now, None if obs.blind else int(obs.face_count), obs.face_box)
+        # A single face that is not the user's (they left, the onlooker stayed)
+        # is nobody at the keyboard as far as walk-away detection is concerned.
+        self._last_face = False if face and self._guard.owner_missing else face
         self._update_presence(now)
         self._update_state()
         self._last_decision = None
@@ -1132,6 +1458,64 @@ class Controller(QObject):
         self._update_timer()
         if self._trace is not None:
             self._write_trace(obs, now)
+
+    def _face_verdict(self, obs: Observation, now: float) -> bool | None:
+        """The observation's verdict for walk-away detection: face, no face, or
+        ``None`` when the camera cannot tell.
+
+        A blind frame (covered lens, closed shutter, dark room) cannot tell. If the
+        blindness began while the user was demonstrably there (face just seen, or
+        recent input), they covered the camera: presence pauses, for at most
+        BLIND_FREEZE_MAX_S without input. Blindness that begins after the face was
+        already gone (the user left, then the lights went out) keeps counting as
+        "nobody here", so the walk-away lock still happens.
+        """
+        if not obs.blind:
+            if self._blind_since is not None:
+                log.info("The camera sees again")
+                self._end_blind_episode()
+            present = bool(obs.face_present)
+            if present:
+                self._face_seen_at = now
+            return present
+        if self._blind_since is None:
+            self._blind_since = now
+            seen = self._face_seen_at
+            face_recent = seen is not None and now - seen <= BLIND_ONSET_S
+            input_recent = now - self._input.last_any_activity <= BLIND_ONSET_S
+            self._blind_freeze = face_recent or input_recent
+            log.info(
+                "The camera sees nothing (covered or dark)%s",
+                "; walk-away detection paused" if self._blind_freeze else "",
+            )
+            if self._blind_freeze and now - self._blind_notice_at >= BLIND_NOTICE_COOLDOWN_S:
+                self._blind_notice_at = now
+                self._notify(
+                    "Camera appears covered",
+                    "The camera sees nothing, so walk-away detection is paused. Uncover it, "
+                    "or turn on privacy mode to switch the camera off.",
+                )
+        if not self._blind_freeze:
+            return False
+        evidence = max(self._blind_since, self._input.last_any_activity)
+        if now - evidence > BLIND_FREEZE_MAX_S:
+            return False
+        return None
+
+    def _end_blind_episode(self) -> None:
+        self._blind_since = None
+        self._blind_freeze = False
+
+    def _note_frame_size(self, obs: Observation) -> None:
+        """Remember the camera's frame size; a new one can need another calibration."""
+        size = _known_size(obs.frame_size)
+        if size is None or size == self._frame_size:
+            return
+        self._frame_size = size
+        log.debug("Camera frames are %dx%d", *size)
+        # During a calibration the new profile is judged when it is finished.
+        if self._calibration is not None and self._state is not TrackingState.CALIBRATING:
+            self._validate_calibration(announce=True)
 
     def _write_trace(self, obs: Observation, now: float) -> None:
         trace = self._trace
@@ -1167,33 +1551,64 @@ class Controller(QObject):
         if self._model is None:
             return  # the calibration turned out to be unusable
         self._publish_gaze(gaze, now)
-        if self._settings.learning.adaptive:
+        if self._settings.learning.adaptive and not self._looking_away:
             self._learn(obs, now)
         cursor = self._cursor_pos()
-        current = monitor_at(self._monitors, cursor[0], cursor[1]) if cursor else None
+        current = self._current_monitor(cursor)
+        # No switching (and so no focus change) under the privacy curtain: focus
+        # would move to a hidden window, and Esc would no longer reach the curtain.
+        enabled = (
+            self._settings.switching.enabled
+            and not self._curtain
+            and now >= self._switching_suspended_until
+        )
         decision = self._decider.update(
             now,
             gaze,
-            current.index if current is not None else None,
+            current,
             self._input.last_mouse_activity,
             self._input.last_key_activity,
-            enabled=self._settings.switching.enabled,
+            enabled=enabled,
+            looking_away=self._looking_away,
         )
         self._pending = decision.pending
         self._last_decision = decision
         if decision.target is not None:
-            self._switch_to(decision.target, gaze, cursor, now)
+            self._switch_to(decision.target, gaze, cursor, current, now)
+
+    def _current_monitor(self, cursor: tuple[int, int] | None) -> int | None:
+        """Index of the monitor the pointer is on (``None`` if unknown)."""
+        if not self._cursor_reliable:
+            return self._assumed_monitor
+        monitor = monitor_at(self._monitors, cursor[0], cursor[1]) if cursor else None
+        return monitor.index if monitor is not None else None
 
     def _estimate_gaze(self, obs: Observation, now: float) -> tuple[float, float] | None:
+        self._looking_away = False
         model = self._model
         if model is None:
             return None
         if obs.usable and obs.features is not None:
             try:
-                raw = model.predict(obs.features)
+                away = model.looks_away(obs.features, self.gaze_feature_indices())
+                raw = None if away else model.predict(obs.features)
             except (ValueError, RuntimeError) as exc:
+                self._feature_mismatches += 1
+                if self._feature_mismatches < FEATURE_MISMATCH_LIMIT:
+                    # Most likely a frame the previous backend analysed.
+                    log.debug("Gaze model rejected the camera features: %s", exc)
+                    return None
                 log.warning("Gaze model rejected the camera features: %s", exc)
                 self._invalidate_calibration("the camera features no longer match the calibration")
+                return None
+            self._feature_mismatches = 0
+            if raw is None:
+                # Far outside the calibrated range (phone, desk, a person beside
+                # the screens): off screen. Forget the last point so a blink right
+                # after does not bring it back, and restart the filter.
+                self._looking_away = True
+                self._last_gaze = None
+                self._last_gaze_time = None
                 return None
             x, y = float(raw[0]), float(raw[1])
             if not (math.isfinite(x) and math.isfinite(y)):
@@ -1232,15 +1647,15 @@ class Controller(QObject):
         target: int,
         gaze: tuple[float, float] | None,
         cursor: tuple[int, int] | None,
+        current: int | None,
         now: float,
     ) -> None:
         monitor = next((m for m in self._monitors if m.index == target), None)
         if monitor is None:
             return
         sw = self._settings.switching
-        previous = monitor_at(self._monitors, cursor[0], cursor[1]) if cursor else None
-        if previous is not None and cursor is not None:
-            self._memory.record_cursor(previous.index, cursor)
+        if self._cursor_reliable and current is not None and cursor is not None:
+            self._memory.record_cursor(current, cursor)
 
         window = self._remembered_window(monitor) if sw.focus_window else None
         x, y = choose_cursor_target(
@@ -1253,22 +1668,39 @@ class Controller(QObject):
         # Warp first, then activate: input injected by activation fallbacks must
         # not be mistaken for the user typing (see InputTracker).
         self._input.note_programmatic_move((x, y), now)
-        self._move_cursor(x, y)
+        if not self._move_cursor(x, y, now):
+            # Nothing moved, so this was no switch: no focus change, no count. The
+            # decider armed its cooldown when it fired, so it retries after that.
+            return
         if sw.focus_window:
             if window is None:
                 found = self._platform_call("window_at", x, y)
                 window = found if isinstance(found, WindowRef) else None
             if window is not None:
-                if self._platform_call("activate_window", window, default=False):
-                    self._memory.record_window(monitor.index, window)
-                else:
-                    log.debug("Could not activate the window on monitor %d", monitor.index)
+                self._activate(monitor, window)
 
         self._decider.notify_switched(now, target)
-        self._last_switch = (now, previous.index if previous is not None else None, target)
+        self._assumed_monitor = target
+        if self._last_switch is not None:
+            self._drift.record_switch(True)  # the previous switch was kept until now
+        # Without a reliable pointer position an undone switch cannot be seen.
+        self._last_switch = (now, current, target) if self._cursor_reliable else None
         self._switch_count += 1
         log.debug("Switched to monitor %d (cursor %d, %d)", target, x, y)
         self.switched.emit(target)
+
+    def _activate(self, monitor: Monitor, window: WindowRef) -> None:
+        if self._platform_call("activate_window", window, default=False):
+            self._memory.record_window(monitor.index, window)
+            self._activation_failures = 0
+            return
+        log.debug("Could not activate the window on monitor %d", monitor.index)
+        self._activation_failures += 1
+        if self._activation_failures >= ACTIVATION_FAILURE_LIMIT:
+            # Activation also fails for ordinary reasons (Windows' foreground
+            # lock, a window that closed); only a missing permission is reported.
+            self._activation_failures = 0
+            self._check_accessibility()
 
     def _remembered_window(self, monitor: Monitor) -> WindowRef | None:
         """The last window used on ``monitor`` if it still exists and is still there."""
@@ -1288,21 +1720,40 @@ class Controller(QObject):
             return None
         return ref if rect == ref.rect else dataclasses.replace(ref, rect=rect)
 
-    def _move_cursor(self, x: int, y: int) -> bool:
+    def _move_cursor(self, x: int, y: int, now: float) -> bool:
+        """Warp the pointer; False if the system refused.
+
+        Refusals in a row pause switching (backing off) instead of retrying after
+        every cooldown, and the user is told once.
+        """
         try:
             result = self._cursor.set_pos(int(x), int(y))
         except Exception:
             log.warning("Moving the cursor failed", exc_info=True)
             result = False
-        ok = result is None or bool(result)
-        if not ok and not self._cursor_warning_shown:
-            self._cursor_warning_shown = True
-            self._notify(
-                "Cannot move the cursor",
-                "The system refused to move the mouse pointer. On Wayland, install "
-                "ydotool (see the documentation).",
+        if result is None or bool(result):
+            self._warp_refusals = 0
+            self._warp_suspensions = 0
+            self._switching_suspended_until = -math.inf
+            return True
+        self._warp_refusals += 1
+        log.info("The system refused to move the pointer (%d in a row)", self._warp_refusals)
+        if self._warp_refusals >= WARP_REFUSAL_LIMIT:
+            self._warp_suspensions += 1
+            delay = min(
+                WARP_BACKOFF_MAX_S, WARP_BACKOFF_S * 2 ** min(self._warp_suspensions - 1, 16)
             )
-        return ok
+            self._switching_suspended_until = now + delay
+            log.warning("Pointer moves keep failing; switching paused for %.0f s", delay)
+            if not self._cursor_warning_shown:
+                self._cursor_warning_shown = True
+                self._notify(
+                    "Cannot move the cursor",
+                    "The system keeps refusing to move the mouse pointer, so switching "
+                    "monitors is paused for now. On Wayland, install ydotool (see the "
+                    "documentation).",
+                )
+        return False
 
     # ------------------------------------------------------------------ learning
     def _learn(self, obs: Observation, now: float) -> None:
@@ -1312,9 +1763,21 @@ class Controller(QObject):
         sample = self._learner.on_observation(obs, now, self._monitor_index_at)
         if sample is None:
             return
-        self._implicit_dirty = True
-        self._drift.record(self._predicted_monitor(model, sample.features), sample.monitor_index)
+        predicted = self._predict_point(model, sample.features)
+        predicted_monitor = (
+            nearest_monitor(self._monitors, *predicted)[0].index
+            if predicted is not None and self._monitors
+            else None
+        )
+        # The comparison is drift evidence either way, also for a rejected label.
+        self._drift.record(predicted_monitor, sample.monitor_index)
         self._check_drift(now)
+        if predicted is not None and not plausible_label(predicted, sample, self._monitors):
+            # The pointer was parked while the user read elsewhere: not a label.
+            self._learner.discard_last()
+            log.debug("Ignored an implausible learning sample at %.0f, %.0f", sample.x, sample.y)
+            return
+        self._implicit_dirty = True
         if self._learner.should_refit():
             self._refit(cal, model)
 
@@ -1332,6 +1795,24 @@ class Controller(QObject):
         self._save_calibration(cal, quiet=True)
         log.info("Gaze model refined with %d learned samples", len(learned))
 
+    def _refit_after_trim(self) -> None:
+        """Refit the calibration after learned samples were dropped (smaller capacity)."""
+        cal = self._calibration
+        if cal is None or not cal.model.is_fitted:
+            return
+        learned = self._learner.samples
+        try:
+            refined = refit_model(cal.samples, learned, cal.model)
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            log.warning("Could not refit the gaze model: %s", exc)
+            return
+        cal.model = refined
+        cal.implicit_samples = learned
+        if self._model is not None:
+            self._model = refined
+        self._save_calibration(cal, quiet=True)
+        log.info("Gaze model refitted with the %d learned samples kept", len(learned))
+
     def _check_drift(self, now: float) -> None:
         if self._settings.learning.drift_alerts and self._drift.should_alert(
             now, DRIFT_ALERT_COOLDOWN_S
@@ -1341,16 +1822,15 @@ class Controller(QObject):
                 "Accuracy dropped — recalibrate? Choose Calibrate… in the tray menu.",
             )
 
-    def _predicted_monitor(self, model: GazeModel, features: np.ndarray) -> int | None:
-        if not self._monitors:
-            return None
+    @staticmethod
+    def _predict_point(model: GazeModel, features: np.ndarray) -> tuple[float, float] | None:
         try:
             px, py = (float(v) for v in model.predict(features))
         except (ValueError, RuntimeError):
             return None
         if not (math.isfinite(px) and math.isfinite(py)):
             return None
-        return nearest_monitor(self._monitors, px, py)[0].index
+        return (px, py)
 
     def _monitor_index_at(self, x: float, y: float) -> int | None:
         monitor = monitor_at(self._monitors, x, y)
@@ -1358,9 +1838,18 @@ class Controller(QObject):
 
     # ================================================================== presence
     def _update_presence(self, now: float) -> None:
-        events = self._presence.update(
-            now, self._presence_face(now), self._input.seconds_since_any(now)
-        )
+        face = self._presence_face(now)
+        if (
+            face is None
+            and self._presence.state is PresenceState.AWAY
+            and self._state.camera_active
+            and self._state is not TrackingState.CALIBRATING
+        ):
+            # The camera should be watching but cannot tell (it failed or stalled
+            # while the user was away). Input must still be able to prove their
+            # return; without input AWAY simply stays, as with "no face".
+            face = False
+        events = self._presence.update(now, face, self._input.seconds_since_any(now))
         self._handle_presence_events(events)
 
     def _presence_face(self, now: float) -> bool | None:
@@ -1442,18 +1931,33 @@ class Controller(QObject):
             self.away_cancelled.emit()
 
     # ===================================================================== guard
-    def _update_guard(self, now: float, face_count: int | None) -> None:
-        result = self._guard.update(now, face_count)
+    def _update_guard(
+        self,
+        now: float,
+        face_count: int | None,
+        face_box: tuple[float, float, float, float] | None = None,
+    ) -> None:
+        result = self._guard.update(now, face_count, face_box)
         if result == "trigger":
-            self._on_guard_trigger()
+            self._on_guard_trigger(now)
         elif result == "clear":
+            self._guard_relock_until = -math.inf  # the onlooker left
             self._show_curtain(False)
 
-    def _on_guard_trigger(self) -> None:
+    def _on_guard_trigger(self, now: float) -> None:
         action = self._settings.privacy.guard_action
         log.info("Shoulder guard: second face detected; action %s", action)
         if action == "lock":
-            if self._session_locked or self._platform_call("lock_screen", default=False):
+            if self._session_locked:
+                return
+            if now < self._guard_relock_until:
+                log.info("Shoulder guard: showing the curtain instead of locking again")
+                self._show_curtain(True)
+                return
+            if self._platform_call("lock_screen", default=False):
+                self._guard_locked = True
+                # Notice the lock soon so the camera is released promptly.
+                self._next_lock_check = min(self._next_lock_check, now + 0.5)
                 return
             log.warning("Could not lock the screen; showing the privacy curtain instead")
             self._show_curtain(True)
@@ -1502,6 +2006,20 @@ class Controller(QObject):
         new = self._derive_state()
         if new is self._state:
             return
+        if (
+            self._started
+            and self._state in _UNCHECKED_CAMERA_OFF
+            and new.camera_active
+            and new is not TrackingState.CALIBRATING
+        ):
+            # The camera is about to reopen, but whether another app uses it was
+            # not checked while it was off: a call may have started meanwhile.
+            now = self._clock()
+            self._check_camera_yield(now, force=True)
+            self._next_yield_check = now + YIELD_POLL_S
+            new = self._derive_state()
+            if new is self._state:
+                return
         old, self._state = self._state, new
         log.info("State: %s -> %s", old.value, new.value)
         self._enter_state(old, new, self._clock())
@@ -1510,12 +2028,20 @@ class Controller(QObject):
     def _enter_state(self, old: TrackingState, new: TrackingState, now: float) -> None:
         if self._worker is not None:
             self._worker.set_active(new.camera_active)
+        if new.camera_active and (old is TrackingState.STARTING or not old.camera_active):
+            self._camera_on_since = now
         if not new.camera_active:
             # Judged afresh once the camera is back on.
+            self._camera_on_since = None
             self._camera_error = False
             self._last_obs_time = None
             self._last_face = None
+            self._end_blind_episode()
             self._clear_guard()
+        elif new in (TrackingState.CALIBRATING, TrackingState.CAMERA_ERROR):
+            # No observations reach the guard in these states; a run in progress
+            # must not survive them.
+            self._update_guard(now, None)
         if not new.camera_active or new is TrackingState.CALIBRATING:
             # Time without a camera verdict never counts as absence.
             self._handle_presence_events(self._presence.update(now, None, None))
@@ -1523,8 +2049,17 @@ class Controller(QObject):
             self._reset_tracking()
         if TrackingState.CALIBRATING in (old, new):
             self._apply_motion_gate()
-        if old in _CAMERA_OFF or old is TrackingState.CALIBRATING:
+        if (old in _CAMERA_OFF or old is TrackingState.CALIBRATING) and (
+            self._yield_checked_at != now
+        ):
             self._next_yield_check = min(self._next_yield_check, now)
+        if (
+            old in _ABSENT_STATES
+            and new not in _ABSENT_STATES
+            and new is not TrackingState.CALIBRATING
+        ):
+            self._remind_calibration(now)
+        self._set_background_activity(new not in _NAPPABLE_STATES)
         self._update_rate(now)
         self._update_timer()
 
@@ -1534,6 +2069,8 @@ class Controller(QObject):
         self._pending = False
         self._last_gaze = None
         self._last_gaze_time = None
+        self._looking_away = False
+        self._feature_mismatches = 0
         self._gaze_moving_until = -math.inf
         self._publish_gaze(None, 0.0)
 
@@ -1550,7 +2087,7 @@ class Controller(QObject):
             < max(TYPING_RATE_WINDOW_S, sw.typing_grace_ms / 1000.0),
             face_present=self._last_face is not False,
             presence_warning=self._presence.state is PresenceState.WARNING,
-            preview=self._preview,
+            preview=bool(self._preview_owners),
         )
         interval = self._policy.interval(ctx)
         self._mode = self._policy.mode(ctx)
@@ -1586,68 +2123,196 @@ class Controller(QObject):
     def _max_faces(self) -> int:
         return 2 if self._settings.privacy.shoulder_guard else 1
 
+    def _set_background_activity(self, active: bool) -> None:
+        """Keep timers unthrottled while tracking (macOS App Nap); a no-op elsewhere."""
+        if active == self._background_active:
+            return
+        self._background_active = active
+        self._platform_call("set_background_activity", active)
+
     # =============================================================== calibration
     def _load_calibration(self) -> None:
-        data = load_calibration(paths.calibration_file())
+        self._library = CalibrationLibrary.load(paths.calibration_file())
+        self._use_profile(self._library.latest, save=False)
+        if self._calibration is None:
+            self._calibration_reason = "not calibrated yet"
+
+    def _use_profile(self, data: CalibrationData | None, *, save: bool) -> None:
+        """Make ``data`` the calibration in use, with its own learned samples.
+
+        The samples learned for the previous profile are kept in that profile.
+        ``save`` also marks ``data`` as the most recently used and writes the file.
+        """
+        if data is self._calibration:
+            return
+        self._flush_learned()
         self._calibration = data
         self._model = None
-        if data is None:
-            self._calibration_reason = "not calibrated yet"
-            return
         self._learner.clear()
-        if data.implicit_samples:
+        if data is not None and data.implicit_samples:
             self._learner.load(data.implicit_samples)
+        self._implicit_dirty = False
+        self._drift.reset()
+        self._feature_mismatches = 0
+        if save and data is not None and self._library.mark_used(data):
+            self._write_library(quiet=True)
 
-    def _save_calibration(self, data: CalibrationData, *, quiet: bool) -> None:
+    def _flush_learned(self) -> None:
+        """Copy unsaved learned samples into the calibration they belong to."""
+        if self._implicit_dirty and self._calibration is not None:
+            self._calibration.implicit_samples = self._learner.samples
+
+    def _with_camera_identity(self, data: CalibrationData) -> CalibrationData:
+        """``data`` with the camera device and frame size filled in where unknown."""
+        changes: dict[str, Any] = {}
+        if not data.camera.strip():
+            changes["camera"] = str(self._settings.camera.device)
+        if _known_size(data.frame_size) is None and self._frame_size is not None:
+            changes["frame_size"] = self._frame_size
+        return dataclasses.replace(data, **changes) if changes else data
+
+    def _save_calibration(self, data: CalibrationData, *, quiet: bool) -> bool:
+        """Store ``data`` as the most recently used profile and write the file."""
+        self._flush_learned()
+        self._library.put(data)
+        return self._write_library(quiet=quiet)
+
+    def _write_library(self, *, quiet: bool) -> bool:
         try:
-            save_calibration(paths.calibration_file(), data)
+            self._library.save(paths.calibration_file())
         except (OSError, ValueError) as exc:
             log.error("Could not save the calibration: %s", exc)
             if not quiet:
                 self._notify("Calibration not saved", str(exc), force=True)
-            return
+            return False
         self._implicit_dirty = False
+        return True
 
     def _validate_calibration(self, *, announce: bool) -> None:
-        """Decide whether the calibration fits the backend and monitors in use."""
-        data = self._calibration
+        """Decide which calibration fits the backend, monitors and camera in use.
+
+        The profile in use is kept while it fits; otherwise the best saved profile
+        for the current setup is taken (and learned samples follow it). Without
+        one the calibration is unusable and, if it was usable and ``announce``,
+        ``calibration_required`` is emitted (now or once the user is back).
+        """
         was_usable = self._model is not None
-        if data is None:
-            self._model = None
-            self._calibration_reason = "not calibrated yet"
-            return
-        if not self._monitors:
+        if not self._monitors and self._calibration is not None:
             return  # nothing to compare with; keep the current verdict
-        info = self._current_backend()
-        if info is not None:
-            ok, reason = data.is_compatible(info[0], info[1], self._monitors)
-        elif not data.model.is_fitted:
-            ok, reason = False, "the calibration has no fitted model"
-        elif layout_signature(self._monitors) != data.layout_signature:
-            ok, reason = False, "the monitor layout changed"
-        else:
-            # Backend unknown (none installed?): the layout is all that can be checked.
-            ok, reason = True, ""
-        if ok:
-            if not was_usable:
+        data, reason = self._match_profile()
+        if data is not None:
+            switched = data is not self._calibration
+            if switched:
+                log.info(
+                    "Using the calibration of %s for this setup",
+                    data.created_at or "an earlier session",
+                )
+                self._use_profile(data, save=True)
+            if not was_usable or switched:
                 log.info("Calibration is usable")
                 self._reset_tracking()
             self._model = data.model
             self._calibration_reason = ""
+            self._announce_pending = None
+            self._interruptible_since = None
             return
         self._model = None
         self._calibration_reason = reason
         if was_usable:
             log.warning("Calibration no longer usable: %s", reason)
-            if announce and self._may_interrupt():
-                self.calibration_required.emit(reason)
+            if announce:
+                self._announce_calibration(reason)
+
+    def _match_profile(self) -> tuple[CalibrationData | None, str]:
+        """The profile to use for the current setup, or ``(None, reason)``."""
+        current = self._calibration
+        info = self._current_backend()
+        camera = str(self._settings.camera.device)
+        frame_size = self._frame_size
+        if info is not None:
+            name, version = info
+            reason = "not calibrated yet"
+            if current is not None:
+                ok, reason = current.is_compatible(
+                    name, version, self._monitors, camera=camera, frame_size=frame_size
+                )
+                if ok:
+                    return current, ""
+            data, why = self._library.match(
+                name, version, self._monitors, camera=camera, frame_size=frame_size
+            )
+            if data is not None:
+                return data, ""
+            return None, reason if current is not None else why
+        # Backend unknown (none installed?): the layout is all that can be checked.
+        signature = layout_signature(self._monitors)
+
+        def fits(p: CalibrationData) -> bool:
+            return p.model.is_fitted and p.layout_signature == signature
+
+        if current is not None and fits(current):
+            return current, ""
+        other = next((p for p in self._library if fits(p)), None)
+        if other is not None:
+            return other, ""
+        if current is None:
+            return None, "not calibrated yet"
+        if not current.model.is_fitted:
+            return None, "the calibration has no fitted model"
+        return None, "the monitor layout changed"
 
     def _invalidate_calibration(self, reason: str) -> None:
         was_usable = self._model is not None
         self._model = None
         self._calibration_reason = reason
-        if was_usable and self._may_interrupt():
-            self.calibration_required.emit(reason)
+        if was_usable:
+            self._announce_calibration(reason)
+
+    def _announce_calibration(self, reason: str) -> None:
+        """Emit ``calibration_required`` now, or once the user can be interrupted."""
+        if self._may_interrupt():
+            self._emit_calibration_required(reason)
+        else:
+            log.debug("Calibration announcement deferred: %s", reason)
+            self._announce_pending = reason
+            self._interruptible_since = None
+
+    def _remind_calibration(self, now: float) -> None:
+        """The user is back (from away, a lock or privacy mode): remind them of a
+        calibration that is still unusable, unless that was said recently."""
+        if (
+            self._calibration is None
+            or self._model is not None
+            or self._announce_pending is not None
+            or now - self._last_announce < CALIBRATION_REMINDER_S
+        ):
+            return
+        self._announce_pending = self._calibration_reason
+        self._interruptible_since = None
+
+    def _deliver_calibration_notice(self, now: float) -> None:
+        """Deliver a deferred announcement once the user has been interruptible for
+        ANNOUNCE_SETTLE_S with no monitor change pending."""
+        if self._announce_pending is None:
+            return
+        if self._model is not None:
+            self._announce_pending = None  # usable again: nothing to say
+            self._interruptible_since = None
+            return
+        if not self._may_interrupt() or self._screen_timer.isActive():
+            self._interruptible_since = None
+            return
+        if self._interruptible_since is None:
+            self._interruptible_since = now
+            return
+        if now - self._interruptible_since >= ANNOUNCE_SETTLE_S:
+            self._emit_calibration_required(self._calibration_reason or self._announce_pending)
+
+    def _emit_calibration_required(self, reason: str) -> None:
+        self._announce_pending = None
+        self._interruptible_since = None
+        self._last_announce = self._clock()
+        self.calibration_required.emit(reason)
 
     def _may_interrupt(self) -> bool:
         """Whether a calibration prompt is appropriate right now.
@@ -1664,10 +2329,43 @@ class Controller(QObject):
         )
 
     # =================================================================== backend
+    def _make_backend_factory(self, settings: Settings) -> BackendFactory:
+        """A backend factory for the worker that records what it built.
+
+        Every factory gets a new generation number. The worker keeps reporting its
+        previous backend until it has built the new one, and the new backend can
+        even have the same identity (``auto`` falling back to ``lite`` again), so
+        identities alone cannot tell a stale report from a fresh one.
+        """
+        self._backend_generation += 1
+        generation = self._backend_generation
+        create = _backend_factory(settings, self._max_faces())
+
+        def factory() -> VisionBackend:  # worker thread
+            backend = create()
+            built = _BuiltBackend(
+                generation,
+                (str(backend.name), str(backend.feature_version)),
+                _backend_gaze_indices(backend),
+            )
+            with self._backend_lock:
+                self._built_backend = built
+            return backend
+
+        return factory
+
     def _safe_backend_info(self) -> tuple[str, str] | None:
         worker = self._worker
         if worker is None:
             return None
+        with self._backend_lock:
+            built = self._built_backend
+        if built is not None:
+            # Only the backend built by the latest factory counts.
+            return built.info if built.generation == self._backend_generation else None
+        if self._backend_generation > 1:
+            return None  # a new backend was requested and is not built yet
+        # The worker never used our factory (a test double): trust what it says.
         try:
             info = worker.backend_info
         except Exception:
@@ -1680,10 +2378,8 @@ class Controller(QObject):
         info = self._safe_backend_info()
         if info is None or info == self._reported_backend:
             return
-        if self._stale_backend is not None and info == self._stale_backend:
-            return  # still the backend from before a reconfigure
-        self._stale_backend = None
         self._reported_backend = info
+        self._feature_mismatches = 0
         log.debug("Vision backend in use: %s (%s)", *info)
         self._validate_calibration(announce=True)
 
@@ -1716,6 +2412,35 @@ class Controller(QObject):
             except Exception:
                 log.debug("Reading worker stats failed", exc_info=True)
         return self._worker_stats
+
+    # ============================================================ permissions
+    def _check_accessibility(self) -> None:
+        """Tell the user (once) when focus cannot follow the gaze for lack of the
+        macOS Accessibility permission, or because it belongs to an older build."""
+        sw = self._settings.switching
+        if (
+            self._accessibility_notice_shown
+            or not (sw.enabled and sw.focus_window)
+            or len(self._monitors) < 2
+        ):
+            return
+        status = self._platform_call("accessibility_status")
+        if status not in ("missing", "stale"):
+            return
+        self._accessibility_notice_shown = True
+        if status == "stale":
+            message = (
+                "Keyboard focus cannot follow your gaze: the Accessibility permission "
+                "belongs to a previous version of Eye Tracker. In System Settings › Privacy "
+                "& Security › Accessibility, remove Eye Tracker with “−” and add it again."
+            )
+        else:
+            message = (
+                "Keyboard focus cannot follow your gaze until Eye Tracker may control "
+                "your computer: System Settings › Privacy & Security › Accessibility."
+            )
+        self._notify("Accessibility access needed", message, force=True)
+        self.permission_needed.emit("accessibility")
 
     # =================================================================== hotkeys
     def _setup_hotkeys(self) -> None:
@@ -1760,13 +2485,31 @@ class Controller(QObject):
                 log.warning("Registering hotkey %s failed", combo, exc_info=True)
                 ok = False
             if not ok:
-                failed.append(combo)
+                reason = self._hotkey_error(manager, name)
+                failed.append(
+                    reason or f"{combo} could not be registered (invalid, or used by another app)"
+                )
         if failed:
             self._notify(
                 "Hotkey unavailable",
-                f"{', '.join(failed)} could not be registered (invalid, or used by another "
-                "app). Choose another in Settings → Hotkeys.",
+                "; ".join(failed) + ". Choose another in Settings → Hotkeys.",
             )
+
+    @staticmethod
+    def _hotkey_error(manager: HotkeyManager, name: str) -> str | None:
+        """The manager's explanation of why ``name`` is not registered, if it has one."""
+        getter = getattr(manager, "last_error", None)
+        if not callable(getter):
+            return None
+        try:
+            reason = getter(name)
+        except Exception:
+            log.debug("Reading the hotkey error failed", exc_info=True)
+            return None
+        if not reason:
+            return None
+        # Joined into one sentence with the others; the caller adds the full stop.
+        return str(reason).strip().rstrip(".") or None
 
     def _on_hotkey(self, name: str) -> None:  # hotkey thread (or the main thread on macOS)
         if self._closed:
@@ -1833,6 +2576,13 @@ class Controller(QObject):
         self._decider.set_monitors(self._monitors)
         sides = [min(m.rect.w, m.rect.h) for m in self._monitors if m.rect.w > 0 and m.rect.h > 0]
         self._min_side = float(min(sides)) if sides else 1000.0
+        if not self._cursor_reliable and not any(
+            m.index == self._assumed_monitor for m in self._monitors
+        ):
+            # A stale position is still the best guess until the first switch.
+            cursor = self._cursor_pos()
+            monitor = monitor_at(self._monitors, *cursor) if cursor else None
+            self._assumed_monitor = monitor.index if monitor is not None else None
 
     # ==================================================================== helpers
     def _cursor_pos(self) -> tuple[int, int] | None:
@@ -1844,9 +2594,16 @@ class Controller(QObject):
         return (int(x), int(y))
 
     def _platform_call(self, name: str, *args: Any, default: Any = None) -> Any:
-        """Call a platform method; the contract says they never raise, but be safe."""
+        """Call a platform method; the contract says they never raise, but be safe.
+
+        A method this platform does not have (an optional, platform-specific one
+        such as ``accessibility_status``) returns ``default``.
+        """
+        method = getattr(self._platform, name, None)
+        if method is None:
+            return default
         try:
-            return getattr(self._platform, name)(*args)
+            return method(*args)
         except Exception:
             log.debug("Platform call %s failed", name, exc_info=True)
             return default

@@ -54,6 +54,7 @@ __all__ = [
     "TEXT_MUTED",
     "WARNING",
     "accent_gradient",
+    "autostart_status",
     "controller_monitors",
     "controller_settings",
     "controller_state",
@@ -249,6 +250,24 @@ def controller_settings(controller: object) -> Settings:
     return value if isinstance(value, Settings) else Settings()
 
 
+def autostart_status(backend: object) -> str:
+    """``status().value`` of an autostart backend: ``"enabled"``, ``"disabled"``,
+    ``"stale"`` or ``"other-profile"`` (see :mod:`eye_tracker.platform.autostart`).
+
+    ``""`` when the backend has no ``status`` or it fails (a test fake, an older
+    module): only the plain "enabled or not" view is known then. Never raises.
+    """
+    status = getattr(backend, "status", None)
+    if not callable(status):
+        return ""
+    try:
+        value = status()
+    except Exception:
+        log.debug("Reading the start-at-login status failed", exc_info=True)
+        return ""
+    return str(getattr(value, "value", value) or "")
+
+
 def controller_state(controller: object) -> TrackingState:
     """The controller's current :class:`TrackingState` (``STARTING`` if unknown)."""
     value = getattr(controller, "state", None)
@@ -298,6 +317,14 @@ def system_tray_is_dark() -> bool:
 
 
 def _windows_personalize_value(name: str) -> int | None:
+    """A DWORD under ``HKCU\\...\\Themes\\Personalize``; ``None`` when unreadable.
+
+    The platform check comes first so that mypy, which type-checks for one
+    ``sys.platform`` at a time (CI runs it on Linux), sees ``winreg`` only where
+    typeshed defines its members.
+    """
+    if sys.platform != "win32":
+        return None
     try:
         import winreg
 

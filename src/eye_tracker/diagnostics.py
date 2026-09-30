@@ -3,8 +3,10 @@
 :func:`collect_report` gathers everything useful for a bug report into a
 JSON-friendly dict and :func:`format_report` renders it for humans. Collection
 never fails as a whole: a section that cannot be gathered carries an ``error``
-entry instead. Paths are shown relative to the home directory (``~``) so a
-pasted report does not reveal the user's account name.
+entry instead. The report is meant to be pasted into public bug reports, so it
+must not reveal the user's account name: paths are shown relative to the home
+directory (``~``), camera files by their name only, and nothing derived from
+the user name (such as the instance socket name) is included.
 
 :func:`run_bench` measures what the vision pipeline costs on this machine, once
 as fast as possible and once at the rate the app uses while you sit still.
@@ -14,7 +16,6 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
-import importlib.util
 import json
 import logging
 import os
@@ -35,8 +36,6 @@ from .platform.base import PlatformServices
 from .types import Monitor, Rect, layout_signature, virtual_bounds
 
 __all__ = [
-    "MODEL_FILES",
-    "MODEL_SHA256",
     "BenchError",
     "collect_report",
     "current_monitors",
@@ -48,19 +47,6 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-#: Model file used by each vision backend.
-MODEL_FILES: dict[str, str] = {
-    "mediapipe": "face_landmarker.task",
-    "opencv": "face_detection_yunet_2023mar.onnx",
-}
-#: Pinned checksums of the bundled models (see scripts/fetch_models.py).
-MODEL_SHA256: dict[str, str] = {
-    "face_landmarker.task": "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff",
-    "face_detection_yunet_2023mar.onnx": (
-        "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
-    ),
-}
-
 _DISTRIBUTIONS = {
     "numpy": ("numpy",),
     "opencv": (
@@ -69,11 +55,22 @@ _DISTRIBUTIONS = {
         "opencv-contrib-python-headless",
         "opencv-contrib-python",
     ),
-    "mediapipe": ("mediapipe",),
     "PySide6": ("PySide6-Essentials", "PySide6"),
     "psutil": ("psutil",),
     "platformdirs": ("platformdirs",),
 }
+
+#: Things worth knowing on Linux that are not problems (shown under "OS integration").
+_LINUX_CAMERA_NOTE = (
+    "apps that open /dev/video* are noticed (refused attempts too, via fanotify on "
+    "Linux 5.13+); apps using the PipeWire camera portal are not: add them to "
+    "'Pause while these apps run' (e.g. zoom, teams-for-linux, skypeforlinux, obs)"
+)
+_WAYLAND_CURSOR_NOTE = (
+    "moved exactly with swaymsg (sway) or hyprctl (Hyprland); elsewhere it needs "
+    "ydotool 1.x with ydotoold running and a flat pointer-acceleration profile for "
+    "ydotool's virtual device (ydotool 0.1 is not supported)"
+)
 
 #: Shown for empty values. Reports are pasted into bug reports and printed on
 #: consoles with legacy code pages, so the text output is kept ASCII-only.
@@ -113,7 +110,7 @@ def collect_report(probe_cameras: bool = False) -> dict[str, Any]:
         "paths": _safe(_paths_section),
         "settings": settings_info,
     }
-    report["calibration"] = _safe(lambda: _calibration_section(report))
+    report["calibration"] = _safe(lambda: _calibration_section(report, settings))
     report["problems"] = _problems(report)
     return report
 
@@ -297,20 +294,26 @@ def _libraries_section() -> dict[str, Any]:
 
 
 def _backends_section(settings: Settings) -> dict[str, Any]:
-    from .vision.backends import BackendUnavailable, available_backends, backend_class
+    from .vision.backends import (
+        BACKEND_MODEL_FILES,
+        MODEL_FILES,
+        BackendUnavailable,
+        available_backends,
+        backend_class,
+    )
 
     models = {}
-    for backend, filename in MODEL_FILES.items():
+    for filename, digest in MODEL_FILES.items():
         path = paths.model_path(filename)
-        entry: dict[str, Any] = {"file": filename, "present": path.is_file()}
+        users = [name for name, files in BACKEND_MODEL_FILES.items() if filename in files]
+        entry: dict[str, Any] = {"used_by": users, "present": path.is_file()}
         if entry["present"]:
             entry["size"] = path.stat().st_size
-            entry["sha256_ok"] = _sha256(path) == MODEL_SHA256[filename]
-        models[backend] = entry
+            entry["sha256_ok"] = _sha256(path) == digest
+        models[filename] = entry
     out: dict[str, Any] = {
         "configured": settings.general.backend,
         "available": available_backends(),
-        "mediapipe_installed": importlib.util.find_spec("mediapipe") is not None,
         "models": models,
     }
     try:
@@ -341,12 +344,36 @@ def _cameras_section(settings: Settings, probe: bool) -> dict[str, Any]:
 
 
 def _platform_section(services: PlatformServices) -> dict[str, Any]:
-    return {
+    out: dict[str, Any] = {
         "name": services.name,
         "wayland": bool(services.is_wayland),
+        "cursor_position_reliable": bool(services.cursor_position_reliable()),
         "capabilities": dict(services.capabilities()),
         "permissions": dict(services.permissions()),
     }
+    accessibility = _accessibility_status(services)
+    if accessibility != "unknown":
+        out["accessibility"] = accessibility
+    notes: dict[str, str] = {}
+    if sys.platform.startswith("linux"):
+        notes["camera_release"] = _LINUX_CAMERA_NOTE
+        if services.is_wayland:
+            notes["cursor"] = _WAYLAND_CURSOR_NOTE
+    if notes:
+        out["notes"] = notes
+    return out
+
+
+def _accessibility_status(services: PlatformServices) -> str:
+    """``accessibility_status()`` where the platform has it (macOS), else ``"unknown"``."""
+    getter = getattr(services, "accessibility_status", None)
+    if not callable(getter):
+        return "unknown"
+    try:
+        return str(getter())
+    except Exception:
+        log.debug("accessibility_status() failed", exc_info=True)
+        return "unknown"
 
 
 def _hotkeys_section(settings: Settings) -> dict[str, Any]:
@@ -355,14 +382,26 @@ def _hotkeys_section(settings: Settings) -> dict[str, Any]:
     manager = create_hotkey_manager()
     configured: dict[str, Any] = {}
     invalid: dict[str, str] = {}
+    conflicts: dict[str, str] = {}
     for name in ("toggle_tracking", "toggle_privacy", "recalibrate"):
         text = getattr(settings.hotkeys, name)
         configured[name] = text
-        if text:
-            try:
-                parse_hotkey(text)
-            except ValueError as exc:
-                invalid[name] = str(exc)
+        if not text:
+            continue
+        try:
+            hotkey = parse_hotkey(text)
+        except ValueError as exc:
+            invalid[name] = str(exc)
+            continue
+        # Read-only: e.g. Ctrl+Alt+T is AltGr+T on some Windows layouts, and the
+        # manager refuses to register a combination that types a character.
+        try:
+            conflict = manager.layout_conflict(hotkey)
+        except Exception:
+            log.debug("layout_conflict(%s) failed", text, exc_info=True)
+            conflict = None
+        if conflict:
+            conflicts[name] = conflict
     return {
         "enabled": settings.hotkeys.enabled,
         "backend": manager.name,
@@ -370,30 +409,46 @@ def _hotkeys_section(settings: Settings) -> dict[str, Any]:
         "note": manager.note or "",
         "configured": configured,
         "invalid": invalid,
+        "layout_conflicts": conflicts,
     }
 
 
 def _autostart_section() -> dict[str, Any]:
     from .platform import autostart
 
+    registered = autostart.registered_command()
     return {
         "supported": autostart.is_supported(),
+        "status": autostart.status().value,
         "enabled": autostart.is_enabled(),
         "location": _redact(autostart.location()),
-        "command": format_command([_redact(part) or "" for part in autostart.launch_command()]),
+        "registered": _redacted_command(registered) if registered else None,
+        "command": _redacted_command(autostart.launch_command()),
     }
 
 
+def _redacted_command(parts: Sequence[str]) -> str:
+    return format_command([_redact(part) or "" for part in parts])
+
+
 def _paths_section() -> dict[str, Any]:
+    # No socket name: it is derived from the user name and would reveal it.
     return {
+        "profile": "custom (--config-dir)" if _profile_override() else "default",
         "config_dir": _redact(paths.config_dir()),
         "data_dir": _redact(paths.data_dir()),
         "log_dir": _redact(paths.log_dir()),
         "settings_file": _redact(paths.settings_file()),
         "calibration_file": _redact(paths.calibration_file()),
         "log_file": _redact(paths.log_file()),
-        "ipc_name": paths.ipc_name(),
     }
+
+
+def _profile_override() -> bool:
+    """Whether a ``--config-dir`` profile is in use."""
+    getter = getattr(paths, "base_override", None)
+    override = getter() if callable(getter) else paths._override
+    return override is not None
 
 
 def _settings_section() -> tuple[Settings, dict[str, Any]]:
@@ -413,28 +468,43 @@ def _settings_section() -> tuple[Settings, dict[str, Any]]:
             info["valid"] = isinstance(data, dict)
     defaults = Settings()
     info["non_default"] = {
-        row["key"]: _get_setting(settings, row["key"])
+        row["key"]: _shareable_setting(row["key"], _get_setting(settings, row["key"]))
         for row in describe_settings()
         if _get_setting(settings, row["key"]) != _get_setting(defaults, row["key"])
     }
     return settings, info
 
 
-def _calibration_section(report: dict[str, Any]) -> dict[str, Any]:
-    from .gaze.store import load_calibration
+def _shareable_setting(key: str, value: Any) -> Any:
+    """A setting value as it may appear in a pasted report (no account name)."""
+    if key == "camera.device":
+        return _describe_device(str(value))  # may be a video file's full path
+    if isinstance(value, str):
+        return _redact(value)
+    if isinstance(value, list):
+        return [_redact(v) if isinstance(v, str) else v for v in value]
+    return value
+
+
+def _calibration_section(report: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    from .gaze.store import CalibrationLibrary
 
     path = paths.calibration_file()
     if not path.is_file():
         return {"exists": False}
-    data = load_calibration(path)
+    library = CalibrationLibrary.load(path)
+    data = library.latest
     if data is None:
         return {"exists": True, "valid": False}
     out: dict[str, Any] = {
         "exists": True,
         "valid": True,
+        "profiles": len(library),
         "created_at": data.created_at,
         "backend": data.backend,
         "feature_version": data.feature_version,
+        "camera": _describe_device(data.camera) if data.camera else None,
+        "frame_size": list(data.frame_size) if all(data.frame_size) else None,
         "grade": data.grade,
         "monitors": len(data.monitors),
         "samples": len(data.samples),
@@ -444,6 +514,12 @@ def _calibration_section(report: dict[str, Any]) -> dict[str, Any]:
     summary = _calibration_summary(data.report)
     if summary:
         out["summary"] = summary
+    if len(library) > 1:
+        # Most recently used first, one per desk / camera / backend.
+        out["profile_list"] = {
+            str(n): _describe_profile(profile)
+            for n, profile in enumerate(library.profiles, start=1)
+        }
     backends = report.get("backends") or {}
     monitors_info = report.get("monitors") or {}
     active = backends.get("active")
@@ -459,13 +535,28 @@ def _calibration_section(report: dict[str, Any]) -> dict[str, Any]:
             )
             for m in monitors_info["items"]
         ]
-        ok, reason = data.is_compatible(active, feature_version, monitors)
-        out["compatible"] = ok
-        if not ok:
+        # What the app does: the best profile for this setup, not just the latest.
+        match, reason = library.match(
+            active, feature_version, monitors, camera=settings.camera.device
+        )
+        out["compatible"] = match is not None
+        if match is None:
             out["reason"] = reason
+        elif match is not data:
+            out["matching_profile"] = _describe_profile(match)
     else:
         out["compatible"] = None
     return out
+
+
+def _describe_profile(data: Any) -> str:
+    """One line per stored calibration, e.g. ``2026-09-30 facemesh, 2 monitors, camera 0, good``."""
+    parts = [f"{str(data.created_at)[:10]} {data.backend}", f"{len(data.monitors)} monitor(s)"]
+    if data.camera:
+        parts.append(_describe_device(data.camera))
+    if data.grade:
+        parts.append(str(data.grade))
+    return ", ".join(parts)
 
 
 def _calibration_summary(report: dict[str, Any]) -> str | None:
@@ -488,12 +579,16 @@ def _problems(report: dict[str, Any]) -> list[str]:
 
     backends = report.get("backends") or {}
     if backends.get("available") == []:
-        problems.append("No vision backend is available (MediaPipe or OpenCV with its model).")
-    for name, model in (backends.get("models") or {}).items():
+        problems.append(
+            "No vision backend is available (it needs OpenCV 4.10 or newer with its DNN "
+            "module, and the bundled model files)."
+        )
+    for filename, model in (backends.get("models") or {}).items():
+        users = ", ".join(model.get("used_by") or []) or "vision"
         if not model.get("present"):
-            problems.append(f"The {name} model file {model.get('file')} is missing.")
+            problems.append(f"The model file {filename} ({users} backend) is missing.")
         elif model.get("sha256_ok") is False:
-            problems.append(f"The {name} model file {model.get('file')} is damaged (checksum).")
+            problems.append(f"The model file {filename} ({users} backend) is damaged (checksum).")
     if backends.get("active_error"):
         problems.append(str(backends["active_error"]))
 
@@ -513,14 +608,21 @@ def _problems(report: dict[str, Any]) -> list[str]:
     permissions = platform_info.get("permissions") or {}
     if permissions.get("camera") is False:
         problems.append("Camera access is blocked by the operating system's privacy settings.")
-    if permissions.get("accessibility") is False:
+    if platform_info.get("accessibility") == "stale":
+        problems.append(
+            "Accessibility permission was granted to an earlier version, so keyboard focus "
+            "cannot follow your gaze: in System Settings > Privacy & Security > "
+            "Accessibility remove Eye Tracker with '-' and add it again."
+        )
+    elif permissions.get("accessibility") is False:
         problems.append(
             "Accessibility permission is missing: keyboard focus cannot follow your gaze."
         )
     capabilities = platform_info.get("capabilities") or {}
     if capabilities and not capabilities.get("cursor", True):
         problems.append(
-            "This session does not allow moving the cursor (on Wayland install ydotool)."
+            "This session does not allow moving the cursor. On Wayland, sway and Hyprland "
+            "work directly; elsewhere install ydotool 1.x and run ydotoold."
         )
     if capabilities and not capabilities.get("lock", True):
         problems.append("Locking the screen is not supported here.")
@@ -530,6 +632,16 @@ def _problems(report: dict[str, Any]) -> list[str]:
         problems.append(f"Global hotkeys: {hotkeys['note']}")
     for name, error in (hotkeys.get("invalid") or {}).items():
         problems.append(f"Hotkey {name} is invalid: {error}")
+    if hotkeys.get("enabled"):
+        for name, conflict in (hotkeys.get("layout_conflicts") or {}).items():
+            problems.append(f"Hotkey {name} cannot be used: {conflict}.")
+
+    autostart_info = report.get("autostart") or {}
+    if autostart_info.get("status") == "stale":
+        problems.append(
+            "Start at login points to a copy of Eye Tracker that no longer exists; "
+            "turn it off and on again."
+        )
 
     settings = report.get("settings") or {}
     if settings.get("valid") is False:

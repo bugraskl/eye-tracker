@@ -1,10 +1,9 @@
-"""Lightweight OpenCV backend: YuNet face detection and five-point head geometry.
+"""Lite backend: YuNet face detection and five-point head geometry.
 
-This backend needs nothing beyond OpenCV and a 230 kB model, runs in a few
-milliseconds at 320 px and works where MediaPipe is unavailable (Intel Macs).
-It has no iris landmarks, so it relies on head movement alone: the features
-describe where the nose points relative to the eyes and mouth, plus where the
-face is in the frame. Blinks cannot be detected.
+This backend needs nothing beyond OpenCV and a 230 kB model and runs in a few
+milliseconds at 320 px. It has no iris landmarks, so it relies on head movement
+alone: the features describe where the nose points relative to the eyes and
+mouth, plus where the face is in the frame. Blinks cannot be detected.
 """
 
 from __future__ import annotations
@@ -21,8 +20,19 @@ import numpy as np
 
 from ... import paths
 from ...types import Observation
+from ..threads import limit_opencv_threads
 from .base import BackendUnavailable, VisionBackend
-from .mediapipe_backend import draw_box, draw_label, observation_label, to_bgr
+from .overlay import (
+    COLOR_BOX,
+    COLOR_OTHER,
+    COLOR_POINT,
+    as_bgr,
+    draw_box,
+    draw_label,
+    line_thickness,
+    observation_label,
+    to_bgr,
+)
 
 log = logging.getLogger(__name__)
 
@@ -41,12 +51,42 @@ NOSE_BASELINE = 0.55
 YAW_GAIN = 1.6
 PITCH_GAIN = 2.5
 BORDER_MARGIN = 0.01
-#: Upper bound for OpenCV's worker thread pool while this backend is used.
-MAX_OPENCV_THREADS = 2
 
-_COLOR_BOX = (240, 170, 70)
-_COLOR_OTHER = (60, 150, 255)
-_COLOR_POINT = (140, 230, 120)
+
+def create_yunet(
+    model_path: Path | None = None, input_width: int = MAX_INPUT_WIDTH
+) -> cv2.FaceDetectorYN:
+    """Create a YuNet detector for frames about ``input_width`` pixels wide.
+
+    Raises:
+        BackendUnavailable: The OpenCV build lacks ``FaceDetectorYN`` or the model
+            cannot be loaded.
+    """
+    if not hasattr(cv2, "FaceDetectorYN"):
+        raise BackendUnavailable(
+            f"OpenCV {cv2.__version__} has no FaceDetectorYN (4.5.4 or newer is required)"
+        )
+    path = Path(model_path) if model_path else paths.model_path(MODEL_FILE)
+    try:
+        # Read by Python and passed as a buffer: OpenCV cannot open non-ASCII
+        # paths on Windows.
+        model = np.frombuffer(path.read_bytes(), dtype=np.uint8)
+    except OSError as exc:
+        raise BackendUnavailable(
+            f"YuNet model not found at {path} (run scripts/fetch_models.py)"
+        ) from exc
+    try:
+        return cv2.FaceDetectorYN.create(
+            "onnx",
+            model,
+            np.empty(0, dtype=np.uint8),
+            (int(input_width), max(1, round(input_width * 3 / 4))),
+            SCORE_THRESHOLD,
+            NMS_THRESHOLD,
+            TOP_K,
+        )
+    except cv2.error as exc:
+        raise BackendUnavailable(f"OpenCV could not load the YuNet model: {exc}") from exc
 
 
 def geometry_features(
@@ -83,7 +123,7 @@ def geometry_features(
     # frontal face. Normalising by the eye-to-mouth distance keeps it independent
     # of how far away the user sits and of head yaw (which shrinks the eye distance).
     nose_dy = float(nose_rel @ down) / mouth_depth - NOSE_BASELINE
-    # Counter-clockwise positive, matching the sign of MediaPipe's roll.
+    # Counter-clockwise positive, matching the sign of the facemesh backend's roll.
     roll = math.degrees(math.atan2(-axis[1], axis[0]))
     face_cx = (x + w / 2.0) / frame_width
     face_cy = (y + h / 2.0) / frame_height
@@ -119,11 +159,11 @@ class _Detections:
     others: list[tuple[float, float, float, float]]  # boxes of the other faces
 
 
-class OpenCVBackend(VisionBackend):
+class LiteBackend(VisionBackend):
     """Head-geometry features from OpenCV's YuNet face detector.
 
-    Creating an instance caps OpenCV's (process-wide) thread pool at
-    :data:`MAX_OPENCV_THREADS`, see the comment in ``__init__``.
+    Creating an instance caps OpenCV's process-wide thread pool (see
+    :mod:`eye_tracker.vision.threads`).
 
     Args:
         model_path: YuNet ONNX model; defaults to the bundled model.
@@ -135,7 +175,7 @@ class OpenCVBackend(VisionBackend):
             cannot be loaded.
     """
 
-    name: ClassVar[str] = "opencv"
+    name: ClassVar[str] = "lite"
     feature_names: ClassVar[tuple[str, ...]] = (
         "nose_dx",
         "nose_dy",
@@ -145,42 +185,12 @@ class OpenCVBackend(VisionBackend):
         "scale",
     )
     feature_version: ClassVar[str] = "yunet-geom-1"
+    gaze_features: ClassVar[tuple[str, ...]] = ("nose_dx", "nose_dy")
 
     def __init__(self, model_path: Path | None = None, max_faces: int = 1) -> None:
-        if not hasattr(cv2, "FaceDetectorYN"):
-            raise BackendUnavailable(
-                f"OpenCV {cv2.__version__} has no FaceDetectorYN (4.5.4 or newer is required)"
-            )
-        path = Path(model_path) if model_path else paths.model_path(MODEL_FILE)
-        try:
-            # Read by Python and passed as a buffer: OpenCV cannot open non-ASCII
-            # paths on Windows.
-            model = np.frombuffer(path.read_bytes(), dtype=np.uint8)
-        except OSError as exc:
-            raise BackendUnavailable(
-                f"YuNet model not found at {path} (run scripts/fetch_models.py)"
-            ) from exc
-        self._input_size = (MAX_INPUT_WIDTH, 240)
-        try:
-            detector = cv2.FaceDetectorYN.create(
-                "onnx",
-                model,
-                np.empty(0, dtype=np.uint8),
-                self._input_size,
-                SCORE_THRESHOLD,
-                NMS_THRESHOLD,
-                TOP_K,
-            )
-        except cv2.error as exc:
-            raise BackendUnavailable(f"OpenCV could not load the YuNet model: {exc}") from exc
-        self._detector: cv2.FaceDetectorYN | None = detector
-        # OpenCV defaults to one worker thread per core. For a 320 px network the
-        # threads mostly spin while waiting, so capping the pool cuts the CPU cost
-        # to about a third at equal latency (measured: 2.7 % -> 0.9 % of a 16-thread
-        # machine at 12 fps). The setting is process-wide, which is harmless here:
-        # the app only runs small OpenCV workloads.
-        if cv2.getNumThreads() > MAX_OPENCV_THREADS:
-            cv2.setNumThreads(MAX_OPENCV_THREADS)
+        limit_opencv_threads()
+        self._detector: cv2.FaceDetectorYN | None = create_yunet(model_path, MAX_INPUT_WIDTH)
+        self._input_size: tuple[int, int] | None = None
         self._max_faces = max(1, int(max_faces))
         self._last: _Detections | None = None
 
@@ -194,12 +204,10 @@ class OpenCVBackend(VisionBackend):
     def process(self, frame_bgr: np.ndarray, timestamp: float) -> Observation:
         detector = self._detector
         if detector is None:
-            raise RuntimeError("OpenCVBackend is closed")
+            raise RuntimeError("LiteBackend is closed")
         started = time.perf_counter()
         height, width = frame_bgr.shape[:2]
-        image = frame_bgr
-        if image.ndim == 2 or image.shape[2] != 3:
-            image = to_bgr(image)
+        image = as_bgr(frame_bgr)
         if width > MAX_INPUT_WIDTH:
             scale = MAX_INPUT_WIDTH / width
             size = (MAX_INPUT_WIDTH, max(1, round(height * scale)))
@@ -266,15 +274,15 @@ class OpenCVBackend(VisionBackend):
     def annotate(self, frame_bgr: np.ndarray, observation: Observation) -> np.ndarray:
         out = to_bgr(frame_bgr)
         h, w = out.shape[:2]
-        thickness = max(1, round(max(h, w) / 640))
+        thickness = line_thickness(out)
         last = self._last
         if last is not None and last.timestamp == observation.timestamp:
             for px, py in last.points * (w, h):
                 center = (round(float(px)), round(float(py)))
-                cv2.circle(out, center, thickness + 2, _COLOR_POINT, -1, cv2.LINE_AA)
+                cv2.circle(out, center, thickness + 2, COLOR_POINT, -1, cv2.LINE_AA)
             for box in last.others:
-                draw_box(out, box, _COLOR_OTHER, thickness)
+                draw_box(out, box, COLOR_OTHER, thickness)
         if observation.face_box is not None:
-            draw_box(out, observation.face_box, _COLOR_BOX, thickness)
+            draw_box(out, observation.face_box, COLOR_BOX, thickness)
         draw_label(out, observation_label(observation))
         return out

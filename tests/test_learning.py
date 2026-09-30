@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import logging
+import math
 
 import numpy as np
 import pytest
 
-from eye_tracker.gaze.calibration import CalibrationSample
-from eye_tracker.gaze.learning import DriftMonitor, ImplicitLearner, refit_model
+from eye_tracker.gaze.calibration import CalibrationSample, evaluate
+from eye_tracker.gaze.learning import (
+    IMPLICIT_MAX_ERROR,
+    DriftMonitor,
+    ImplicitLearner,
+    plausible_label,
+    refit_model,
+)
 from eye_tracker.gaze.model import GazeModel
-from eye_tracker.types import Monitor, Observation, Rect, monitor_at
+from eye_tracker.types import Monitor, Observation, Rect, monitor_at, nearest_monitor
+from gaze_synth import GAZE, TWO, calibration_samples, random_points, synth_features
 
 MONITORS = [
     Monitor(0, "left", Rect(0, 0, 1920, 1080)),
@@ -171,6 +179,63 @@ def test_feature_length_change_discards_old_samples(caplog: pytest.LogCaptureFix
     assert "discarding" in caplog.text
 
 
+def test_discard_last_takes_the_sample_back() -> None:
+    learner = ImplicitLearner(refit_every=2)
+    first = move_and_settle(learner, 100.0, 100.0, 1.0)
+    second = move_and_settle(learner, 200.0, 100.0, 3.0)
+    assert learner.should_refit()
+    assert learner.discard_last() is second
+    assert learner.samples == [first]
+    assert learner.new_since_refit == 1
+    assert not learner.should_refit()
+    assert learner.discard_last() is None  # only the latest can be taken back
+    assert learner.samples == [first]
+    third = move_and_settle(learner, 300.0, 100.0, 5.0)
+    assert third is not None
+    assert third.point_id == -3  # ids are never reused
+
+
+def test_discard_last_restores_the_sample_evicted_for_it() -> None:
+    learner = ImplicitLearner(max_samples=2)
+    t = 0.0
+    for x in (100.0, 200.0, 2500.0):
+        move_and_settle(learner, x, 100.0, t)
+        t += 2.0
+    assert [s.x for s in learner.samples] == [200.0, 2500.0]  # 100 made room
+    learner.discard_last()
+    assert [s.x for s in learner.samples] == [100.0, 200.0]
+
+
+def test_discard_last_after_refit_or_reset() -> None:
+    learner = ImplicitLearner(refit_every=1)
+    sample = move_and_settle(learner, 100.0, 100.0, 1.0)
+    learner.mark_refit()
+    assert learner.discard_last() is sample  # still leaves the training set …
+    assert learner.new_since_refit == 0  # … but was already accounted for
+    for reset in (
+        lambda: learner.load([]),
+        learner.clear,
+        lambda: learner.set_max_samples(0),
+    ):
+        learner.set_max_samples(400)
+        move_and_settle(learner, 100.0, 100.0, 10.0)
+        reset()
+        assert learner.discard_last() is None
+
+
+def test_set_max_samples_reports_dropped_samples() -> None:
+    learner = ImplicitLearner(max_samples=5)
+    for i in range(3):
+        move_and_settle(learner, 100.0 + i, 100.0, 2.0 * i)
+    assert not learner.set_max_samples(3)
+    assert not learner.set_max_samples(10)
+    assert learner.set_max_samples(1)
+    assert len(learner.samples) == 1
+    assert learner.set_max_samples(0)
+    assert learner.samples == []
+    assert not learner.set_max_samples(0)
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [{"max_samples": -1}, {"weight": 0.0}, {"settle_s": -0.1}, {"refit_every": 0}],
@@ -204,6 +269,103 @@ def test_refit_model_uses_template_settings_and_weights() -> None:
     assert np.median(np.hypot(*(pulled.predict(X[:10]) - (3500.0, 900.0)).T)) < np.median(
         np.hypot(*(model.predict(X[:10]) - (3500.0, 900.0)).T)
     )
+
+
+def test_refit_without_learned_samples_restores_the_calibration_fit() -> None:
+    # Lowering "max learned samples" (to 0) must be able to undo their influence.
+    base = calibration_samples(TWO, np.random.default_rng(60), noise=1.0, per_point=8)
+    calibrated, _ = evaluate(base, TWO, nonlinear=GAZE)
+    rng = np.random.default_rng(61)
+    wrong = [
+        CalibrationSample(f, 3500.0, 900.0, 1, -1 - i, 0.5)
+        for i, f in enumerate(synth_features(random_points(TWO[:1], rng, 80), rng, 1.0))
+    ]
+    polluted = refit_model(base, wrong, calibrated)
+    assert polluted.nonlinear == GAZE
+    learner = ImplicitLearner()
+    learner.load(wrong)
+    assert learner.set_max_samples(0)
+    restored = refit_model(base, learner.samples, polluted)
+    X = np.array([s.features for s in base])
+    assert not np.allclose(polluted.predict(X), calibrated.predict(X), atol=1.0)
+    assert np.allclose(restored.predict(X), calibrated.predict(X), atol=1e-6)
+    assert (restored.degree, restored.alpha, restored.nonlinear, restored.bounds) == (
+        calibrated.degree,
+        calibrated.alpha,
+        calibrated.nonlinear,
+        calibrated.bounds,
+    )
+
+
+# --------------------------------------------------------------------------- plausible labels
+def _sample(x: float, y: float, monitor: int) -> CalibrationSample:
+    return CalibrationSample(np.zeros(8), x, y, monitor, -1, 0.5)
+
+
+def test_plausible_label() -> None:
+    diagonal = MONITORS[1].rect.diagonal
+    label = _sample(2300.0, 900.0, 1)
+    assert plausible_label((2400.0, 800.0), label, MONITORS)
+    # On the other monitor but close to the label: a drifted model the label corrects.
+    assert plausible_label((1800.0, 900.0), label, MONITORS)
+    # The cursor was parked on the right while the user read the left monitor.
+    assert not plausible_label((500.0, 400.0), label, MONITORS)
+    limit = IMPLICIT_MAX_ERROR * diagonal
+    assert plausible_label((2300.0 - limit + 1, 900.0), label, MONITORS)
+    assert not plausible_label((2300.0 - limit - 1, 900.0), label, MONITORS)
+    assert plausible_label((500.0, 400.0), label, MONITORS, max_error=2.0)
+    # No evidence either way.
+    assert plausible_label((math.nan, 400.0), label, MONITORS)
+    assert plausible_label((500.0, 400.0), label, [])
+    # An index that is not in the list: the monitor under the cursor decides.
+    small = [Monitor(0, "a", Rect(0, 0, 800, 600)), Monitor(1, "b", Rect(800, 0, 800, 600))]
+    assert not plausible_label((700.0, 300.0), _sample(1500.0, 300.0, 9), small)
+
+
+def test_gated_learning_resists_parked_cursor_labels() -> None:
+    """Regression: every settle used to be learned, so a habit such as clicking
+    "Run" on the right monitor and reading the output on the left one biased
+    the model towards the right."""
+    base = calibration_samples(TWO, np.random.default_rng(70), noise=1.0, per_point=12)
+    model, _ = evaluate(base, TWO, nonlinear=GAZE)
+    rng = np.random.default_rng(71)
+
+    def learn(gate: bool) -> GazeModel:
+        learner = ImplicitLearner(max_samples=400, refit_every=10_000)
+        t = 0.0
+        for i in range(400):
+            gaze = random_points(TWO, rng, 1)[0]
+            parked = i % 5 == 0  # 20 % of the settles
+            if parked:
+                gaze = random_points(TWO[:1], rng, 1)[0]  # reading the left monitor
+            cursor = (3500.0, 900.0) if parked else tuple(gaze)
+            features = synth_features(gaze[None, :], rng, 1.0)[0]
+            learner.on_manual_cursor(*cursor, t)
+            sample = learner.on_observation(obs(t + 0.4, features), t + 0.4, lookup)
+            assert sample is not None
+            if gate and not plausible_label(model.predict(sample.features), sample, TWO):
+                assert learner.discard_last() is sample
+            t += 2.0
+        return refit_model(base, learner.samples, model)
+
+    points = random_points(TWO, np.random.default_rng(72), 1500)
+    X = synth_features(points, np.random.default_rng(73), 1.0)
+
+    def accuracy(m: GazeModel) -> float:
+        predicted = m.predict(X)
+        return float(
+            np.mean(
+                [
+                    nearest_monitor(TWO, *p)[0].index == nearest_monitor(TWO, *q)[0].index
+                    for p, q in zip(predicted, points, strict=True)
+                ]
+            )
+        )
+
+    ungated, gated = accuracy(learn(gate=False)), accuracy(learn(gate=True))
+    assert gated >= 0.99
+    assert gated >= accuracy(model) - 0.005
+    assert ungated < gated - 0.02
 
 
 # --------------------------------------------------------------------------- DriftMonitor
@@ -240,6 +402,29 @@ def test_drift_cooldown() -> None:
     assert drift.should_alert(1000.0 + 1800.0)
     assert not drift.should_alert(3000.0, cooldown_s=300.0)
     assert drift.should_alert(3100.0, cooldown_s=300.0)
+
+
+def test_switch_outcomes_count_both_ways() -> None:
+    # With adaptive learning off only switches produce events. 5 % of 300 switches
+    # undone is an accurate model, not a reason to alert.
+    drift = DriftMonitor()
+    alerts = 0
+    for i in range(300):
+        drift.record_switch(i % 20 != 0)
+        alerts += drift.should_alert(float(i * 600))
+    assert alerts == 0
+    assert drift.error_rate == pytest.approx(0.05, abs=0.03)
+    drift.record_switch(False)
+    drift.record_wrong_switch()
+    assert drift.event_count == 40
+
+
+def test_mostly_undone_switches_still_alert() -> None:
+    drift = DriftMonitor(window=20, alert_ratio=0.35, min_events=15)
+    for i in range(20):
+        drift.record_switch(i % 2 == 0)
+    assert drift.error_rate == 0.5
+    assert drift.should_alert(0.0)
 
 
 def test_drift_window_rolls_over() -> None:

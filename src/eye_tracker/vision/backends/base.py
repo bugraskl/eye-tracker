@@ -19,7 +19,7 @@ class BackendUnavailable(RuntimeError):
 
 
 class VisionBackend(ABC):
-    #: Short identifier stored with calibrations ("mediapipe", "opencv").
+    #: Short identifier stored with calibrations ("facemesh", "lite").
     name: ClassVar[str]
     #: Human-readable names of the entries of ``Observation.features``.
     feature_names: ClassVar[tuple[str, ...]]

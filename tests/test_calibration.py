@@ -20,17 +20,17 @@ from eye_tracker.gaze.calibration import (
     samples_to_arrays,
 )
 from eye_tracker.types import Monitor, Observation, Rect
+from gaze_synth import (
+    GAZE,
+    STACKED,
+    THREE,
+    TWO,
+    calibration_samples,
+    random_points,
+    synth_features,
+)
 
 # --------------------------------------------------------------------------- layouts
-TWO = [
-    Monitor(0, "left", Rect(0, 0, 1920, 1080), primary=True),
-    Monitor(1, "right", Rect(1920, 0, 1920, 1080)),
-]
-THREE = [Monitor(i, f"m{i}", Rect(1920 * (i - 1), 0, 1920, 1080)) for i in range(3)]
-STACKED = [
-    Monitor(0, "top", Rect(0, -1080, 1920, 1080)),
-    Monitor(1, "bottom", Rect(0, 0, 1920, 1080)),
-]
 # Three side by side plus a fourth stacked above the middle one.
 THREE_PLUS_TOP = [
     Monitor(0, "centre", Rect(0, 0, 2560, 1440), primary=True),
@@ -38,51 +38,6 @@ THREE_PLUS_TOP = [
     Monitor(2, "right", Rect(2560, 180, 1920, 1080)),
     Monitor(3, "top", Rect(320, -1080, 1920, 1080)),
 ]
-
-# --------------------------------------------------------------------------- synthetic data
-PX_CM = 53.0 / 1920  # 24" 1080p panel
-NOISE_SCALE = np.array([1.0, 1.0, 1.0, 0.3, 0.3, 0.5, 0.01, 0.006])
-
-
-def synth_features(
-    points: np.ndarray, rng: np.random.Generator, noise: float = 0.0, camera_x: float = 1920.0
-) -> np.ndarray:
-    """(yaw, pitch, roll, tx, ty, tz, iris_h, iris_v) of a user ~65 cm away looking at points.
-
-    The head turns part of the way towards the target (a random share, as people
-    do) and the eyes cover the rest; flat screens make the mapping tan-shaped.
-    """
-    pts = np.asarray(points, dtype=float)
-    n = len(pts)
-    target_x = (pts[:, 0] - camera_x) * PX_CM
-    target_y = pts[:, 1] * PX_CM + 2.0
-    hx, hy, hz = rng.normal(0, 2.5, n), rng.normal(0, 1.5, n), 65.0 + rng.normal(0, 3.0, n)
-    gaze_yaw = np.degrees(np.arctan2(target_x - hx, hz))
-    gaze_pitch = np.degrees(np.arctan2(target_y - hy, hz))
-    head_share = np.clip(0.55 + rng.normal(0, 0.12, n), 0.1, 0.95)
-    yaw = head_share * gaze_yaw + rng.normal(0, 2.0, n)
-    pitch = 0.8 * head_share * gaze_pitch + rng.normal(0, 1.5, n)
-    iris_h = 0.5 + 0.42 * np.sin(np.radians(gaze_yaw - yaw))
-    iris_v = 0.05 + 0.20 * np.sin(np.radians(gaze_pitch - pitch))
-    roll = rng.normal(0, 1.5, n)
-    feats = np.column_stack([yaw, pitch, roll, hx, hy, -hz, iris_h, iris_v])
-    return feats + rng.normal(size=feats.shape) * NOISE_SCALE * noise
-
-
-def calibration_samples(
-    monitors: list[Monitor],
-    rng: np.random.Generator,
-    noise: float = 0.0,
-    *,
-    per_point: int = 20,
-    camera_x: float = 1920.0,
-    points_per_monitor: int = 9,
-) -> list[CalibrationSample]:
-    samples = []
-    for t in make_plan(monitors, points_per_monitor):
-        feats = synth_features(np.tile((t.x, t.y), (per_point, 1)), rng, noise, camera_x)
-        samples += [CalibrationSample(f, t.x, t.y, t.monitor_index, t.point_id) for f in feats]
-    return samples
 
 
 def obs(t: float = 0.0, features: np.ndarray | None = None, **kwargs: object) -> Observation:
@@ -308,6 +263,21 @@ def test_collector_samples_copy_features() -> None:
     assert np.all(c.samples[0].features == 1.0)
 
 
+def test_collector_reports_the_camera_frame_size() -> None:
+    c = CalibrationCollector(make_plan(TWO)[:1], settle_s=0.0, min_samples=1)
+    assert c.frame_size == (0, 0)  # unknown until a frame was recorded
+    c.start(0.0)
+    c.update(0.0)
+    assert c.add(obs(frame_size=(0, 0)))  # a backend that does not report it
+    assert c.frame_size == (0, 0)
+    for size in [(640, 480)] * 3 + [(1280, 720)]:
+        assert c.add(obs(frame_size=size))
+    assert not c.add(obs(frame_size=(320, 240), blink=True))  # not recorded, not counted
+    assert c.frame_size == (640, 480)  # the most common one
+    c.start(1.0)
+    assert c.frame_size == (0, 0)
+
+
 def test_empty_plan_finishes_immediately() -> None:
     c = CalibrationCollector([])
     c.start(0.0)
@@ -412,6 +382,52 @@ def test_evaluate_requires_enough_data() -> None:
         evaluate(samples, [])
 
 
+def test_evaluate_restricts_polynomial_terms_to_gaze_features() -> None:
+    samples = calibration_samples(TWO, np.random.default_rng(110), noise=1.0)
+    model, report = evaluate(samples, TWO, nonlinear=GAZE)
+    assert model.nonlinear == GAZE
+    assert report.grade == "excellent", report
+    # Posture changes after calibrating barely matter (see test_model for the
+    # comparison with every feature expanded).
+    rng = np.random.default_rng(111)
+    points = random_points(TWO, rng, 600)
+    moved = synth_features(points, rng, 1.0, head_offset=(0.0, 8.0, 0.0))
+    predicted = model.predict(moved)
+    assert np.mean((predicted[:, 0] >= 1920) == (points[:, 0] >= 1920)) >= 0.98
+    # By default every feature is expanded, as before backends declared theirs.
+    assert evaluate(samples, TWO)[0].nonlinear is None
+    with pytest.raises(ValueError, match="out of range"):
+        evaluate(samples, TWO, nonlinear=(0, 8))
+
+
+def test_evaluate_reports_a_monitor_without_dots() -> None:
+    # All nine dots of the left monitor were skipped (face lost at the far turn).
+    rng = np.random.default_rng(112)
+    samples = calibration_samples(THREE, rng, noise=1.0, camera_x=960.0)
+    samples = [s for s in samples if s.monitor_index != 0]
+    _, report = evaluate(samples, THREE, nonlinear=GAZE)
+    assert report.monitor_accuracy >= 0.97  # on the covered monitors
+    assert report.uncovered_monitors == [0]
+    assert report.per_monitor_accuracy[0] == 0.0
+    assert list(report.per_monitor_accuracy) == [0, 1, 2]
+    assert report.grade == "fair"  # not "excellent": one screen was never calibrated
+    assert report.summary().endswith("; 1 screen not calibrated")
+    restored = CalibrationReport.from_dict(report.to_dict())
+    assert restored.uncovered_monitors == [0]
+    assert restored.summary() == report.summary()
+
+
+def test_evaluate_uncovered_monitor_only_caps_the_grade() -> None:
+    # A grade already below "fair" is not raised by the cap.
+    rng = np.random.default_rng(113)
+    samples = calibration_samples(THREE, rng, noise=40.0, camera_x=960.0)
+    samples = [s for s in samples if s.monitor_index != 2]
+    _, report = evaluate(samples, THREE)
+    assert report.uncovered_monitors == [2]
+    assert grade_for(report.monitor_accuracy) == "poor", report
+    assert report.grade == "poor"
+
+
 def test_evaluate_ignores_samples_of_unknown_monitors(caplog: pytest.LogCaptureFixture) -> None:
     rng = np.random.default_rng(108)
     samples = calibration_samples(TWO, rng, per_point=6)
@@ -487,9 +503,18 @@ def test_report_dict_round_trip() -> None:
     assert restored.per_monitor_accuracy == {0: 1.0, 1: 0.99}
     assert math.isnan(restored.median_error_px)
     assert restored.degree == 3
+    assert restored.uncovered_monitors == []  # reports saved before it existed
     assert restored.summary() == report.summary()
     with pytest.raises(ValueError, match="invalid calibration report"):
         CalibrationReport.from_dict({"grade": "excellent"})
+    with pytest.raises(ValueError, match="invalid calibration report"):
+        CalibrationReport.from_dict({**data, "uncovered_monitors": [math.inf]})
+
+
+def test_report_summary_names_uncovered_screens() -> None:
+    assert _report(uncovered_monitors=[0, 3], grade="fair").summary() == (
+        "Fair — 99% monitor accuracy, 180 samples, mean error 42 px; 2 screens not calibrated"
+    )
 
 
 def test_samples_to_arrays() -> None:

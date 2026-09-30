@@ -30,6 +30,8 @@
 #endif
 
 #define AppName "Eye Tracker"
+; AppId identifies the installation for upgrades and uninstall. Never change it.
+#define AppGuid "F2F98F7C-0EEF-44D5-ADDE-173D9D8BA82B"
 #define AppExeName "EyeTracker.exe"
 #define CliExeName "eye-tracker-cli.exe"
 ; Same ID the app sets at run time (SetCurrentProcessExplicitAppUserModelID), so
@@ -41,14 +43,15 @@
 #define RunValueName "EyeTracker"
 #define RunKey "Software\Microsoft\Windows\CurrentVersion\Run"
 #define StartupApprovedKey "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+; Where Inno Setup records this per-user installation (used to detect upgrades).
+#define UninstallKey "Software\Microsoft\Windows\CurrentVersion\Uninstall\{" + AppGuid + "}_is1"
 
 #if !FileExists(AddBackslash(BundleDir) + AppExeName)
   #error PyInstaller output not found; build it first (see packaging/pyinstaller/eye-tracker.spec)
 #endif
 
 [Setup]
-; AppId identifies the installation for upgrades and uninstall. Never change it.
-AppId={{F2F98F7C-0EEF-44D5-ADDE-173D9D8BA82B}
+AppId={{{#AppGuid}}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
@@ -71,6 +74,8 @@ DisableProgramGroupPage=yes
 DisableDirPage=auto
 DisableReadyPage=yes
 UsePreviousAppDir=yes
+; Remembers the desktop-icon choice. The "startup" task is never re-applied from
+; the previous installation: see ShouldWriteAutostart in [Code].
 UsePreviousTasks=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -125,9 +130,10 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "
 
 [Registry]
 ; Same entry that "Start at login" in the app writes (see platform/autostart.py).
-Root: HKCU; Subkey: "{#RunKey}"; ValueType: string; ValueName: "{#RunValueName}"; ValueData: """{app}\{#AppExeName}"" --background"; Flags: uninsdeletevalue; Tasks: startup
+; On upgrades ShouldWriteAutostart keeps whatever the user has chosen since.
+Root: HKCU; Subkey: "{#RunKey}"; ValueType: string; ValueName: "{#RunValueName}"; ValueData: """{app}\{#AppExeName}"" --background"; Flags: uninsdeletevalue; Tasks: startup; Check: ShouldWriteAutostart
 ; A "Disabled" flag left by Task Manager would silently override the entry above.
-Root: HKCU; Subkey: "{#StartupApprovedKey}"; ValueType: none; ValueName: "{#RunValueName}"; Flags: deletevalue dontcreatekey; Tasks: startup
+Root: HKCU; Subkey: "{#StartupApprovedKey}"; ValueType: none; ValueName: "{#RunValueName}"; Flags: deletevalue dontcreatekey; Tasks: startup; Check: ShouldWriteAutostart
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
@@ -142,6 +148,110 @@ const
   UserDataDir = '{localappdata}\bugraskl\eye-tracker';
   { "eye-tracker ctl" exit code when no instance is running. }
   CtlNotRunning = 3;
+
+var
+  { An earlier version is installed for this user. }
+  IsUpgrade: Boolean;
+  { Start-at-login was on for this installation just before files were copied. }
+  AutostartWasOn: Boolean;
+  { The Select Tasks page shows the real start-at-login state (upgrades only). }
+  StartupPageSynced: Boolean;
+
+function InitializeSetup: Boolean;
+begin
+  IsUpgrade := RegKeyExists(HKCU, '{#UninstallKey}');
+  Result := True;
+end;
+
+{ Whether the "start at sign-in" entry starts the copy in AppDir and Task Manager
+  has not disabled it (in StartupApproved an odd first byte means "disabled"). }
+function AutostartEnabledFor(const AppDir: String): Boolean;
+var
+  Command: String;
+  Approved: AnsiString;
+begin
+  Result := False;
+  if (AppDir = '') or
+     not RegQueryStringValue(HKCU, '{#RunKey}', '{#RunValueName}', Command) then
+    Exit;
+  if Pos(Lowercase(AddBackslash(AppDir) + '{#AppExeName}'), Lowercase(Command)) = 0 then
+    Exit;
+  if RegQueryBinaryValue(HKCU, '{#StartupApprovedKey}', '{#RunValueName}', Approved) and
+     (Length(Approved) > 0) and ((Ord(Approved[1]) and 1) = 1) then
+    Exit;
+  Result := True;
+end;
+
+{ What the command line says about the "startup" task: 1 selected, 0 deselected,
+  -1 not mentioned. /TASKS= deselects every task it does not list; /MERGETASKS=
+  changes only the tasks it names ("!startup" deselects). }
+function StartupTaskParam: Integer;
+var
+  I, Comma: Integer;
+  Param, Tasks, Task: String;
+begin
+  Result := -1;
+  for I := 1 to ParamCount do
+  begin
+    Param := Lowercase(ParamStr(I));
+    if Pos('/tasks=', Param) = 1 then
+    begin
+      Tasks := Copy(Param, Length('/tasks=') + 1, Length(Param));
+      Result := 0;
+    end
+    else if Pos('/mergetasks=', Param) = 1 then
+      Tasks := Copy(Param, Length('/mergetasks=') + 1, Length(Param))
+    else
+      Continue;
+    Tasks := RemoveQuotes(Tasks);
+    while Tasks <> '' do
+    begin
+      Comma := Pos(',', Tasks);
+      if Comma = 0 then
+        Comma := Length(Tasks) + 1;
+      Task := Trim(Copy(Tasks, 1, Comma - 1));
+      Delete(Tasks, 1, Comma);
+      if (Task = 'startup') or (Task = '*startup') then
+        Result := 1
+      else if Task = '!startup' then
+        Result := 0;
+    end;
+  end;
+end;
+
+{ Upgrades: show the real start-at-login state on the Select Tasks page instead
+  of the choice made at the first installation, which UsePreviousTasks would
+  restore even after the user turned autostart off in the app or Task Manager. }
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpSelectTasks) and IsUpgrade and not StartupPageSynced then
+  begin
+    if AutostartEnabledFor(WizardDirValue) then
+      WizardSelectTasks('startup')
+    else
+      WizardSelectTasks('!startup');
+    StartupPageSynced := True;
+  end;
+end;
+
+{ Check for the [Registry] autostart entries, evaluated when the "startup" task
+  is selected. A new installation writes them as chosen. An upgrade never turns
+  start-at-login back on by itself (silent upgrades such as winget re-apply the
+  first installation's task selection): it writes them only when autostart is
+  off now and the user asked for it, by ticking the box on a page that showed
+  the real state, or with /TASKS or /MERGETASKS on a silent command line. An
+  entry that is already on is left as it is (it may carry the app's options). }
+function ShouldWriteAutostart: Boolean;
+begin
+  if not IsUpgrade then
+    Result := True
+  else if AutostartWasOn then
+    Result := False
+  else if WizardSilent or not StartupPageSynced then
+    Result := StartupTaskParam = 1
+  else
+    Result := True;
+end;
 
 { Ask a running Eye Tracker to quit through its local control socket and wait
   (up to about 10 s) until it has released the socket, then give it a moment to
@@ -188,6 +298,18 @@ begin
     RegDeleteValue(HKCU, '{#RunKey}', '{#RunValueName}');
   end;
   RegDeleteValue(HKCU, '{#StartupApprovedKey}', '{#RunValueName}');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssInstall then
+    { Runs before the [Registry] section, so ShouldWriteAutostart sees the old state. }
+    AutostartWasOn := IsUpgrade and AutostartEnabledFor(ExpandConstant('{app}'))
+  else if (CurStep = ssPostInstall) and AutostartWasOn and
+          not WizardIsTaskSelected('startup') and
+          ((not WizardSilent and StartupPageSynced) or (StartupTaskParam = 0)) then
+    { The user unticked a box that showed start-at-login as on, or passed !startup. }
+    RemoveAutostartIfOurs;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

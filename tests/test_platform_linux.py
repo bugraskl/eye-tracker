@@ -7,8 +7,12 @@ nothing here locks the screen, touches displays or moves the real cursor.
 from __future__ import annotations
 
 import os
+import shutil
+import struct
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +39,8 @@ _SESSION_VARS = (
     "QT_ENABLE_HIGHDPI_SCALING",
     "LD_LIBRARY_PATH",
     "LD_LIBRARY_PATH_ORIG",
+    "YDOTOOL_SOCKET",
+    "XDG_RUNTIME_DIR",
 )
 
 
@@ -103,6 +109,7 @@ def tools(monkeypatch: pytest.MonkeyPatch) -> FakeTools:
     monkeypatch.setattr(linux.shutil, "which", fake.which)
     monkeypatch.setattr(linux.subprocess, "run", fake.run)
     monkeypatch.setattr(linux, "_xcb_plugin_usable", lambda: True)
+    monkeypatch.setattr(linux, "_YDOTOOL_DEFAULT_SOCKETS", ())
     return fake
 
 
@@ -122,15 +129,45 @@ class FakeXss:
         return self.idle is not None
 
 
+class FakeDBus:
+    """Stands in for QtDBus: "unavailable" (``None``) unless a test scripts an answer."""
+
+    def __init__(self) -> None:
+        self.answers: dict[str, Any] = {}  # method -> reply, or callable(call) -> reply
+        self.calls: list[dict[str, Any]] = []
+
+    def call(self, **kwargs: Any) -> linux._DBusReply | None:
+        self.calls.append(kwargs)
+        answer = self.answers.get(kwargs["method"])
+        return answer(kwargs) if callable(answer) else answer
+
+    def methods(self) -> list[str]:
+        return [call["method"] for call in self.calls]
+
+
+def _no_x_server() -> Any:
+    raise OSError("no X server in tests")
+
+
 @pytest.fixture
-def plat(clock: Clock, tmp_path: Path) -> linux.LinuxPlatform:
+def dbus() -> FakeDBus:
+    return FakeDBus()
+
+
+@pytest.fixture
+def plat(clock: Clock, tmp_path: Path, dbus: FakeDBus) -> linux.LinuxPlatform:
+    """Everything on the calling thread; no real X server, D-Bus or /proc is touched."""
     platform = linux.LinuxPlatform(
         proc_root=tmp_path / "proc",
         dev_root=tmp_path / "dev",
         sys_root=tmp_path / "sys",
         clock=clock,
+        sleep=clock.advance,
+        background_threads=False,
     )
     platform._xss = FakeXss()  # type: ignore[assignment]
+    platform._ewmh = linux._EwmhClient(_no_x_server, clock=clock)
+    platform._dbus = dbus  # type: ignore[assignment]
     return platform
 
 
@@ -189,7 +226,8 @@ def test_prepare_forces_xcb_on_wayland_with_xwayland(
 ) -> None:
     wayland(monkeypatch, "GNOME")
     plat.prepare_process()
-    assert os.environ["QT_QPA_PLATFORM"] == "xcb"
+    # A list, so Qt falls back to native Wayland if the xcb plugin cannot load.
+    assert os.environ["QT_QPA_PLATFORM"] == "xcb;wayland"
     assert os.environ["QT_ENABLE_HIGHDPI_SCALING"] == "0"
 
 
@@ -239,7 +277,7 @@ def test_child_env_undoes_our_overrides(
     env = plat._child_env()
     assert "QT_QPA_PLATFORM" not in env
     assert "QT_ENABLE_HIGHDPI_SCALING" not in env
-    assert os.environ["QT_QPA_PLATFORM"] == "xcb"  # our own process keeps them
+    assert os.environ["QT_QPA_PLATFORM"] == "xcb;wayland"  # our own process keeps them
 
 
 def test_child_env_restores_library_path(
@@ -333,6 +371,7 @@ def test_lock_without_any_locker(plat: linux.LinuxPlatform, tools: FakeTools) ->
 def test_lock_resolves_display_session_without_session_id(
     monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
 ) -> None:
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "GNOME")
     monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
     tools.install("loginctl")
     tools.respond(["loginctl", "show-user"], (0, "3\n"))
@@ -347,6 +386,7 @@ def test_lock_resolves_display_session_without_session_id(
 def test_lock_falls_back_to_callers_session(
     monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
 ) -> None:
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "KDE")
     monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
     tools.install("loginctl")
     tools.respond(["loginctl", "show-user"], (0, "\n"))
@@ -355,16 +395,237 @@ def test_lock_falls_back_to_callers_session(
     assert tools.calls[-1] == ["loginctl", "lock-session"]
 
 
+@pytest.mark.parametrize("desktop", ["GNOME", "KDE", "X-Cinnamon", "MATE", "XFCE", "Budgie:GNOME"])
+def test_lock_trusts_loginctl_on_desktops_that_handle_it(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, desktop: str
+) -> None:
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", desktop)
+    tools.install(*_ALL_LOCKERS)
+    tools.respond(["loginctl", "lock-session"], (0, ""))
+    assert plat.lock_screen() is True
+    assert tools.calls == [["loginctl", "lock-session", "2"]]
+
+
+def test_lock_unconfirmed_loginctl_tries_other_lockers(
+    monkeypatch: pytest.MonkeyPatch,
+    plat: linux.LinuxPlatform,
+    tools: FakeTools,
+    clock: Clock,
+    proc_tree: ProcTree,
+) -> None:
+    # i3 without xss-lock: logind emits Lock, nobody listens, loginctl still exits 0.
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "i3")
+    proc_tree.process(100, [], comm="i3")
+    tools.install("loginctl", "dm-tool")
+    tools.respond(["loginctl", "lock-session"], (0, ""))
+    tools.respond(["loginctl", "show-session"], (0, "no\n"))
+    tools.respond(["dm-tool"], (0, ""))
+    started = clock.now
+    assert plat.lock_screen() is True
+    assert tools.calls[0] == ["loginctl", "lock-session", "2"]
+    assert tools.calls[-1] == ["dm-tool", "lock"]
+    assert ["loginctl", "show-session", "2", "-p", "LockedHint", "--value"] in tools.calls
+    assert clock.now - started == pytest.approx(linux._LOCK_CONFIRM_S)  # bounded wait
+
+
+def test_lock_unconfirmed_loginctl_alone_reports_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    plat: linux.LinuxPlatform,
+    tools: FakeTools,
+    proc_tree: ProcTree,
+) -> None:
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "sway")
+    tools.install("loginctl")
+    tools.respond(["loginctl", "lock-session"], (0, ""))
+    tools.respond(["loginctl", "show-session"], (0, "no\n"))
+    # False lets the controller warn, and the shoulder guard fall back to its curtain.
+    assert plat.lock_screen() is False
+
+
+def test_lock_confirmed_by_locker_process(
+    monkeypatch: pytest.MonkeyPatch, clock: Clock, tools: FakeTools, proc_tree: ProcTree
+) -> None:
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "i3")
+    tools.install("loginctl", "dm-tool")
+    tools.respond(["loginctl", "lock-session"], (0, ""))
+    tools.respond(["loginctl", "show-session"], (0, "no\n"))  # xss-lock + i3lock never set it
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock.advance(seconds)
+        proc_tree.process(4321, [], comm="i3lock")  # xss-lock started the locker
+
+    platform = linux.LinuxPlatform(
+        proc_root=proc_tree.proc,
+        dev_root=proc_tree.dev,
+        sys_root=proc_tree.sys,
+        clock=clock,
+        sleep=sleep,
+        background_threads=False,
+    )
+    platform._dbus = FakeDBus()  # type: ignore[assignment]
+    assert platform.lock_screen() is True
+    assert len(sleeps) == 1
+    assert ["dm-tool", "lock"] not in tools.calls  # no second lock screen on top
+
+
+def test_lock_slow_locker_is_not_stacked_with_another(
+    monkeypatch: pytest.MonkeyPatch,
+    plat: linux.LinuxPlatform,
+    tools: FakeTools,
+    proc_tree: ProcTree,
+) -> None:
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "i3")
+    tools.install("loginctl", "xdg-screensaver", "dm-tool")
+    tools.respond(["loginctl", "lock-session"], (0, ""))
+    waited: list[str | None] = []
+
+    def nothing_in_time(session: str | None) -> bool:
+        waited.append(session)
+        proc_tree.process(4321, [], comm="i3lock")  # shows up just after the wait
+        return False
+
+    monkeypatch.setattr(plat, "_logind_lock_took_effect", nothing_in_time)
+    assert plat.lock_screen() is True
+    assert waited == ["2"]
+    assert tools.calls == [["loginctl", "lock-session", "2"]]  # no second lock screen
+
+
+def test_lock_confirmed_by_locked_hint(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
+) -> None:
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "LXQt")
+    tools.install("loginctl", "dm-tool")
+    tools.respond(["loginctl", "lock-session"], (0, ""))
+    hints = ["no\n", "no\n", "yes\n"]
+    tools.respond(["loginctl", "show-session"], lambda argv: (0, hints.pop(0) if hints else "yes"))
+    assert plat.lock_screen() is True
+    assert ["dm-tool", "lock"] not in tools.calls
+
+
 # ------------------------------------------------------------------ display power
-def test_display_off_x11_uses_xset(
+_XSET_Q_ENABLED = (
+    "DPMS (Energy Star):\n  Standby: 600    Suspend: 600    Off: 600\n  DPMS is Enabled\n"
+)
+
+
+def test_display_off_x11_uses_xset_without_python_xlib(
     monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
 ) -> None:
     x11(monkeypatch, "XFCE")
     tools.install("xset", "kscreen-doctor", "busctl")
     tools.respond(["xset"], (0, ""))
+    tools.respond(["xset", "q"], (0, _XSET_Q_ENABLED))
     assert plat.display_off()
     assert plat.wake_display()
-    assert tools.calls == [["xset", "dpms", "force", "off"], ["xset", "dpms", "force", "on"]]
+    assert tools.calls == [
+        ["xset", "q"],
+        ["xset", "dpms", "force", "off"],
+        ["xset", "q"],
+        ["xset", "dpms", "force", "on"],
+    ]
+
+
+def test_xset_restores_disabled_dpms_after_waking(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
+) -> None:
+    # "xset -dpms" (kiosk, presentation): "dpms force" would enable DPMS for good.
+    x11(monkeypatch, "i3")
+    tools.install("xset")
+    tools.respond(["xset"], (0, ""))
+    tools.respond(["xset", "q"], (0, _XSET_Q_ENABLED.replace("Enabled", "Disabled")))
+    assert plat.display_off()
+    assert tools.calls[-1] == ["xset", "dpms", "force", "off"]
+    tools.respond(["xset", "q"], (0, _XSET_Q_ENABLED))  # "force" enabled it meanwhile
+    assert plat.wake_display()
+    assert tools.calls[-2:] == [["xset", "dpms", "force", "on"], ["xset", "-dpms"]]
+
+
+@pytest.mark.parametrize(
+    "output", ["Server does not have the DPMS Extension\n", "Display is not capable of DPMS\n"]
+)
+def test_xset_without_dpms_reports_failure(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, output: str
+) -> None:
+    # Xvnc, xrdp, many VMs: xset complains on stderr and still exits with 0.
+    x11(monkeypatch, "XFCE")
+    tools.install("xset")
+    tools.respond(["xset"], (0, ""))
+    tools.respond(["xset", "q"], (0, output))
+    assert plat.display_off() is False
+    assert tools.calls == [["xset", "q"]]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (_XSET_Q_ENABLED, (True, True)),
+        (_XSET_Q_ENABLED.replace("Enabled", "Disabled"), (True, False)),
+        ("Server does not have the DPMS Extension", (False, False)),
+        ("Keyboard Control:\n  auto repeat: on", None),
+        ("", None),
+    ],
+)
+def test_parse_xset_dpms(text: str, expected: tuple[bool, bool] | None) -> None:
+    assert linux._parse_xset_dpms(text) == expected
+
+
+def test_x11_dpms_in_process_restores_disabled_state(
+    x11_plat: linux.LinuxPlatform, xdisplay: FakeDisplay, tools: FakeTools
+) -> None:
+    tools.install("xset")
+    xdisplay.dpms_enabled = False
+    assert x11_plat.display_off() is True
+    assert xdisplay.dpms_log == ["enable", "force 3"]
+    assert x11_plat.wake_display() is True
+    assert xdisplay.dpms_log == ["enable", "force 3", "force 0", "disable"]
+    assert xdisplay.dpms_enabled is False
+    assert tools.calls == []  # python-xlib did it all
+
+
+def test_x11_dpms_in_process_keeps_enabled_state(
+    x11_plat: linux.LinuxPlatform, xdisplay: FakeDisplay
+) -> None:
+    assert x11_plat.display_off() is True
+    assert x11_plat.wake_display() is True
+    assert xdisplay.dpms_log == ["force 3", "force 0"]
+    assert xdisplay.dpms_enabled is True
+
+
+def test_x11_without_dpms_reports_failure(
+    x11_plat: linux.LinuxPlatform, xdisplay: FakeDisplay, tools: FakeTools
+) -> None:
+    tools.install("xset")
+    tools.respond(["xset"], (0, ""))
+    xdisplay.extensions.discard("DPMS")
+    assert x11_plat.display_off() is False
+    xdisplay.extensions.add("DPMS")
+    xdisplay.dpms_capable_flag = False
+    assert x11_plat.display_off() is False
+    assert xdisplay.dpms_log == []
+    assert tools.calls == []  # xset would only pretend
+    assert x11_plat.capabilities()["display_off"] is False
+
+
+def test_x11_dpms_disabled_again_when_monitors_wake_by_themselves(
+    x11_plat: linux.LinuxPlatform, xdisplay: FakeDisplay
+) -> None:
+    # wake_on_return off: the user's input wakes the monitors, not wake_display().
+    xdisplay.dpms_enabled = False
+    assert x11_plat.display_off() is True
+    assert x11_plat._restore_dpms_if_awake() is False  # still off: keep waiting
+    xdisplay.power_level = 0
+    assert x11_plat._restore_dpms_if_awake() is True
+    assert xdisplay.dpms_enabled is False
+    assert x11_plat._restore_dpms_if_awake() is True  # nothing left to do
+    assert xdisplay.dpms_log == ["enable", "force 3", "disable"]
 
 
 def test_display_off_kde_wayland_uses_kscreen_doctor(
@@ -443,7 +704,12 @@ def test_wake_x11_falls_back_to_xtest(
 ) -> None:
     x11(monkeypatch)
     nudges: list[bool] = []
-    monkeypatch.setattr(plat._ewmh, "nudge_pointer", lambda: nudges.append(True) or True)
+
+    def nudge() -> bool:
+        nudges.append(True)
+        return True
+
+    monkeypatch.setattr(plat._ewmh, "nudge_pointer", nudge)
     assert plat.wake_display() is True
     assert nudges == [True]
 
@@ -521,13 +787,187 @@ def test_lock_invalidates_locked_cache(
     monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
 ) -> None:
     monkeypatch.setenv("XDG_SESSION_ID", "5")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "GNOME")
     tools.install("loginctl")
-    hints = iter([(0, "no\n"), (0, "yes\n")])
-    tools.respond(["loginctl", "show-session"], lambda argv: next(hints))
+    hints = ["no\n", "yes\n"]
+    tools.respond(["loginctl", "show-session"], lambda argv: (0, hints.pop(0) if hints else "yes"))
     tools.respond(["loginctl", "lock-session"], (0, ""))
     assert plat.is_session_locked() is False
     assert plat.lock_screen() is True
     assert plat.is_session_locked() is True
+
+
+def test_session_locked_by_locker_without_locked_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    plat: linux.LinuxPlatform,
+    tools: FakeTools,
+    clock: Clock,
+    proc_tree: ProcTree,
+) -> None:
+    # sway + swaylock: logind's LockedHint stays "no" the whole time.
+    monkeypatch.setenv("XDG_SESSION_ID", "5")
+    wayland(monkeypatch, "sway")
+    tools.install("loginctl")
+    tools.respond(["loginctl", "show-session"], (0, "no\n"))
+    proc_tree.process(100, [], comm="sway")
+    assert plat.is_session_locked() is False
+    proc_tree.process(200, [], comm="swaylock")
+    clock.advance(2.5)
+    assert plat.is_session_locked() is True
+    proc_tree.remove(200)
+    clock.advance(2.5)
+    assert plat.is_session_locked() is False  # the unlock is seen too
+
+
+def test_session_locked_locker_names_are_truncated_like_comm(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, proc_tree: ProcTree
+) -> None:
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "i3")
+    proc_tree.process(300, [], comm="kscreenlocker_g")  # kscreenlocker_greet, 15 chars
+    assert plat.is_session_locked() is True
+
+
+def test_session_locked_ignores_other_users_lockers(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, proc_tree: ProcTree
+) -> None:
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "i3")
+    proc_tree.process(300, [], comm="i3lock")
+    owner = os.stat(proc_tree.proc / "300").st_uid
+    monkeypatch.setattr(linux, "_getuid", lambda: owner + 1)
+    assert plat.is_session_locked() is False
+
+
+def test_session_locked_without_logind_session_relies_on_lockers(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, proc_tree: ProcTree
+) -> None:
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "i3")
+    monkeypatch.setattr(linux, "_getuid", lambda: None)  # no session can be looked up
+    proc_tree.process(100, [], comm="i3")
+    assert plat.is_session_locked() is False
+    proc_tree.process(101, [], comm="slock")
+    plat._locked_cache = None
+    assert plat.is_session_locked() is True
+
+
+def test_session_locked_failed_query_is_unknown_not_unlocked(
+    monkeypatch: pytest.MonkeyPatch,
+    plat: linux.LinuxPlatform,
+    tools: FakeTools,
+    proc_tree: ProcTree,
+) -> None:
+    # A lock screen that is up must not be mistaken for the user's return.
+    monkeypatch.setenv("XDG_SESSION_ID", "5")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "GNOME")
+    tools.install("loginctl")
+    tools.respond(["loginctl", "show-session"], subprocess.TimeoutExpired(["loginctl"], 2.0))
+    assert plat.is_session_locked() is None
+
+
+def test_session_locked_gnome_trusts_locked_hint_without_scanning(
+    monkeypatch: pytest.MonkeyPatch,
+    plat: linux.LinuxPlatform,
+    tools: FakeTools,
+    proc_tree: ProcTree,
+) -> None:
+    monkeypatch.setenv("XDG_SESSION_ID", "5")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "ubuntu:GNOME")
+    tools.install("loginctl")
+    tools.respond(["loginctl", "show-session"], (0, "no\n"))
+    monkeypatch.setattr(plat, "_locker_running", lambda: pytest.fail("scanned /proc"))
+    assert plat.is_session_locked() is False
+
+
+def test_session_lookup_failure_is_retried(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, clock: Clock
+) -> None:
+    # Autostarted by a systemd user unit (no XDG_SESSION_ID) while logind is slow.
+    monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
+    tools.install("loginctl")
+    answers: list[Any] = [subprocess.TimeoutExpired(["loginctl"], 2.0)]
+
+    def show_user(argv: list[str]) -> tuple[int, str]:
+        if answers:
+            raise answers.pop(0)
+        return 0, "3\n"
+
+    tools.respond(["loginctl", "show-user"], show_user)
+    tools.respond(["loginctl", "show-session"], (0, "yes\n"))
+    assert plat.is_session_locked() is None
+    clock.advance(5.0)
+    assert plat.is_session_locked() is None  # not retried on every poll
+    assert [call[1] for call in tools.calls] == ["show-user"]
+    clock.advance(30.0)
+    assert plat.is_session_locked() is True
+    assert tools.calls[-1] == ["loginctl", "show-session", "3", "-p", "LockedHint", "--value"]
+
+
+def test_locked_hint_through_dbus_in_process(
+    monkeypatch: pytest.MonkeyPatch,
+    plat: linux.LinuxPlatform,
+    tools: FakeTools,
+    dbus: FakeDBus,
+    clock: Clock,
+) -> None:
+    monkeypatch.setenv("XDG_SESSION_ID", "5")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "GNOME")
+    tools.install("loginctl")
+    path = "/org/freedesktop/login1/session/_35"
+    dbus.answers["GetSession"] = linux._DBusReply((path,))
+    hints = [True, False]
+    dbus.answers["Get"] = lambda call: linux._DBusReply((hints.pop(0),))
+    assert plat.is_session_locked() is True
+    clock.advance(2.5)
+    assert plat.is_session_locked() is False
+    assert tools.calls == []  # no loginctl process per poll
+    assert dbus.methods() == ["GetSession", "Get", "Get"]  # the session path is cached
+    get = dbus.calls[1]
+    assert get["system"] is True
+    assert get["path"] == path
+    assert get["args"] == ("org.freedesktop.login1.Session", "LockedHint")
+
+
+def test_locked_hint_dbus_error_forgets_session_path(
+    monkeypatch: pytest.MonkeyPatch,
+    plat: linux.LinuxPlatform,
+    tools: FakeTools,
+    dbus: FakeDBus,
+    clock: Clock,
+) -> None:
+    monkeypatch.setenv("XDG_SESSION_ID", "5")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "GNOME")
+    tools.install("loginctl")
+    dbus.answers["GetSession"] = linux._DBusReply(("/org/freedesktop/login1/session/_35",))
+    dbus.answers["Get"] = linux._DBusReply((), "org.freedesktop.DBus.Error.UnknownObject")
+    assert plat.is_session_locked() is None
+    clock.advance(2.5)
+    assert plat.is_session_locked() is None
+    assert dbus.methods() == ["GetSession", "Get", "GetSession", "Get"]
+    assert tools.calls == []  # D-Bus answered: no pointless loginctl fallback
+
+
+@pytest.mark.parametrize(
+    ("session_reply", "hint_reply"),
+    [
+        (("/org/freedesktop/login1/session/_35",), ("yes",)),  # a variant left unconverted
+        ((None,), (True,)),  # an object path QtDBus could not convert
+    ],
+)
+def test_locked_hint_unexpected_dbus_reply_falls_back_to_loginctl(
+    monkeypatch: pytest.MonkeyPatch,
+    plat: linux.LinuxPlatform,
+    tools: FakeTools,
+    dbus: FakeDBus,
+    session_reply: tuple[Any, ...],
+    hint_reply: tuple[Any, ...],
+) -> None:
+    monkeypatch.setenv("XDG_SESSION_ID", "5")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "GNOME")
+    tools.install("loginctl")
+    tools.respond(["loginctl", "show-session"], (0, "yes\n"))
+    dbus.answers["GetSession"] = linux._DBusReply(session_reply)
+    dbus.answers["Get"] = linux._DBusReply(hint_reply)
+    assert plat.is_session_locked() is True
+    assert tools.names() == ["loginctl"]
 
 
 # ------------------------------------------------------------------ idle time
@@ -600,6 +1040,112 @@ def test_idle_x11_without_libxss_falls_back_to_mutter(
     assert plat.seconds_since_input() == pytest.approx(2.0)
 
 
+def test_idle_transient_failure_is_retried_soon(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, clock: Clock
+) -> None:
+    # gnome-shell stalls once (monitor hotplug, GPU hang): typing must not vanish for 60 s.
+    wayland(monkeypatch, "GNOME")
+    tools.install("gdbus")
+    answers: list[Any] = [(0, "(uint64 100,)"), subprocess.TimeoutExpired(["gdbus"], 1.0)]
+
+    def respond(argv: list[str]) -> tuple[int, str]:
+        answer = answers.pop(0) if answers else (0, "(uint64 200,)")
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    tools.respond(["gdbus"], respond)
+    assert plat.seconds_since_input() == pytest.approx(0.1)
+    clock.advance(1.0)
+    assert plat.seconds_since_input() is None
+    clock.advance(0.5)
+    assert plat.seconds_since_input() is None  # short back-off
+    clock.advance(0.6)
+    assert plat.seconds_since_input() == pytest.approx(0.2)
+    assert len(tools.calls) == 3
+    assert tools.kwargs[0]["timeout"] == pytest.approx(linux._IDLE_QUERY_TIMEOUT_S)
+
+
+def test_idle_through_dbus_in_process(
+    monkeypatch: pytest.MonkeyPatch,
+    plat: linux.LinuxPlatform,
+    tools: FakeTools,
+    dbus: FakeDBus,
+    clock: Clock,
+) -> None:
+    wayland(monkeypatch, "GNOME")
+    tools.install("gdbus")
+    dbus.answers["GetIdletime"] = linux._DBusReply((12345,))
+    assert plat.seconds_since_input() == pytest.approx(12.345)
+    clock.advance(0.6)
+    assert plat.seconds_since_input() == pytest.approx(12.345)
+    assert tools.calls == []  # no gdbus process twice a second
+    call = dbus.calls[0]
+    assert call["system"] is False
+    assert call["service"] == "org.gnome.Mutter.IdleMonitor"
+    assert call["path"] == "/org/gnome/Mutter/IdleMonitor/Core"
+
+
+def test_idle_dbus_missing_service_backs_off(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, dbus: FakeDBus, clock: Clock
+) -> None:
+    wayland(monkeypatch, "KDE")
+    dbus.answers["GetIdletime"] = linux._DBusReply((), "org.freedesktop.DBus.Error.ServiceUnknown")
+    assert plat.seconds_since_input() is None
+    clock.advance(30.0)
+    assert plat.seconds_since_input() is None
+    assert len(dbus.calls) == 1
+
+
+def test_idle_dbus_hiccup_after_success_retries_soon(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, dbus: FakeDBus, clock: Clock
+) -> None:
+    wayland(monkeypatch, "GNOME")
+    replies = [
+        linux._DBusReply((500,)),
+        linux._DBusReply((), "org.freedesktop.DBus.Error.NoReply"),
+        linux._DBusReply((700,)),
+    ]
+    dbus.answers["GetIdletime"] = lambda call: replies.pop(0)
+    assert plat.seconds_since_input() == pytest.approx(0.5)
+    clock.advance(0.6)
+    assert plat.seconds_since_input() is None
+    clock.advance(1.1)
+    assert plat.seconds_since_input() == pytest.approx(0.7)
+
+
+def test_idle_unexpected_dbus_reply_falls_back_to_gdbus(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, dbus: FakeDBus
+) -> None:
+    wayland(monkeypatch, "GNOME")
+    tools.install("gdbus")
+    tools.respond(["gdbus"], (0, "(uint64 1500,)"))
+    dbus.answers["GetIdletime"] = linux._DBusReply(("1500",))
+    assert plat.seconds_since_input() == pytest.approx(1.5)
+    assert tools.names() == ["gdbus"]
+
+
+def test_idle_ignores_reset_caused_by_our_ydotool_move(
+    monkeypatch: pytest.MonkeyPatch,
+    plat: linux.LinuxPlatform,
+    tools: FakeTools,
+    clock: Clock,
+    tmp_path: Path,
+) -> None:
+    wayland(monkeypatch, "GNOME")
+    ydotool_ready(monkeypatch, tools, tmp_path)
+    tools.install("gdbus")
+    idle_ms = [5000, 600, 100]
+    tools.respond(["gdbus"], lambda argv: (0, f"(uint64 {idle_ms.pop(0)},)"))
+    assert plat.seconds_since_input() == pytest.approx(5.0)  # last input at 995
+    assert plat.move_cursor(960, 540) is True  # uinput motion resets Mutter's idle timer
+    clock.advance(0.6)
+    # Mutter now says 0.6 s, but that reset was ours: the user has been idle for 5.6 s.
+    assert plat.seconds_since_input() == pytest.approx(5.6)
+    clock.advance(2.4)
+    assert plat.seconds_since_input() == pytest.approx(0.1)  # real input later is seen
+
+
 # ------------------------------------------------------------------ cursor
 def test_cursor_x11_leaves_it_to_qt(
     monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
@@ -610,24 +1156,113 @@ def test_cursor_x11_leaves_it_to_qt(
     assert tools.calls == []
 
 
+_YDOTOOL_1_HELP = (
+    "Usage: mousemove [OPTION]... [-x <xpos> -y <ypos>] [-- <xpos> <ypos>]\n"
+    "  -a, --absolute             Use absolute position, not applied to wheel\n"
+)
+
+
+def ydotool_ready(monkeypatch: pytest.MonkeyPatch, tools: FakeTools, tmp_path: Path) -> None:
+    """ydotool 1.x installed and ydotoold listening."""
+    socket_path = tmp_path / "ydotool.sock"
+    socket_path.write_text("")
+    monkeypatch.setenv("YDOTOOL_SOCKET", str(socket_path))
+    tools.install("ydotool")
+    tools.respond(["ydotool", "mousemove", "--help"], (0, _YDOTOOL_1_HELP))
+    tools.respond(["ydotool", "mousemove", "--absolute"], (0, ""))
+
+
 def test_cursor_wayland_uses_ydotool(
-    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, tmp_path: Path
 ) -> None:
     wayland(monkeypatch, "GNOME")
-    tools.install("ydotool")
-    tools.respond(["ydotool"], (0, ""))
+    ydotool_ready(monkeypatch, tools, tmp_path)
     assert plat.move_cursor(2560, -20) is True
-    assert tools.calls == [["ydotool", "mousemove", "--absolute", "-x", "2560", "-y", "-20"]]
+    assert plat.move_cursor(10, 20) is True
+    assert tools.calls == [
+        ["ydotool", "mousemove", "--help"],  # probed once
+        ["ydotool", "mousemove", "--absolute", "-x", "2560", "-y", "-20"],
+        ["ydotool", "mousemove", "--absolute", "-x", "10", "-y", "20"],
+    ]
 
 
 def test_cursor_wayland_without_ydotool(
-    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, tmp_path: Path
 ) -> None:
     wayland(monkeypatch, "GNOME")
     assert plat.move_cursor(1, 2) is False
-    tools.install("ydotool")
-    tools.respond(["ydotool"], (1, "failed to connect socket"))
+    ydotool_ready(monkeypatch, tools, tmp_path)
+    tools.respond(["ydotool", "mousemove", "--absolute"], (1, "failed to connect socket"))
     assert plat.move_cursor(1, 2) is False
+
+
+def test_cursor_old_ydotool_is_unsupported(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, tmp_path: Path
+) -> None:
+    # Debian/Ubuntu still ship 0.1.x, whose CLI has no --absolute.
+    wayland(monkeypatch, "GNOME")
+    ydotool_ready(monkeypatch, tools, tmp_path)
+    tools.respond(
+        ["ydotool", "mousemove", "--help"], (1, "Usage: mousemove [--delay <ms>] <x> <y>")
+    )
+    assert plat.move_cursor(1, 2) is False
+    assert plat.capabilities()["cursor"] is False
+    assert tools.calls == [["ydotool", "mousemove", "--help"]]
+
+
+def test_cursor_ydotool_needs_its_daemon(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, tmp_path: Path
+) -> None:
+    wayland(monkeypatch, "GNOME")
+    ydotool_ready(monkeypatch, tools, tmp_path)
+    monkeypatch.setenv("YDOTOOL_SOCKET", str(tmp_path / "missing.sock"))
+    assert plat.move_cursor(1, 2) is False
+    assert plat.capabilities()["cursor"] is False
+    runtime = tmp_path / "run"
+    runtime.mkdir()
+    (runtime / ".ydotool_socket").write_text("")
+    monkeypatch.delenv("YDOTOOL_SOCKET")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    assert plat.move_cursor(1, 2) is True
+
+
+def test_cursor_sway_moves_through_its_ipc(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, tmp_path: Path
+) -> None:
+    wayland(monkeypatch, "sway")
+    monkeypatch.setenv("SWAYSOCK", "/run/user/1000/sway-ipc.sock")
+    ydotool_ready(monkeypatch, tools, tmp_path)
+    tools.install("swaymsg")
+    tools.respond(["swaymsg"], (0, ""))
+    assert plat.move_cursor(2880, 540) is True
+    assert tools.calls == [["swaymsg", "seat", "-", "cursor", "set", "2880", "540"]]
+    # Older sway without the "-" seat alias: the default seat name.
+    tools.calls.clear()
+    tools.respond(["swaymsg", "seat", "-"], (2, "Error: seat - not found"))
+    assert plat.move_cursor(1, 2) is True
+    assert tools.calls[-1] == ["swaymsg", "seat", "seat0", "cursor", "set", "1", "2"]
+
+
+def test_cursor_hyprland_moves_through_its_ipc(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
+) -> None:
+    wayland(monkeypatch, "Hyprland")
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "abc")
+    tools.install("hyprctl")
+    tools.respond(["hyprctl"], (0, "ok\n"))
+    assert plat.move_cursor(100, 200) is True
+    assert tools.calls == [["hyprctl", "dispatch", "movecursor", "100", "200"]]
+    tools.respond(["hyprctl"], (0, "Invalid dispatcher\n"))  # hyprctl exits 0 regardless
+    assert plat.move_cursor(100, 200) is False
+
+
+def test_cursor_position_reliability(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform
+) -> None:
+    x11(monkeypatch)
+    assert plat.cursor_position_reliable() is True
+    wayland(monkeypatch, "GNOME")  # XWayland only sees the pointer over X11 windows
+    assert plat.cursor_position_reliable() is False
 
 
 # ------------------------------------------------------------------ camera in use
@@ -652,11 +1287,14 @@ class ProcTree:
 
     def process(self, pid: int, targets: list[str], comm: str = "app", maps: str = "") -> None:
         base = self.proc / str(pid)
-        (base / "fd").mkdir(parents=True)
+        (base / "fd").mkdir(parents=True, exist_ok=True)
         for fd, target in enumerate(targets):
             (base / "fd" / str(fd)).write_text(target)
         (base / "comm").write_text(comm + "\n")
         (base / "maps").write_text(maps)
+
+    def remove(self, pid: int) -> None:
+        shutil.rmtree(self.proc / str(pid))
 
 
 @pytest.fixture
@@ -735,15 +1373,32 @@ def test_camera_without_dev_info_matches_any_video_node(
 ) -> None:
     proc_tree.process(100, ["/dev/video3"])
     platform = linux.LinuxPlatform(
-        proc_root=proc_tree.proc, dev_root=tmp_path / "missing", sys_root=proc_tree.sys, clock=clock
+        proc_root=proc_tree.proc,
+        dev_root=tmp_path / "missing",
+        sys_root=proc_tree.sys,
+        clock=clock,
+        background_threads=False,
     )
     assert platform.camera_in_use_by_other_app() is True
 
 
 def test_camera_unknown_without_proc(tmp_path: Path, clock: Clock) -> None:
-    platform = linux.LinuxPlatform(proc_root=tmp_path / "nope", clock=clock)
+    platform = linux.LinuxPlatform(
+        proc_root=tmp_path / "nope", clock=clock, background_threads=False
+    )
     assert platform.camera_in_use_by_other_app() is None
     assert platform.capabilities()["camera_in_use"] is False
+
+
+def test_camera_scan_skips_other_users_processes(
+    proc_tree: ProcTree, plat: linux.LinuxPlatform, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc_tree.device("video0")
+    proc_tree.process(100, ["/dev/video0"])
+    owner = os.stat(proc_tree.proc / "100").st_uid
+    monkeypatch.setattr(linux, "_readlink", lambda path: pytest.fail("read another user's fds"))
+    monkeypatch.setattr(linux, "_getuid", lambda: owner + 1)
+    assert plat.camera_in_use_by_other_app() is False
 
 
 def test_camera_result_is_cached(
@@ -762,6 +1417,288 @@ def test_camera_permission(proc_tree: ProcTree, plat: linux.LinuxPlatform) -> No
     assert plat.permissions() == {"camera": None, "accessibility": None}
     proc_tree.device("video0")
     assert plat.permissions()["camera"] is True
+
+
+# ------------------------------------------------------------------ camera: refused opens
+def opened(foreign: bool | None) -> list[linux._CameraEvent]:
+    """A capture attempt that failed at once: read-write open, then close (merged)."""
+    return [linux._CameraEvent(opened=True, foreign=foreign, wrote=True)]
+
+
+@pytest.fixture
+def streaming(proc_tree: ProcTree) -> ProcTree:
+    """A physical camera that this process streams from."""
+    proc_tree.device("video0")
+    proc_tree.process(os.getpid(), ["/dev/video0"], comm="eye-tracker")
+    return proc_tree
+
+
+def test_refused_open_releases_the_camera_for_a_grace_period(
+    streaming: ProcTree, plat: linux.LinuxPlatform, clock: Clock
+) -> None:
+    # A browser joining a call opens the node, gets EBUSY and closes it again at once.
+    assert plat.camera_in_use_by_other_app() is False
+    plat._camera.handle_events(opened(foreign=True))
+    assert plat.camera_in_use_by_other_app() is True  # no holder, but an attempt
+    clock.advance(plat._camera.grace_s - 1.0)
+    assert plat.camera_in_use_by_other_app() is True
+    clock.advance(2.0)
+    assert plat.camera_in_use_by_other_app() is False  # nobody took it: resume
+
+
+def test_refused_open_then_app_takes_the_camera(
+    streaming: ProcTree, plat: linux.LinuxPlatform, clock: Clock
+) -> None:
+    plat._camera.handle_events(opened(foreign=True))
+    assert plat.camera_in_use_by_other_app() is True
+    # We released the camera; the app retried and now streams.
+    streaming.process(os.getpid(), [], comm="eye-tracker")
+    (streaming.proc / str(os.getpid()) / "fd" / "0").unlink()
+    streaming.process(700, ["/dev/video0"], comm="chrome")
+    clock.advance(3.5)
+    assert plat.camera_in_use_by_other_app() is True
+    clock.advance(plat._camera.grace_s)
+    assert plat.camera_in_use_by_other_app() is True  # held: stays released
+    streaming.remove(700)
+    clock.advance(3.5)
+    assert plat.camera_in_use_by_other_app() is False
+    assert plat._camera._false_alarms == 0
+
+
+@pytest.mark.parametrize("foreign", [False, None])
+def test_own_or_unattributed_opens_are_not_contention(
+    streaming: ProcTree, plat: linux.LinuxPlatform, foreign: bool | None
+) -> None:
+    # Our own probe/reopen (foreign=False), or inotify that cannot tell (None).
+    plat._camera.handle_events(opened(foreign=foreign))
+    assert plat.camera_in_use_by_other_app() is False
+
+
+def test_device_listing_is_not_contention(streaming: ProcTree, plat: linux.LinuxPlatform) -> None:
+    # A browser enumerating cameras opens each node read-only and closes it.
+    plat._camera.handle_events(
+        [
+            linux._CameraEvent(opened=True, foreign=True),
+            linux._CameraEvent(opened=False, foreign=True),
+        ]
+    )
+    assert plat.camera_in_use_by_other_app() is False
+
+
+def test_app_keeping_the_node_open_is_found_by_the_rescan(
+    streaming: ProcTree, plat: linux.LinuxPlatform, clock: Clock
+) -> None:
+    assert plat.camera_in_use_by_other_app() is False
+    streaming.process(700, ["/dev/video0"], comm="zoom")  # opened, retrying, not closed yet
+    plat._camera.handle_events([linux._CameraEvent(opened=True, foreign=True)])
+    clock.advance(plat._camera.debounce_s)
+    assert plat.camera_in_use_by_other_app() is True
+
+
+def test_foreign_open_while_we_do_not_stream_is_not_contention(
+    proc_tree: ProcTree, plat: linux.LinuxPlatform
+) -> None:
+    proc_tree.device("video0")
+    plat._camera.handle_events(opened(foreign=True))  # it will succeed: no conflict
+    assert plat.camera_in_use_by_other_app() is False
+
+
+def test_repeated_false_alarms_back_off(
+    streaming: ProcTree, plat: linux.LinuxPlatform, clock: Clock
+) -> None:
+    watcher = plat._camera
+
+    def false_alarm() -> None:
+        watcher.handle_events(opened(foreign=True))
+        assert plat.camera_in_use_by_other_app() is True
+        clock.advance(watcher.grace_s + 0.1)
+        assert plat.camera_in_use_by_other_app() is False
+
+    false_alarm()  # the first one is free: the user may simply have been slow to retry
+    false_alarm()
+    # An app keeps probing in the background: ignored for a while ...
+    watcher.handle_events(opened(foreign=True))
+    assert plat.camera_in_use_by_other_app() is False
+    clock.advance(watcher.cooldown_s)
+    false_alarm()  # ... then honoured again, with a longer cooldown afterwards
+    clock.advance(watcher.cooldown_s)
+    watcher.handle_events(opened(foreign=True))
+    assert plat.camera_in_use_by_other_app() is False
+    clock.advance(watcher.cooldown_s)
+    watcher.handle_events(opened(foreign=True))
+    assert plat.camera_in_use_by_other_app() is True
+
+
+def _fan_event(mask: int, pid: int, length: int = 24) -> bytes:
+    header = struct.pack("=IBBHQii", length, 3, 0, 24, mask, -1, pid)
+    return header + b"\0" * (length - len(header))
+
+
+def test_parse_fanotify_attributes_opens() -> None:
+    own = 4242
+    data = (
+        _fan_event(0x20 | 0x10, own, length=56)  # our read-only open+close, merged, FID record
+        + _fan_event(0x20, 0)  # another process (pid hidden from unprivileged listeners)
+        + _fan_event(0x08, 0)  # ... closing a read-write descriptor
+        + _fan_event(0x20 | 0x08, 0)  # a refused capture attempt, merged
+        + _fan_event(0x4000, 0)  # queue overflow: unknown
+        + _fan_event(0x01, 0)  # an access event: not asked for, ignored
+    )
+    assert linux._parse_fanotify(data, own) == [
+        linux._CameraEvent(opened=True, foreign=False),
+        linux._CameraEvent(opened=True, foreign=True),
+        linux._CameraEvent(opened=False, foreign=True, wrote=True),
+        linux._CameraEvent(opened=True, foreign=True, wrote=True),
+        linux._CameraEvent(opened=False, foreign=None),
+    ]
+    assert linux._parse_fanotify(_fan_event(0x20, 0, length=0) * 3, own) == []  # malformed
+
+
+def test_parse_inotify_has_no_attribution() -> None:
+    data = (
+        struct.pack("=iIII", 1, 0x20, 0, 0)
+        + struct.pack("=iIII", 1, 0x10, 0, 4)
+        + b"x\0\0\0"
+        + struct.pack("=iIII", 1, 0x08, 0, 0)
+    )
+    assert linux._parse_inotify(data) == [
+        linux._CameraEvent(opened=True, foreign=None),
+        linux._CameraEvent(opened=False, foreign=None),
+        linux._CameraEvent(opened=False, foreign=None, wrote=True),
+    ]
+
+
+def test_no_notifier_without_nodes() -> None:
+    assert linux._open_camera_notifier([]) is None
+
+
+# ------------------------------------------------------------------ camera: background thread
+class FakeNotifier:
+    kind = "fake"
+
+    def __init__(self) -> None:
+        self.events: list[list[linux._CameraEvent]] = []
+        self.ready = threading.Event()
+        self.closed = False
+
+    def push(self, events: list[linux._CameraEvent]) -> None:
+        self.events.append(events)
+        self.ready.set()
+
+    def wait(self, timeout: float) -> list[linux._CameraEvent]:
+        if self.ready.wait(timeout):
+            self.ready.clear()
+            return self.events.pop(0) if self.events else []
+        return []
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _eventually(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+@pytest.fixture
+def threaded(proc_tree: ProcTree) -> Iterable[tuple[linux.LinuxPlatform, list[FakeNotifier]]]:
+    notifiers: list[FakeNotifier] = []
+
+    def factory(paths: Any) -> FakeNotifier:
+        notifiers.append(FakeNotifier())
+        return notifiers[-1]
+
+    platform = linux.LinuxPlatform(
+        proc_root=proc_tree.proc,
+        dev_root=proc_tree.dev,
+        sys_root=proc_tree.sys,
+        camera_notifier_factory=factory,
+    )
+    platform._camera.max_wait_s = 0.02
+    try:
+        yield platform, notifiers
+    finally:
+        platform._camera.stop()
+
+
+def test_camera_scan_runs_off_the_calling_thread(
+    proc_tree: ProcTree, threaded: tuple[linux.LinuxPlatform, list[FakeNotifier]]
+) -> None:
+    platform, notifiers = threaded
+    proc_tree.device("video0")
+    proc_tree.process(100, ["/dev/video0"])
+    scanners: list[threading.Thread] = []
+    scan = platform._camera._scan
+
+    def recording_scan(devices: Any) -> bool | None:
+        scanners.append(threading.current_thread())
+        return scan(devices)
+
+    platform._camera._scan = recording_scan  # type: ignore[method-assign]
+    assert _eventually(lambda: platform.camera_in_use_by_other_app() is True)
+    assert scanners
+    assert threading.current_thread() not in scanners
+    assert len(notifiers) == 1  # event-driven: the node is watched
+
+
+def test_camera_thread_rescans_on_open_events(
+    proc_tree: ProcTree, threaded: tuple[linux.LinuxPlatform, list[FakeNotifier]]
+) -> None:
+    platform, notifiers = threaded
+    proc_tree.device("video0")
+    assert _eventually(lambda: platform.camera_in_use_by_other_app() is False)
+    assert _eventually(lambda: bool(notifiers))
+    proc_tree.process(100, ["/dev/video0"])  # an app starts streaming ...
+    notifiers[0].push([linux._CameraEvent(opened=True, foreign=None)])  # ... and is noticed
+    assert _eventually(lambda: platform.camera_in_use_by_other_app() is True)
+
+
+def test_camera_thread_stops_when_nobody_asks(
+    proc_tree: ProcTree, threaded: tuple[linux.LinuxPlatform, list[FakeNotifier]]
+) -> None:
+    platform, notifiers = threaded
+    proc_tree.device("video0")
+    platform._camera.idle_stop_s = 0.1
+    platform.camera_in_use_by_other_app()
+    assert _eventually(lambda: platform._camera._thread is None)
+    assert _eventually(lambda: bool(notifiers) and notifiers[0].closed)
+    platform.camera_in_use_by_other_app()  # asking again restarts it
+    assert _eventually(lambda: len(notifiers) == 2)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fanotify/inotify are Linux APIs")
+@pytest.mark.parametrize("kind", ["fanotify", "inotify"])
+def test_real_notifier_reports_opens(tmp_path: Path, kind: str) -> None:
+    node = tmp_path / "video0"
+    node.write_text("")
+    cls = linux._FanotifyNotifier if kind == "fanotify" else linux._InotifyNotifier
+    try:
+        notifier = cls([str(node)])
+    except OSError as exc:
+        pytest.skip(f"{kind} unavailable here: {exc}")
+    try:
+        with open(node, "rb"):
+            pass
+        # The child opens read-write, like a capture attempt.
+        subprocess.run([sys.executable, "-c", f"open({str(node)!r}, 'r+b').close()"], check=True)
+        events: list[linux._CameraEvent] = []
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not any(e.wrote for e in events):
+            events += notifier.wait(0.2)
+    finally:
+        notifier.close()
+    opens = [event.foreign for event in events if event.opened]
+    writes = [event.foreign for event in events if event.wrote]
+    if kind == "fanotify":
+        assert opens == [False, True]  # ours, then the child process's
+        assert writes == [True]
+    else:
+        assert opens == [None, None]
+        assert writes == [None]
 
 
 # ------------------------------------------------------------------ EWMH windows
@@ -800,6 +1737,38 @@ class FakeDisplay:
         self.windows: dict[int, FakeWindow] = {}
         self.root = FakeWindow(self, 1)
         self.flushed = 0
+        # DPMS extension state
+        self.extensions = {"DPMS"}
+        self.dpms_capable_flag = True
+        self.dpms_enabled = True
+        self.power_level = 0
+        self.dpms_log: list[str] = []
+
+    def has_extension(self, name: str) -> bool:
+        return name in self.extensions
+
+    def dpms_capable(self) -> Any:
+        return SimpleNamespace(capable=self.dpms_capable_flag)
+
+    def dpms_info(self) -> Any:
+        return SimpleNamespace(power_level=self.power_level, state=self.dpms_enabled)
+
+    def dpms_enable(self) -> None:
+        self.dpms_log.append("enable")
+        self.dpms_enabled = True
+
+    def dpms_disable(self) -> None:
+        self.dpms_log.append("disable")
+        self.dpms_enabled = False
+        self.power_level = 0  # disabling DPMS turns the monitors back on
+
+    def dpms_force_level(self, level: int) -> None:
+        assert self.dpms_enabled, "BadMatch: DPMS is disabled"
+        self.dpms_log.append(f"force {level}")
+        self.power_level = level
+
+    def sync(self) -> None:
+        pass
 
     def intern_atom(self, name: str) -> int:
         if name not in self.atoms:
@@ -977,7 +1946,7 @@ def test_x11_connection_loss_reconnects(
     def broken(*args: Any) -> Any:
         raise ConnectionResetError("X server went away")
 
-    xdisplay.root.get_full_property = broken  # type: ignore[method-assign]
+    xdisplay.root.get_full_property = broken  # type: ignore[method-assign,assignment]
     assert x11_plat.foreground_window() is None
     assert x11_plat._ewmh._display is None
     del xdisplay.root.get_full_property
@@ -1010,7 +1979,7 @@ def test_capabilities_x11(
 
 
 def test_capabilities_wayland(
-    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, tmp_path: Path
 ) -> None:
     wayland(monkeypatch, "GNOME", display=False)
     tools.install("busctl", "gdbus")
@@ -1022,7 +1991,7 @@ def test_capabilities_wayland(
     assert not caps["focus"]
     assert not caps["cursor"]
     assert not caps["hotkeys"]
-    tools.install("ydotool")
+    ydotool_ready(monkeypatch, tools, tmp_path)
     assert plat.capabilities()["cursor"]
 
 

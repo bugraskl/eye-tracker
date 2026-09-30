@@ -60,12 +60,18 @@ from ..platform.hotkeys import format_hotkey, parse_hotkey
 from ..types import Observation, TrackingState
 from .icons import app_icon
 from .preview import bgr_to_qimage
-from .settings_dialog import CameraProbe, platform_from_controller, settings_from_controller
+from .settings_dialog import (
+    CameraProbe,
+    camera_in_use,
+    platform_from_controller,
+    settings_from_controller,
+)
 from .util import ACCENT, ACCENT_2, DANGER, SUCCESS, WARNING, controller_state, ui_scale
 
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "CAMERA_PRIVACY_HELP",
     "PAGE_CAMERA",
     "PAGE_FINISH",
     "PAGE_PERMISSIONS",
@@ -104,6 +110,22 @@ _CAPABILITY_FOR = {
 # How long a face counts as "detected" after the last observation that had one.
 _FACE_FRESH_S = 1.0
 _CAMERA_STALE_S = 2.5
+
+#: Where to allow camera access, by ``sys.platform`` (Linux: every other Unix).
+CAMERA_PRIVACY_HELP: dict[str, str] = {
+    "win32": (
+        "If Windows blocks the camera: Settings › Privacy & security › Camera, turn on "
+        "“Camera access” and “Let desktop apps access your camera”."
+    ),
+    "darwin": (
+        f"If macOS blocks the camera: System Settings › Privacy & Security › Camera, "
+        f"allow {APP_NAME}."
+    ),
+    "linux": (
+        "If your account may not use the camera: add it to the “video” group "
+        "(sudo usermod -aG video $USER), then log out and back in."
+    ),
+}
 
 
 def _meta(key: str) -> dict[str, Any]:
@@ -313,7 +335,22 @@ class _CameraPage(QWizardPage):
         font.setWeight(QFont.Weight.DemiBold)
         self.status.setFont(font)
         self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status.setWordWrap(True)
         layout.addWidget(self.status)
+        # Shown only when the camera cannot be opened: the OS privacy switch is
+        # the usual culprit, and not something "try another camera" would fix.
+        self.help = _muted(CAMERA_PRIVACY_HELP.get(sys.platform, CAMERA_PRIVACY_HELP["linux"]))
+        self.help.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.help.setVisible(False)
+        layout.addWidget(self.help)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.privacy_settings = QPushButton("Open camera privacy settings")
+        self.privacy_settings.clicked.connect(wizard.open_camera_privacy_settings)
+        self.privacy_settings.setVisible(False)
+        row.addWidget(self.privacy_settings)
+        row.addStretch(1)
+        layout.addLayout(row)
         layout.addWidget(
             _muted(
                 "The preview is shown only here and is never saved. The camera light may "
@@ -353,6 +390,7 @@ class _PermissionsPage(QWizardPage):
             heading = QLabel(f"<b>{title}</b>")
             grid.addWidget(heading, n * 2, 0)
             status = QLabel()
+            status.setWordWrap(True)
             self.status[name] = status
             grid.addWidget(status, n * 2, 1)
             allow = QPushButton("Allow…")
@@ -585,7 +623,8 @@ class FirstRunWizard(QWizard):
     def detect_cameras(self) -> None:
         """Probe for cameras in the background and refresh the device list."""
         settings = settings_from_controller(self._controller)
-        if self._probe.start(settings.camera.api):
+        # The camera behind the live preview is not probed (see camera_in_use).
+        if self._probe.start(settings.camera.api, skip=camera_in_use(self._controller)):
             self.camera_page.detect.setEnabled(False)
             self.camera_page.detect.setText("Detecting…")
 
@@ -605,11 +644,20 @@ class FirstRunWizard(QWizard):
             log.warning("Requesting the %s permission failed", name, exc_info=True)
         self._refresh_permissions()
 
-    def open_permission_settings(self, name: str) -> None:
+    def open_permission_settings(self, name: str) -> bool:
+        """Open the OS settings page for a permission. Returns whether one opened."""
         try:
-            self._platform.open_permission_settings(name)
+            return bool(self._platform.open_permission_settings(name))
         except Exception:
             log.warning("Opening the %s settings failed", name, exc_info=True)
+            return False
+
+    def open_camera_privacy_settings(self) -> None:
+        """The camera page's button: the OS page, or the steps where there is none."""
+        if not self.open_permission_settings("camera"):
+            # No settings page to open (Linux): the help text says what to do.
+            self.camera_page.help.setVisible(True)
+            self.camera_page.help.setStyleSheet(f"color: {WARNING};")
 
     # ============================================================== QWizard
     def accept(self) -> None:
@@ -730,11 +778,13 @@ class FirstRunWizard(QWizard):
 
         ``"face"`` (a face was seen within the last second), ``"no_face"``,
         ``"waiting"`` (no frames yet), ``"error"`` (the camera cannot be opened),
-        ``"off"`` (paused or privacy mode) or ``"busy"`` (another app has the camera).
+        ``"blocked"`` (it cannot be opened and the OS reports that camera access
+        is denied), ``"off"`` (paused or privacy mode) or ``"busy"`` (another app
+        has the camera).
         """
         state = self._tracking_state
         if state == TrackingState.CAMERA_ERROR:
-            return "error"
+            return "blocked" if self._camera_permission() is False else "error"
         if state == TrackingState.YIELDED:
             return "busy"
         if not state.camera_active:
@@ -752,16 +802,34 @@ class FirstRunWizard(QWizard):
             "face": ("✓  Face detected", SUCCESS),
             "no_face": ("✗  No face detected — sit in front of the camera", WARNING),
             "waiting": ("Starting the camera…", None),
-            "error": ("✗  The camera could not be opened — try another one", DANGER),
+            "error": (
+                "✗  The camera could not be opened — another app may be using it, or the "
+                "system's privacy settings may block it",
+                DANGER,
+            ),
+            "blocked": ("✗  Camera access is blocked in the system's privacy settings", DANGER),
             "off": ("The camera is off — tracking is paused or in privacy mode", WARNING),
             "busy": ("The camera is in use by another app — close it to continue", WARNING),
         }[status]
-        label = self.camera_page.status
+        page = self.camera_page
+        label = page.status
         if label.text() != text:
             label.setText(text)
             label.setStyleSheet(f"color: {color};" if color else "")
+        failed = status in ("error", "blocked")
+        page.help.setVisible(failed)
+        page.privacy_settings.setVisible(failed)
         if self.currentId() == PAGE_PERMISSIONS:
             self._refresh_permissions()
+
+    def _camera_permission(self) -> bool | None:
+        """The OS camera permission (``None``: unknown or not applicable)."""
+        try:
+            value = dict(self._platform.permissions()).get("camera")
+        except Exception:
+            log.debug("permissions() failed", exc_info=True)
+            return None
+        return value if isinstance(value, bool) else None
 
     def _known_cameras(self) -> list[str]:
         combo = self.camera_page.device
@@ -826,10 +894,15 @@ class FirstRunWizard(QWizard):
             perms = dict(self._platform.permissions())
         except Exception:
             perms = {}
+        stale = self._accessibility_status() == "stale"
         for name, label in self.permissions_page.status.items():
             value = perms.get(name)
             if value is True:
                 text, color = "✓ Allowed", SUCCESS
+            elif name == "accessibility" and stale:
+                # Granted to an earlier build: the toggle looks on but no longer applies.
+                text = "✗ Granted to an earlier version — remove it with “−” and add it again"
+                color = DANGER
             elif value is False:
                 text, color = "✗ Not allowed yet", DANGER
             else:
@@ -839,6 +912,20 @@ class FirstRunWizard(QWizard):
                 label.setStyleSheet(f"color: {color};" if color else "")
             # Nothing left to ask for once granted.
             self.permissions_page.allow[name].setEnabled(value is not True)
+
+    def _accessibility_status(self) -> str:
+        """``platform.accessibility_status()`` ("granted", "missing", "stale", "unknown").
+
+        Only macOS implements it; elsewhere, or when it fails, ``"unknown"``.
+        """
+        getter = getattr(self._platform, "accessibility_status", None)
+        if not callable(getter):
+            return "unknown"
+        try:
+            return str(getter())
+        except Exception:
+            log.debug("accessibility_status() failed", exc_info=True)
+            return "unknown"
 
     # ============================================================== misc
     def _apply_autostart(self, wanted: bool) -> None:

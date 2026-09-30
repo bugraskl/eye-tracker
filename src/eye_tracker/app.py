@@ -9,11 +9,18 @@ loop. The startup order matters:
    they load;
 2. ``PlatformServices.prepare_process`` before the ``QApplication`` exists
    (DPI awareness and Qt environment variables), then the ``QApplication``;
-3. the single-instance check: if the app already runs, it is asked to show
-   itself (or to calibrate) and this process exits without touching the log
-   file or the settings;
+3. the single-instance check: whoever takes the :class:`~eye_tracker.ipc.InstanceLock`
+   is the instance. Otherwise (or if an older version answers) the running app
+   is asked to show itself (or to calibrate) and this process exits without
+   touching the log file or the settings;
 4. file logging, settings, the command socket, the
-   :class:`~eye_tracker.engine.controller.Controller` and the UI.
+   :class:`~eye_tracker.engine.controller.Controller` and the UI; once the
+   event loop runs, the login item is pointed at this copy if it moved.
+
+A process started at login (``--background``) stays quiet for
+:data:`STARTUP_QUIET_S`. If the first-run setup was never finished, it then
+offers the setup assistant with a notification, and a second launch (or
+``ctl show``) opens the assistant.
 
 :class:`EyeTrackerApp` owns the controller and every window. The windows talk to
 the controller themselves (the tray, the gaze overlay, the countdown toast and
@@ -73,12 +80,18 @@ log = logging.getLogger(__name__)
 EXPLICIT_CALIBRATION_REASONS = frozenset({"hotkey", "ipc", "user"})
 #: With ``--background`` (login start) notifications stay quiet this long.
 STARTUP_QUIET_S = 20.0
-#: Clicking the "calibration needed" notification later than this does nothing.
+#: Clicking a "calibration needed" or "finish setup" notification later than
+#: this does nothing.
 PROMPT_CLICK_WINDOW_S = 600.0
+#: Kinds of our own notifications that open a window when clicked.
+PROMPT_CALIBRATE = "calibrate"
+PROMPT_SETUP = "setup"
 #: How often Python gets control during the event loop, so Ctrl+C is handled.
 SIGNAL_POLL_MS = 500
 #: Delay before quitting on an IPC ``quit``, so the reply reaches the client.
 _QUIT_DELAY_MS = 100
+#: Margin after the startup mute ends before a deferred notification is shown.
+_AFTER_QUIET_MS = 250
 #: Settings that ``--camera`` / ``--backend`` override for one session.
 _OVERRIDABLE = {"camera": "camera.device", "backend": "general.backend"}
 
@@ -195,16 +208,83 @@ def build_app(
         except Exception:
             log.debug("set_accessory_app failed", exc_info=True)
 
-    # Single instance: hand the request to the running app and leave.
+    # Single instance. Taking the lock is atomic, so of two launches racing each
+    # other exactly one becomes the instance; the other hands its request over
+    # (waiting for the winner to start listening) and leaves.
     request = "calibrate" if options.calibrate else "show"
-    reply = ipc.send_command(request)
+    lock = ipc.InstanceLock()
+    owner = lock.acquire()
+    # The owner asks too: an instance of a version without the lock answers.
+    reply = ipc.send_command(request, wait_ms=0 if owner else ipc.STARTUP_WAIT_MS)
     if reply is not None:
+        lock.release()
         if reply.startswith("error"):
             log.warning("The running instance refused %r: %s", request, reply)
             return AppContext(qt_app, exit_code=1)
         log.info("%s is already running; asked it to %s", APP_NAME, request)
         return AppContext(qt_app, exit_code=0)
+    if not owner:
+        log.error("Another instance holds %s but does not answer; exiting", lock.path)
+        _show_error(qt_app, f"{APP_NAME} is already running but does not respond.")
+        return AppContext(qt_app, exit_code=1)
 
+    try:
+        app = _create_app(
+            qt_app,
+            args,
+            services,
+            options,
+            level=level,
+            console=console,
+            controller_factory=controller_factory,
+            controller_kwargs=controller_kwargs,
+        )
+    except BaseException:
+        lock.release()  # never keep a later launch out after failing here
+        raise
+    server = ipc.InstanceServer(app.handle_command, app, lock=lock)
+    if not server.listen():
+        if server.another_instance_running:
+            # Only possible where files cannot be locked: another instance
+            # claimed the socket after our check, or it hangs.
+            log.error("Another instance is running but does not answer; exiting")
+            _show_error(qt_app, f"{APP_NAME} is already running but does not respond.")
+            server.close()
+            app.shutdown()
+            return AppContext(qt_app, exit_code=1)
+        log.warning("Command socket unavailable; 'eye-tracker ctl' will not work")
+
+    try:
+        app.start()
+    except Exception as exc:
+        log.exception("%s could not start", APP_NAME)
+        server.close()
+        app.shutdown()
+        _show_error(
+            qt_app,
+            f"{APP_NAME} could not start:\n\n{exc}\n\n"
+            f"Details are in the log file:\n{paths.log_file()}",
+        )
+        return AppContext(qt_app, exit_code=1)
+    return AppContext(qt_app, app, server)
+
+
+def _create_app(
+    qt_app: QApplication,
+    args: argparse.Namespace,
+    services: PlatformServices,
+    options: AppOptions,
+    *,
+    level: str,
+    console: bool,
+    controller_factory: ControllerFactory | None,
+    controller_kwargs: Mapping[str, Any] | None,
+) -> EyeTrackerApp:
+    """File logging, settings (with command-line overrides) and the app object.
+
+    Runs once this process is known to be the instance, so it may write the log
+    file and read the settings.
+    """
     setup_logging(level, console=console)
     install_qt_message_handler()
     settings = Settings.load(paths.settings_file())
@@ -224,7 +304,7 @@ def build_app(
         controller_kwargs = {**dict(controller_kwargs or {}), "trace_path": trace}
     if controller_factory is None and controller_kwargs:
         controller_factory = _controller_factory(dict(controller_kwargs))
-    app = EyeTrackerApp(
+    return EyeTrackerApp(
         qt_app,
         settings,
         services,
@@ -232,29 +312,6 @@ def build_app(
         controller_factory=controller_factory,
         session_overrides=overrides,
     )
-    server = ipc.InstanceServer(app.handle_command, app)
-    if not server.listen():
-        if server.another_instance_running:
-            # Another instance claimed the socket after our check, or it hangs.
-            log.error("Another instance is running but does not answer; exiting")
-            _show_error(qt_app, f"{APP_NAME} is already running but does not respond.")
-            app.shutdown()
-            return AppContext(qt_app, exit_code=1)
-        log.warning("Command socket unavailable; 'eye-tracker ctl' will not work")
-
-    try:
-        app.start()
-    except Exception as exc:
-        log.exception("%s could not start", APP_NAME)
-        server.close()
-        app.shutdown()
-        _show_error(
-            qt_app,
-            f"{APP_NAME} could not start:\n\n{exc}\n\n"
-            f"Details are in the log file:\n{paths.log_file()}",
-        )
-        return AppContext(qt_app, exit_code=1)
-    return AppContext(qt_app, app, server)
 
 
 def _controller_factory(kwargs: dict[str, Any]) -> ControllerFactory:
@@ -316,10 +373,13 @@ class EyeTrackerApp(QObject):
         self._preview: PreviewWindow | None = None
         self._about: AboutDialog | None = None
         self._wizard: FirstRunWizard | None = None
-        #: Reasons already announced with a "calibration needed" notification.
+        #: Reasons announced with a "calibration needed" notification since the
+        #: calibration was last usable (cleared when it is usable again).
         self._announced: set[str] = set()
-        #: When the last "calibration needed" notification was shown.
-        self._prompt_at: float | None = None
+        #: The notification of ours on screen: (``PROMPT_*`` kind, when shown).
+        self._prompt: tuple[str, float] | None = None
+        #: A reason that could not be announced while notifications were muted.
+        self._deferred_reason: str | None = None
 
     # ---------------------------------------------------------------- accessors
     @property
@@ -373,6 +433,7 @@ class EyeTrackerApp(QObject):
         controller.calibration_required.connect(self._on_calibration_required)
         controller.settings_changed.connect(self._on_settings_changed)
         controller.ui_requested.connect(self._on_ui_requested)
+        controller.state_changed.connect(self._on_state_changed)
 
         from .ui.countdown import CountdownToast
         from .ui.curtain import PrivacyCurtain
@@ -464,27 +525,30 @@ class EyeTrackerApp(QObject):
     def present(self) -> None:
         """Answer a second launch or ``ctl show``: bring up whatever needs attention.
 
-        An open calibration, wizard or settings window is raised; otherwise the
-        tray menu pops up next to the tray icon. Without a system tray (e.g. GNOME
-        without an AppIndicator extension) the settings window opens instead.
+        An open calibration, wizard or settings window is raised. If the first-run
+        setup was never finished (e.g. the app was only ever started at login),
+        the setup assistant opens. Otherwise the tray menu pops up next to the
+        tray icon; without a system tray (e.g. GNOME without an AppIndicator
+        extension) the settings window opens instead.
         """
         if self._closed:
             return
-        calibration = self._calibration
-        if calibration is not None and calibration.is_active:
-            calibration.start()  # raises the existing windows
+        if self._raise_calibration():
             return
         for window in (self._wizard, self._settings_dialog):
             if window is not None and window.isVisible():
                 _present(window)
                 return
+        if self._setup_pending():
+            self.open_wizard()
+            return
         if not self._popup_tray_menu():
             self.open_settings()
 
     # ------------------------------------------------------------------ windows
     def open_settings(self) -> None:
         """Show the settings window (a fresh one unless it is already open)."""
-        if self._closed or self._controller is None:
+        if self._closed or self._controller is None or self._raise_calibration():
             return
         if self._wizard is not None and self._wizard.isVisible():
             _present(self._wizard)
@@ -512,7 +576,7 @@ class EyeTrackerApp(QObject):
         from .ui.calibration_window import CalibrationWindow
 
         log.info("Opening the calibration (%s)", reason)
-        self._prompt_at = None
+        self._prompt = None
         window = CalibrationWindow(self._controller, self)
         window.finished.connect(functools.partial(self._on_calibration_finished, window))
         # Assigned before start(): start() emits finished(False) at once when
@@ -522,7 +586,7 @@ class EyeTrackerApp(QObject):
 
     def open_preview(self) -> None:
         """Show the camera preview (one instance; closing only hides it)."""
-        if self._closed or self._controller is None:
+        if self._closed or self._controller is None or self._raise_calibration():
             return
         if self._preview is None:
             from .ui.preview import PreviewWindow
@@ -532,7 +596,7 @@ class EyeTrackerApp(QObject):
 
     def open_about(self) -> None:
         """Show the About dialog."""
-        if self._closed:
+        if self._closed or self._raise_calibration():
             return
         if self._about is None or not self._about.isVisible():
             from .ui.about import AboutDialog
@@ -544,7 +608,7 @@ class EyeTrackerApp(QObject):
 
     def open_wizard(self) -> None:
         """Show the first-run wizard."""
-        if self._closed or self._controller is None:
+        if self._closed or self._controller is None or self._raise_calibration():
             return
         if self._wizard is not None:
             _present(self._wizard)
@@ -562,13 +626,18 @@ class EyeTrackerApp(QObject):
         controller = self._controller
         if self._closed or controller is None:
             return
-        if not controller.settings.general.first_run_done and not self._options.background:
-            try:
-                self.open_wizard()
-            except Exception:
-                log.exception("The first-run wizard could not be opened")
+        self._refresh_autostart()
+        if self._setup_pending():
+            if self._options.background:
+                # A login start stays quiet; offer the setup once that is over.
+                self._after_quiet_period(self._prompt_setup)
             else:
-                return  # the wizard offers the calibration itself
+                try:
+                    self.open_wizard()
+                except Exception:
+                    log.exception("The first-run wizard could not be opened")
+                else:
+                    return  # the wizard offers the calibration itself
         if self._options.calibrate:
             self.open_calibration("cli")
         elif not self._options.background:
@@ -628,16 +697,30 @@ class EyeTrackerApp(QObject):
         else:
             log.debug("Ignoring unknown UI request %r", command)
 
+    def _on_state_changed(self, _state: object) -> None:
+        controller = self._controller
+        if controller is not None and controller.is_calibrated and self._announced:
+            # Usable again (recalibrated, or back at a known desk): the next time
+            # it stops being usable deserves a notification, even for a reason
+            # announced before (docking at a new desk is "the monitor layout
+            # changed" every time).
+            self._announced.clear()
+
     def _on_controller_notify(self, _title: str, _message: str) -> None:
         # The tray shows one message at a time; ours has been replaced.
-        self._prompt_at = None
+        self._prompt = None
 
     def _on_message_clicked(self) -> None:
-        prompt, self._prompt_at = self._prompt_at, None
+        prompt, self._prompt = self._prompt, None
         controller = self._controller
-        if prompt is None or controller is None or controller.is_calibrated:
+        if prompt is None or controller is None:
             return
-        if self._clock() - prompt <= PROMPT_CLICK_WINDOW_S:
+        kind, shown_at = prompt
+        if self._clock() - shown_at > PROMPT_CLICK_WINDOW_S:
+            return
+        if kind == PROMPT_SETUP and self._setup_pending():
+            self.open_wizard()
+        elif kind == PROMPT_CALIBRATE and not controller.is_calibrated:
             self.open_calibration("notification")
 
     # ------------------------------------------------------------------ helpers
@@ -660,23 +743,94 @@ class EyeTrackerApp(QObject):
         return True
 
     def _suggest_calibration(self, reason: str) -> None:
-        """Tell the user (once per reason) that switching needs a calibration."""
+        """Tell the user that switching needs a calibration.
+
+        Once per reason until the calibration is usable again. A notification
+        that could not be shown does not count: one suppressed by the quiet
+        period after a login start is shown when that period ends.
+        """
         controller = self._controller
-        if controller is None or self._tray is None or controller.is_calibrated:
+        tray = self._tray
+        if controller is None or tray is None or controller.is_calibrated:
             return
         if self._calibration is not None and self._calibration.is_active:
             return
         if len(controller.monitors()) < 2 or reason in self._announced:
             return  # with one monitor there is nothing to switch between
-        self._announced.add(reason)
         detail = f" ({reason})" if reason else ""
-        shown = self._tray.notify(
+        shown = tray.notify(
             "Calibration needed",
             f"Switching monitors is off until you calibrate{detail}. "
             "Click here or choose “Calibrate now…” in the tray menu.",
         )
         if shown:
-            self._prompt_at = self._clock()
+            self._announced.add(reason)
+            self._prompt = (PROMPT_CALIBRATE, self._clock())
+        elif tray.muted_for > 0:
+            # Swallowed by the quiet period of a login start: say it afterwards.
+            if self._deferred_reason is None:
+                self._after_quiet_period(self._announce_deferred)
+            self._deferred_reason = reason
+
+    def _announce_deferred(self) -> None:
+        reason, self._deferred_reason = self._deferred_reason, None
+        controller = self._controller
+        if reason is not None and not self._closed and controller is not None:
+            # The reason may be stale by now; the current one is what matters.
+            self._suggest_calibration(controller.calibration_reason or reason)
+
+    def _prompt_setup(self) -> None:
+        """After a quiet login start: offer the first-run setup that never happened."""
+        tray = self._tray
+        if self._closed or tray is None or not self._setup_pending():
+            return
+        if self._wizard is not None or (
+            self._calibration is not None and self._calibration.is_active
+        ):
+            return
+        shown = tray.notify(
+            f"Finish setting up {APP_NAME}",
+            "Check the camera and choose what happens when you walk away. "
+            "Click here to open the setup assistant.",
+        )
+        if shown:
+            self._prompt = (PROMPT_SETUP, self._clock())
+
+    def _after_quiet_period(self, callback: Callable[[], None]) -> None:
+        """Run ``callback`` once the startup notification mute is over."""
+        tray = self._tray
+        delay = tray.muted_for if tray is not None else 0.0
+        QTimer.singleShot(int(delay * 1000) + _AFTER_QUIET_MS, self, callback)
+
+    def _setup_pending(self) -> bool:
+        """The first-run setup was never finished (or was asked for again)."""
+        controller = self._controller
+        return controller is not None and not controller.settings.general.first_run_done
+
+    def _raise_calibration(self) -> bool:
+        """Raise an open calibration instead of opening another window. Returns
+        whether one was open.
+
+        Every other window would open underneath its topmost full-screen
+        surfaces and take the keyboard from it (Space, R and Esc would stop
+        working with no visible reason).
+        """
+        calibration = self._calibration
+        if calibration is None or not calibration.is_active:
+            return False
+        calibration.start()  # only raises and refocuses the existing surfaces
+        return True
+
+    def _refresh_autostart(self) -> None:
+        """Point the login item at this copy of the app if it moved (e.g. an
+        update to another folder, a replaced AppImage). Never raises."""
+        try:
+            from .platform import autostart
+
+            if autostart.is_supported():
+                autostart.refresh()
+        except Exception:
+            log.warning("Could not check the start-at-login entry", exc_info=True)
 
     def _save_without_overrides(self, settings: Settings) -> None:
         """The controller saved ``settings``; keep command-line overrides out of the file."""

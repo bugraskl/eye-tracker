@@ -7,17 +7,24 @@ them into the fit (at a lower weight than deliberate calibration samples) lets
 the model follow slow changes such as a different chair height or a moved
 camera. The same moments reveal when the model has drifted: if its prediction
 keeps disagreeing with where the user puts the cursor, it is time to recalibrate.
+
+Not every settle is a good label: the user may click "Run" on one monitor and
+already watch the output on the other. :func:`plausible_label` rejects labels
+far from what the model currently predicts, and :meth:`ImplicitLearner.discard_last`
+takes such a sample back out of the training set. The gate is generous on
+purpose, so the samples that let the model follow a posture change still pass.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from collections import Counter, deque
 from collections.abc import Callable, Iterable, Sequence
 
 import numpy as np
 
-from ..types import Observation, Rect
+from ..types import Monitor, Observation, Rect, nearest_monitor
 from .calibration import CalibrationSample, samples_to_arrays
 from .model import GazeModel
 
@@ -25,6 +32,14 @@ log = logging.getLogger(__name__)
 
 #: A settle only counts if the cursor was moved within this many seconds.
 RECENT_MOVE_S = 1.5
+
+#: A learned label is implausible when the model's current prediction is farther
+#: from it than this fraction of the diagonal of the cursor's monitor (about
+#: 1100 px on a 1920x1080 monitor). In synthetic tests this removes every label
+#: of "cursor parked on one monitor, reading the other" while keeping over 90 %
+#: of the samples that correct an 8 cm change of posture; requiring the
+#: prediction to be on the cursor's monitor would drop half of the latter.
+IMPLICIT_MAX_ERROR = 0.5
 
 MonitorLookup = Callable[[float, float], int | None]
 
@@ -66,6 +81,12 @@ class ImplicitLearner:
         self._armed = False  # a settle is pending and has not produced a sample yet
         self._since_refit = 0
         self._next_id = -1
+        # Undo information for discard_last(): the latest sample, whether it still
+        # counts towards the next refit, and the (index, sample) pairs evicted to
+        # make room for it, in eviction order.
+        self._last_added: CalibrationSample | None = None
+        self._last_counted = False
+        self._last_evicted: list[tuple[int, CalibrationSample]] = []
 
     # -------------------------------------------------------------- events
     def on_manual_cursor(self, x: float, y: float, now: float) -> None:
@@ -115,8 +136,32 @@ class ImplicitLearner:
         sample = CalibrationSample(features, x, y, monitor, self._next_id, self.weight)
         self._next_id -= 1
         self._samples.append(sample)
-        self._trim()
+        evicted = self._trim()
         self._since_refit += 1
+        self._last_added, self._last_counted, self._last_evicted = sample, True, evicted
+        return sample
+
+    def discard_last(self) -> CalibrationSample | None:
+        """Take back the sample most recently returned by :meth:`on_observation`.
+
+        For a label the caller finds implausible (see :func:`plausible_label`): the
+        sample leaves the training set, no longer counts towards the next refit,
+        and the samples evicted to make room for it are restored. Returns the
+        discarded sample, or ``None`` if there is nothing to undo (it was already
+        discarded, or the samples were replaced, cleared or trimmed since).
+        """
+        sample = self._last_added
+        if sample is None:
+            return None
+        self._samples = [s for s in self._samples if s is not sample]
+        # Evictions shifted later indices; undoing them in reverse order restores
+        # the list exactly (a victim always precedes the newest sample).
+        for index, victim in reversed(self._last_evicted):
+            if victim is not sample:
+                self._samples.insert(index, victim)
+        if self._last_counted:
+            self._since_refit = max(0, self._since_refit - 1)
+        self._forget_last()
         return sample
 
     # -------------------------------------------------------------- samples
@@ -137,6 +182,7 @@ class ImplicitLearner:
         ids = [s.point_id for s in self._samples if s.point_id < 0]
         self._next_id = min(ids, default=0) - 1
         self._since_refit = 0
+        self._forget_last()
 
     def clear(self) -> None:
         """Forget every learned sample (after a new calibration)."""
@@ -144,13 +190,23 @@ class ImplicitLearner:
         self._since_refit = 0
         self._next_id = -1
         self._armed = False
+        self._forget_last()
 
-    def set_max_samples(self, max_samples: int) -> None:
-        """Change the capacity, dropping samples if needed (0 disables learning)."""
+    def set_max_samples(self, max_samples: int) -> bool:
+        """Change the capacity, dropping samples if needed (0 disables learning).
+
+        Returns True if samples were dropped. The model fitted with them then
+        still carries their influence, so the caller should refit it (with
+        :func:`refit_model` and the remaining :attr:`samples`; with none left
+        that reproduces the calibration-only fit) and save the result.
+        """
         if max_samples < 0:
             raise ValueError("max_samples must be >= 0")
         self.max_samples = int(max_samples)
-        self._trim()
+        dropped = bool(self._trim())
+        if dropped:
+            self._forget_last()
+        return dropped
 
     def should_refit(self) -> bool:
         """True once ``refit_every`` new samples have arrived since the last refit."""
@@ -158,8 +214,14 @@ class ImplicitLearner:
 
     def mark_refit(self) -> None:
         self._since_refit = 0
+        self._last_counted = False
 
-    def _trim(self) -> None:
+    def _forget_last(self) -> None:
+        self._last_added, self._last_counted, self._last_evicted = None, False, []
+
+    def _trim(self) -> list[tuple[int, CalibrationSample]]:
+        """Drop samples beyond the capacity; returns the ``(index, sample)`` evicted, in order."""
+        evicted: list[tuple[int, CalibrationSample]] = []
         while len(self._samples) > self.max_samples:
             counts = Counter(s.monitor_index for s in self._samples)
             busiest = max(counts.values())
@@ -168,7 +230,8 @@ class ImplicitLearner:
             victim = next(
                 i for i, s in enumerate(self._samples) if counts[s.monitor_index] == busiest
             )
-            del self._samples[victim]
+            evicted.append((victim, self._samples.pop(victim)))
+        return evicted
 
 
 def refit_model(
@@ -179,24 +242,51 @@ def refit_model(
 ) -> GazeModel:
     """Fit a new model on calibration plus learned samples.
 
-    The template supplies the degree and ``alpha`` chosen at calibration time and,
-    unless ``bounds`` is given, the target normalisation. Sample weights are
-    honoured, so learned samples count less than calibration samples.
+    The template supplies the degree, ``alpha`` and nonlinear features chosen at
+    calibration time and, unless ``bounds`` is given, the target normalisation.
+    Sample weights are honoured, so learned samples count less than calibration
+    samples. Without learned samples this reproduces the calibration-only fit.
     """
     items = [*base, *implicit]
     X, Y, W = samples_to_arrays(items)
-    return GazeModel(degree=template.degree, alpha=template.alpha).fit(
-        X, Y, W, bounds=bounds if bounds is not None else template.bounds
-    )
+    model = GazeModel(degree=template.degree, alpha=template.alpha, nonlinear=template.nonlinear)
+    return model.fit(X, Y, W, bounds=bounds if bounds is not None else template.bounds)
+
+
+def plausible_label(
+    predicted: Sequence[float] | np.ndarray,
+    sample: CalibrationSample,
+    monitors: Sequence[Monitor],
+    max_error: float = IMPLICIT_MAX_ERROR,
+) -> bool:
+    """Whether a learned sample's label (the settled cursor) is plausible.
+
+    ``predicted`` is the current model's gaze point for ``sample.features``. The
+    label is implausible when it lies more than ``max_error`` times the diagonal
+    of the cursor's monitor (``sample.monitor_index``, else the monitor nearest
+    to the cursor) away from the prediction. The prediction need not be on the
+    same monitor, so labels that correct a drifted model still count. A
+    non-finite prediction or no monitors gives no evidence either way: True.
+    """
+    px, py = float(predicted[0]), float(predicted[1])
+    if not (math.isfinite(px) and math.isfinite(py)) or not monitors:
+        return True
+    monitor = next((m for m in monitors if m.index == sample.monitor_index), None)
+    if monitor is None:
+        monitor = nearest_monitor(monitors, sample.x, sample.y)[0]
+    return math.hypot(px - sample.x, py - sample.y) <= max_error * monitor.rect.diagonal
 
 
 class DriftMonitor:
     """Tracks disagreement between prediction and manual cursor placement.
 
     Each event is either a comparison between the monitor the model predicts and
-    the monitor where the user settled the cursor, or a wrong automatic switch
-    that the user immediately undid. When at least ``min_events`` of the last
-    ``window`` events exist and at least ``alert_ratio`` of them are errors,
+    the monitor where the user settled the cursor, or the outcome of an automatic
+    switch: undone by the user within a moment (an error) or kept (correct).
+    Recording both outcomes of switches matters: with adaptive learning off there
+    are no settle comparisons, and counting only the undone switches would make
+    every event an error. When at least ``min_events`` of the last ``window``
+    events exist and at least ``alert_ratio`` of them are errors,
     :meth:`should_alert` fires (at most once per cooldown).
     """
 
@@ -218,9 +308,15 @@ class DriftMonitor:
             return
         self._events.append(predicted_monitor != actual_monitor)
 
+    def record_switch(self, ok: bool) -> None:
+        """Outcome of an automatic switch: ``ok`` False if the user undid it at once
+        (moved the mouse back within the wrong-switch window), True once that
+        window has passed without such a correction."""
+        self._events.append(not ok)
+
     def record_wrong_switch(self) -> None:
         """The user moved the mouse back within 2 s of an automatic switch."""
-        self._events.append(True)
+        self.record_switch(False)
 
     @property
     def error_rate(self) -> float:

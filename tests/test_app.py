@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import signal
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -117,12 +118,21 @@ class Harness:
 
 @pytest.fixture(autouse=True)
 def fake_autostart(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """The tray, wizard and settings window read (and could change) the login item."""
+    """The app, tray, wizard and settings window read (and could change) the login item."""
     calls: list[str] = []
     monkeypatch.setattr(autostart, "is_supported", lambda: True)
-    monkeypatch.setattr(autostart, "is_enabled", lambda: False)
-    monkeypatch.setattr(autostart, "enable", lambda background=True: calls.append("enable"))
-    monkeypatch.setattr(autostart, "disable", lambda: calls.append("disable"))
+    monkeypatch.setattr(autostart, "is_enabled", lambda config_dir=None: False)
+    monkeypatch.setattr(autostart, "status", lambda config_dir=None: autostart.Status.DISABLED)
+    monkeypatch.setattr(
+        autostart, "enable", lambda background=True, config_dir=None: calls.append("enable")
+    )
+    monkeypatch.setattr(autostart, "disable", lambda config_dir=None: calls.append("disable"))
+
+    def refresh(config_dir: Path | None = None) -> bool:
+        calls.append("refresh")
+        return False
+
+    monkeypatch.setattr(autostart, "refresh", refresh)
     return calls
 
 
@@ -380,7 +390,7 @@ def test_first_run_wizard_then_calibration(
     window = h.app.calibration_window
     assert window is not None
     assert window.is_active
-    assert fake_autostart == []  # "Start at login" was left unticked
+    assert fake_autostart == ["refresh"]  # "Start at login" was left unticked
 
 
 def test_background_start_skips_the_wizard(
@@ -425,9 +435,9 @@ def test_second_instance_hands_over_and_exits(
 def test_session_overrides_stay_out_of_the_settings_file(
     build: Callable[..., Harness],
 ) -> None:
-    h = build(camera="clip.mp4", backend="opencv")
+    h = build(camera="clip.mp4", backend="lite")
     assert h.controller.settings.camera.device == "clip.mp4"
-    assert h.controller.settings.general.backend == "opencv"
+    assert h.controller.settings.general.backend == "lite"
     updated = h.controller.settings.copy()
     updated.general.notifications = False
     h.controller.apply_settings(updated)
@@ -581,3 +591,164 @@ def test_ignored_signals_stay_ignored(qapp: QApplication, monkeypatch: pytest.Mo
     with app_module._quit_on_signals(lambda: None):
         pass
     assert installed == []
+
+
+# -------------------------------------------------------------------- review fixes
+def _tray_messages(h: Harness, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Titles the tray shows, with its real settings and mute checks (no tray offscreen)."""
+    titles: list[str] = []
+    monkeypatch.setattr(h.tray, "_messages_available", lambda: True)
+    monkeypatch.setattr(h.tray, "_show_message", lambda title, *_args: titles.append(title))
+    return titles
+
+
+def _wait_for(qapp: QApplication, condition: Callable[[], bool], timeout: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    return condition()
+
+
+def test_calibration_prompt_repeats_after_the_calibration_was_usable(
+    build: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (ui_app-08, journeys-19): each reason was announced once per process."""
+    h = build(monitors=TWO_MONITORS, background=False)
+    titles = _tray_messages(h, monkeypatch)
+    h.controller.calibration_required.emit("the monitor layout changed")
+    h.controller.calibration_required.emit("the monitor layout changed")
+    assert titles == ["Calibration needed"]  # while still uncalibrated: once
+    # The user recalibrates (or returns to a known desk): usable again.
+    controller_type = type(h.controller)
+    monkeypatch.setattr(controller_type, "is_calibrated", property(lambda self: True))
+    h.controller.state_changed.emit(TrackingState.TRACKING)
+    monkeypatch.setattr(controller_type, "is_calibrated", property(lambda self: False))
+    # Days later, another dock: the same reason text deserves a new notification.
+    h.controller.calibration_required.emit("the monitor layout changed")
+    assert titles == ["Calibration needed", "Calibration needed"]
+
+
+def test_a_calibration_prompt_that_was_not_shown_is_not_counted(
+    build: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = build(monitors=TWO_MONITORS, background=False)
+    titles = _tray_messages(h, monkeypatch)
+    quiet = h.controller.settings.copy()
+    quiet.general.notifications = False
+    h.controller.apply_settings(quiet)
+    h.controller.calibration_required.emit("the monitor layout changed")
+    assert titles == []
+    loud = h.controller.settings.copy()
+    loud.general.notifications = True
+    h.controller.apply_settings(loud)
+    h.controller.calibration_required.emit("the monitor layout changed")
+    assert titles == ["Calibration needed"]
+
+
+def test_a_prompt_muted_after_a_login_start_is_shown_later(
+    build: Callable[..., Harness], qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_module, "STARTUP_QUIET_S", 0.5)
+    h = build(monitors=TWO_MONITORS)  # --background: notifications muted at first
+    titles = _tray_messages(h, monkeypatch)
+    assert h.tray.muted_for > 0
+    # A dock brings a monitor up while the login start is still quiet.
+    h.controller.calibration_required.emit("the monitor layout changed")
+    assert titles == []
+    assert _wait_for(qapp, lambda: bool(titles))
+    assert titles == ["Calibration needed"]
+    h.tray.tray.messageClicked.emit()
+    window = h.app.calibration_window
+    assert window is not None
+    assert window.is_active
+
+
+def test_window_requests_during_a_calibration_raise_it_instead(
+    build: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (ui_app-12): a dialog hidden under the calibration took its keyboard."""
+    h = build()
+    h.app.open_calibration()
+    window = h.app.calibration_window
+    assert window is not None
+    raised: list[bool] = []
+
+    def raise_windows() -> bool:
+        raised.append(True)
+        return True
+
+    monkeypatch.setattr(window, "start", raise_windows)
+    h.controller.ui_requested.emit("settings")  # e.g. 'eye-tracker ctl settings'
+    h.tray.open_preview.emit()
+    h.tray.open_about.emit()
+    h.app.open_wizard()
+    assert raised == [True, True, True, True]
+    assert h.app.settings_dialog is None
+    assert h.app.preview is None
+    assert h.app._about is None
+    assert h.app.wizard is None
+    assert window.is_active
+
+
+def test_unfinished_setup_is_offered_after_a_login_start(
+    build: Callable[..., Harness], qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (journeys-05): starting at login skipped the setup assistant forever."""
+    monkeypatch.setattr(app_module, "STARTUP_QUIET_S", 0.3)
+    h = build(settings=Settings(), background=True)  # first_run_done is False
+    titles = _tray_messages(h, monkeypatch)
+    settle(qapp)
+    assert h.app.wizard is None  # a login start stays quiet
+    assert _wait_for(qapp, lambda: bool(titles))
+    assert titles == ["Finish setting up Eye Tracker"]
+    h.tray.tray.messageClicked.emit()
+    wizard = h.app.wizard
+    assert wizard is not None
+    wizard.reject()
+    settle(qapp)
+    assert h.app.wizard is None
+
+
+def test_a_second_launch_opens_the_unfinished_setup(
+    build: Callable[..., Harness], qapp: QApplication
+) -> None:
+    h = build(settings=Settings(), background=True)
+    settle(qapp)
+    assert h.app.wizard is None
+    h.controller.ui_requested.emit("show")  # launched again from the Start menu
+    assert h.app.wizard is not None
+    assert h.app.settings_dialog is None
+
+
+def test_startup_points_the_login_item_at_this_copy(
+    build: Callable[..., Harness], qapp: QApplication, fake_autostart: list[str]
+) -> None:
+    build()
+    assert fake_autostart == []  # once the event loop runs
+    settle(qapp)
+    assert fake_autostart == ["refresh"]
+
+
+def test_a_lock_holder_that_does_not_answer_keeps_other_launches_out(
+    build: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """windows-09: the instance lock decides who runs, not a racy socket probe."""
+    monkeypatch.setattr(ipc, "STARTUP_WAIT_MS", 300)
+    holder = ipc.InstanceLock()  # e.g. an instance that is still starting up, or hangs
+    assert holder.acquire()
+    try:
+        blocked = build()
+        assert blocked.ctx.exit_code == 1
+        assert blocked.ctx.app is None
+        assert blocked.workers == []
+    finally:
+        holder.release()
+    h = build()
+    assert h.ctx.exit_code is None
+    server = h.ctx.server
+    assert server is not None
+    assert server.lock is not None
+    assert server.lock.is_held
+    h.ctx.shutdown()
+    assert not server.lock.is_held  # released for the next launch

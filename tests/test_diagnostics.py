@@ -19,7 +19,9 @@ from eye_tracker.config import Settings
 from eye_tracker.gaze.calibration import CalibrationSample
 from eye_tracker.gaze.model import GazeModel
 from eye_tracker.gaze.store import CalibrationData, save_calibration
+from eye_tracker.platform.base import PlatformServices
 from eye_tracker.types import Monitor, Rect, layout_signature, virtual_bounds
+from eye_tracker.vision.backends import MODEL_FILES
 from eye_tracker.vision.camera import CameraError
 
 SECTIONS = {
@@ -100,7 +102,9 @@ def test_collect_report_structure(env: Path) -> None:
     assert report["qt"]["platform_plugin"] == "offscreen"
     assert report["monitors"]["count"] >= 1
     assert report["monitors"]["virtual"] is True
-    assert set(report["backends"]["models"]) == {"mediapipe", "opencv"}
+    assert set(report["backends"]["models"]) == set(MODEL_FILES)
+    assert "mediapipe_installed" not in report["backends"]
+    assert "mediapipe" not in report["libraries"]
     assert report["cameras"]["probed"] is False
     assert "devices" not in report["cameras"]
     assert set(report["platform"]["capabilities"]) >= {"lock", "cursor", "hotkeys"}
@@ -119,7 +123,10 @@ def test_report_paths_are_relative_to_home(env: Path) -> None:
     if str(paths.settings_file()).lower().startswith(home.lower()):
         assert settings_file.startswith("~")
         assert home not in settings_file
-    assert report["paths"]["ipc_name"] == paths.ipc_name()
+    # The socket name is a hash of the user name: easy to reverse, so left out.
+    assert "ipc_name" not in report["paths"]
+    assert paths.ipc_name() not in json.dumps(report)
+    assert report["paths"]["profile"] == "custom (--config-dir)"
 
 
 def test_camera_probe_is_opt_in(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -151,17 +158,17 @@ def test_camera_probe_is_opt_in(env: Path, monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_settings_section_lists_changes_without_side_effects(env: Path) -> None:
     settings = Settings()
-    settings.general.backend = "opencv"
+    settings.general.backend = "lite"
     settings.presence.away_timeout_s = 120
     settings.save(paths.settings_file())
     report = diagnostics.collect_report()
     assert report["settings"]["valid"] is True
     assert report["settings"]["non_default"] == {
-        "general.backend": "opencv",
+        "general.backend": "lite",
         "presence.away_timeout_s": 120,
     }
-    assert report["backends"]["configured"] == "opencv"
-    assert report["backends"]["active"] == "opencv"
+    assert report["backends"]["configured"] == "lite"
+    assert report["backends"]["active"] == "lite"
 
     paths.settings_file().write_text("{broken", encoding="utf-8")
     report = diagnostics.collect_report()
@@ -173,10 +180,10 @@ def test_settings_section_lists_changes_without_side_effects(env: Path) -> None:
 
 def test_calibration_section(env: Path) -> None:
     settings = Settings()
-    settings.general.backend = "opencv"
+    settings.general.backend = "lite"
     settings.save(paths.settings_file())
     current = diagnostics.current_monitors()
-    save_calibration(paths.calibration_file(), _calibration(current, "opencv", "yunet-geom-1"))
+    save_calibration(paths.calibration_file(), _calibration(current, "lite", "yunet-geom-1"))
 
     calibration = diagnostics.collect_report()["calibration"]
     assert calibration["exists"] is True
@@ -190,7 +197,8 @@ def test_calibration_section(env: Path) -> None:
         Monitor(0, "left", Rect(-1920, 0, 1920, 1080), primary=True),
         Monitor(1, "right", Rect(0, 0, 2560, 1440)),
     ]
-    save_calibration(paths.calibration_file(), _calibration(other, "opencv", "yunet-geom-1"))
+    paths.calibration_file().unlink()
+    save_calibration(paths.calibration_file(), _calibration(other, "lite", "yunet-geom-1"))
     report = diagnostics.collect_report()
     assert report["calibration"]["compatible"] is False
     assert "monitor layout" in report["calibration"]["reason"]
@@ -242,8 +250,8 @@ def test_problems_from_a_synthetic_report() -> None:
         "backends": {
             "available": [],
             "models": {
-                "mediapipe": {"file": "a.task", "present": False},
-                "opencv": {"file": "b.onnx", "present": True, "sha256_ok": False},
+                "a.tflite": {"used_by": ["facemesh"], "present": False},
+                "b.onnx": {"used_by": ["facemesh", "lite"], "present": True, "sha256_ok": False},
             },
             "active_error": "No vision backend is available",
         },
@@ -260,16 +268,18 @@ def test_problems_from_a_synthetic_report() -> None:
     problems = diagnostics._problems(report)
     assert problems == [
         "Could not collect system information: RuntimeError: x",
-        "No vision backend is available (MediaPipe or OpenCV with its model).",
-        "The mediapipe model file a.task is missing.",
-        "The opencv model file b.onnx is damaged (checksum).",
+        "No vision backend is available (it needs OpenCV 4.10 or newer with its DNN "
+        "module, and the bundled model files).",
+        "The model file a.tflite (facemesh backend) is missing.",
+        "The model file b.onnx (facemesh, lite backend) is damaged (checksum).",
         "No vision backend is available",
         "Only one monitor detected: switching needs two or more "
         "(walk-away and privacy features still work).",
         "No camera delivered a picture (it may be in use by Eye Tracker itself).",
         "Camera access is blocked by the operating system's privacy settings.",
         "Accessibility permission is missing: keyboard focus cannot follow your gaze.",
-        "This session does not allow moving the cursor (on Wayland install ydotool).",
+        "This session does not allow moving the cursor. On Wayland, sway and Hyprland "
+        "work directly; elsewhere install ydotool 1.x and run ydotoold.",
         "Locking the screen is not supported here.",
         "Global hotkeys: Wayland",
         "Hotkey recalibrate is invalid: bad",
@@ -303,8 +313,8 @@ def test_describe_device() -> None:
 # -------------------------------------------------------------------------- bench
 def test_run_bench_on_an_image(tmp_path: Path) -> None:
     image = _face_free_image(tmp_path / "frame.png")
-    result = diagnostics.run_bench(0.25, str(image), "opencv", idle_fps=20)
-    assert result["backend"] == "opencv"
+    result = diagnostics.run_bench(0.25, str(image), "lite", idle_fps=20)
+    assert result["backend"] == "lite"
     assert result["feature_version"] == "yunet-geom-1"
     assert result["device"] == "file frame.png"
     assert result["frame_size"] == [320, 240]
@@ -322,7 +332,7 @@ def test_run_bench_on_an_image(tmp_path: Path) -> None:
     json.dumps(result)
 
     text = diagnostics.format_bench(result)
-    assert text.startswith("Eye Tracker benchmark - opencv backend (yunet-geom-1)")
+    assert text.startswith("Eye Tracker benchmark - lite backend (yunet-geom-1)")
     assert "max speed" in text
     assert "idle (20 fps)" in text
     assert "frames per second" in text
@@ -330,18 +340,18 @@ def test_run_bench_on_an_image(tmp_path: Path) -> None:
 
 def test_run_bench_errors(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="positive"):
-        diagnostics.run_bench(0, "0", "opencv")
+        diagnostics.run_bench(0, "0", "lite")
     with pytest.raises(CameraError, match="not found"):
-        diagnostics.run_bench(0.1, str(tmp_path / "missing.png"), "opencv")
+        diagnostics.run_bench(0.1, str(tmp_path / "missing.png"), "lite")
     broken = tmp_path / "broken.png"
     broken.write_bytes(b"this is not an image")
     with pytest.raises(diagnostics.BenchError):
-        diagnostics.run_bench(0.1, str(broken), "opencv")
+        diagnostics.run_bench(0.1, str(broken), "lite")
 
 
 def test_format_bench_with_missing_values() -> None:
     result = {
-        "backend": "opencv",
+        "backend": "lite",
         "feature_version": "v",
         "device": "camera 0",
         "frame_size": [640, 480],
@@ -362,3 +372,139 @@ def test_format_bench_with_missing_values() -> None:
     assert "max speed" in text
     assert "idle" not in text
     assert "inference p50 / p95   -" in text
+
+
+# -------------------------------------------------------------------- review fixes
+def test_calibration_section_reports_every_stored_profile(env: Path) -> None:
+    settings = Settings()
+    settings.general.backend = "lite"
+    settings.save(paths.settings_file())
+    current = diagnostics.current_monitors()
+    other = [
+        Monitor(0, "left", Rect(-1920, 0, 1920, 1080), primary=True),
+        Monitor(1, "right", Rect(0, 0, 2560, 1440)),
+    ]
+    home = _calibration(current, "lite", "yunet-geom-1")
+    home.camera = "0"
+    save_calibration(paths.calibration_file(), home)
+    save_calibration(paths.calibration_file(), _calibration(other, "lite", "yunet-geom-1"))
+    calibration = diagnostics.collect_report()["calibration"]
+    assert calibration["profiles"] == 2
+    # The most recent profile is for another desk, but this desk has one: usable.
+    assert calibration["compatible"] is True
+    assert calibration["matching_profile"].endswith("camera 0, good")
+    assert set(calibration["profile_list"]) == {"1", "2"}
+
+
+def test_settings_in_the_report_do_not_reveal_the_home_directory(
+    env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression (ui_app-09): a video file camera printed the full path."""
+    home = tmp_path / "home" / "alice"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    settings = Settings()
+    settings.camera.device = str(home / "Videos" / "me-at-desk.mp4")
+    settings.privacy.pause_for_apps = [str(home / "apps" / "meeting.exe"), "zoom.exe"]
+    settings.save(paths.settings_file())
+    report = diagnostics.collect_report()
+    non_default = report["settings"]["non_default"]
+    assert non_default["camera.device"] == "file me-at-desk.mp4"
+    apps = non_default["privacy.pause_for_apps"]
+    assert apps[0].startswith("~")
+    assert apps[0].endswith("meeting.exe")
+    assert apps[1] == "zoom.exe"
+    text = diagnostics.format_report(report)
+    assert str(home) not in text
+    assert "alice" not in text
+
+
+class _FakeHotkeyManager:
+    name = "fake"
+    supported = True
+    note = None
+
+    def layout_conflict(self, hotkey: object) -> str | None:
+        if str(hotkey) == "ctrl+alt+t":
+            return "Ctrl+Alt+T is AltGr+T, which types a character on the Turkish Q layout"
+        return None
+
+
+def test_hotkeys_that_type_a_character_are_problems(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eye_tracker.platform import hotkeys
+
+    monkeypatch.setattr(hotkeys, "create_hotkey_manager", _FakeHotkeyManager)
+    settings = Settings()
+    settings.hotkeys.toggle_tracking = "ctrl+alt+t"  # an Eye Tracker 0.1 default
+    settings.save(paths.settings_file())
+    report = diagnostics.collect_report()
+    conflicts = report["hotkeys"]["layout_conflicts"]
+    assert set(conflicts) == {"toggle_tracking"}
+    assert (
+        "Hotkey toggle_tracking cannot be used: Ctrl+Alt+T is AltGr+T, which types a "
+        "character on the Turkish Q layout." in report["problems"]
+    )
+    settings.hotkeys.enabled = False  # not registered at all: not a problem
+    settings.save(paths.settings_file())
+    assert not any("cannot be used" in p for p in diagnostics.collect_report()["problems"])
+
+
+def test_autostart_section_reports_the_status_and_registered_command(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eye_tracker.platform import autostart
+
+    monkeypatch.setattr(autostart, "status", lambda config_dir=None: autostart.Status.STALE)
+    monkeypatch.setattr(autostart, "is_enabled", lambda config_dir=None: False)
+    monkeypatch.setattr(
+        autostart, "registered_command", lambda: [str(Path.home() / "old" / "EyeTracker.exe")]
+    )
+    report = diagnostics.collect_report()
+    section = report["autostart"]
+    assert section["status"] == "stale"
+    assert section["registered"].startswith("~")
+    assert any(p.startswith("Start at login points to a copy") for p in report["problems"])
+
+
+class _MacLikeServices(PlatformServices):
+    name = "fake"
+
+    def capabilities(self) -> dict[str, bool]:
+        return dict.fromkeys(super().capabilities(), True)
+
+    def permissions(self) -> dict[str, bool | None]:
+        return {"camera": True, "accessibility": False}
+
+    def accessibility_status(self) -> str:
+        return "stale"
+
+
+def test_a_stale_accessibility_grant_is_explained() -> None:
+    section = diagnostics._platform_section(_MacLikeServices())
+    assert section["accessibility"] == "stale"
+    problems = diagnostics._problems({"platform": section})
+    assert len(problems) == 1
+    assert "granted to an earlier version" in problems[0]
+    assert "remove Eye Tracker with '-' and add it again" in problems[0]
+    assert problems[0].isascii()
+
+
+class _WaylandServices(PlatformServices):
+    name = "fake-linux"
+
+    @property
+    def is_wayland(self) -> bool:
+        return True
+
+
+def test_linux_notes_explain_camera_release_and_wayland_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(diagnostics.sys, "platform", "linux")
+    notes = diagnostics._platform_section(_WaylandServices())["notes"]
+    assert "PipeWire camera portal" in notes["camera_release"]
+    assert "ydotool 1.x" in notes["cursor"]
+    assert "hyprctl" in notes["cursor"]
+    monkeypatch.setattr(diagnostics.sys, "platform", "win32")
+    assert "notes" not in diagnostics._platform_section(_WaylandServices())

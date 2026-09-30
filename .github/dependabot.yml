@@ -1,4 +1,6 @@
 # Keep GitHub Actions and Python dependencies (uv.lock) up to date.
+# Workflow actions are pinned to commit SHAs with a "# vX.Y.Z" comment; Dependabot
+# updates both together.
 # https://docs.github.com/code-security/dependabot/working-with-dependabot/dependabot-options-reference
 version: 2
 
@@ -36,14 +38,14 @@ updates:
         update-types:
           - minor
           - patch
-      # Qt, OpenCV and MediaPipe are updated one at a time on purpose: each can
-      # change behaviour, bundle size or supported OS versions.
+      # Qt and OpenCV are updated one at a time on purpose: each can change
+      # behaviour, bundle size or supported OS versions (OpenCV also runs the
+      # face models, which the facemesh backend self-tests at load time).
       runtime-patches:
         dependency-type: production
         exclude-patterns:
           - pyside6*
           - shiboken6
           - opencv*
-          - mediapipe
         update-types:
           - patch

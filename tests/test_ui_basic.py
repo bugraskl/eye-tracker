@@ -9,6 +9,7 @@ cursor, registers hotkeys or writes login items.
 
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import Callable, Iterator
 from typing import Any, ClassVar
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QWidget
 
 from eye_tracker import __version__
 from eye_tracker.config import Settings
+from eye_tracker.platform.base import PlatformServices
 from eye_tracker.platform.hotkeys import Hotkey, HotkeyManager, format_hotkey, parse_hotkey
 from eye_tracker.types import (
     GazePoint,
@@ -37,12 +39,13 @@ from eye_tracker.types import (
     Observation,
     Rect,
     TrackingState,
+    WindowRef,
     WorkerStats,
 )
 from eye_tracker.ui import icons, util
 from eye_tracker.ui.about import THIRD_PARTY, AboutDialog, system_info
 from eye_tracker.ui.countdown import CountdownToast
-from eye_tracker.ui.curtain import PrivacyCurtain
+from eye_tracker.ui.curtain import HINT, HINT_NO_KEYBOARD, PrivacyCurtain
 from eye_tracker.ui.overlay import GazeOverlay
 from eye_tracker.ui.preview import PreviewWindow, bgr_to_qimage
 from eye_tracker.ui.tray import TrayIcon
@@ -107,7 +110,7 @@ class FakeController(QObject):
         return list(self._monitors)
 
     def backend_info(self) -> tuple[str, str]:
-        return ("mediapipe", "mp-pose-iris-1")
+        return ("facemesh", "facemesh-pose-iris-1")
 
     def set_state(self, state: TrackingState) -> None:
         """Test helper: jump to ``state`` (flags follow)."""
@@ -722,6 +725,72 @@ def test_tray_hides_autostart_when_unsupported(
     assert not tray.action_autostart.isVisible()
 
 
+class _StatusAutostart(FakeAutostart):
+    """An autostart backend that also reports ``status()`` (like the real module)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.state = "disabled"
+
+    def is_enabled(self) -> bool:
+        return self.state == "enabled"
+
+    def status(self) -> str:
+        return self.state
+
+    def enable(self, background: bool = True) -> None:
+        super().enable(background)
+        self.state = "enabled"
+
+
+def test_tray_explains_a_login_item_that_does_not_start_this_copy(
+    controller: FakeController, cleanup: list[Any]
+) -> None:
+    backend = _StatusAutostart()
+    backend.state = "stale"  # e.g. the app was moved to another folder
+    tray = _tray(controller, cleanup, autostart=backend)
+    action = tray.action_autostart
+    assert not action.isChecked()
+    assert action.text() == "Start at login (needs repair)"
+    assert "no longer exists" in action.toolTip()
+    action.trigger()  # re-enabling points the login item at this copy
+    assert backend.state == "enabled"
+    assert action.isChecked()
+    assert action.text() == "Start at login"
+
+    backend.state = "other-profile"
+    tray._on_menu_about_to_show()
+    assert not action.isChecked()
+    assert action.text() == "Start at login (another profile)"
+    assert "--config-dir" in action.toolTip()
+
+
+def test_autostart_status_helper_tolerates_old_backends() -> None:
+    assert util.autostart_status(FakeAutostart()) == ""  # no status(): unknown
+
+    class Broken:
+        def status(self) -> str:
+            raise OSError("registry unreadable")
+
+    assert util.autostart_status(Broken()) == ""
+    from eye_tracker.platform.autostart import Status
+
+    class Real:
+        def status(self) -> Status:
+            return Status.STALE
+
+    assert util.autostart_status(Real()) == "stale"
+
+
+def test_taskbar_theme_is_only_read_from_the_registry_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression (packaging-02): the platform check lets mypy on Linux and macOS
+    # accept the winreg calls, and keeps other systems away from winreg.
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert util._windows_personalize_value("SystemUsesLightTheme") is None
+
+
 def test_tray_notifications_respect_settings(
     controller: FakeController, cleanup: list[Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -793,6 +862,10 @@ def test_tray_dispose_is_final_and_idempotent(
 
 @pytest.mark.skipif(sys.platform == "darwin", reason="macOS shows ⌃⌥ glyphs instead")
 def test_tray_shows_hotkeys_from_settings(controller: FakeController, cleanup: list[Any]) -> None:
+    # The defaults differ per OS (Win key on Windows, Shift on Linux); set them.
+    controller.settings.hotkeys.toggle_tracking = "ctrl+alt+t"
+    controller.settings.hotkeys.toggle_privacy = "ctrl+alt+p"
+    controller.settings.hotkeys.recalibrate = "ctrl+alt+c"
     tray = _tray(controller, cleanup)
     portable = QKeySequence.SequenceFormat.PortableText
     assert tray.action_pause.shortcut().toString(portable) == "Ctrl+Alt+T"
@@ -1086,6 +1159,64 @@ def test_curtain_falls_back_to_qt_screens(cleanup: list[Any]) -> None:
     assert not curtain.is_showing
 
 
+class _ActivatingPlatform(PlatformServices):
+    """Records activation requests; activates nothing."""
+
+    def __init__(self) -> None:
+        self.activated: list[WindowRef] = []
+
+    def activate_window(self, ref: WindowRef) -> bool:
+        self.activated.append(ref)
+        return False
+
+
+def test_curtain_promises_esc_only_with_keyboard_focus(
+    controller: FakeController, cleanup: list[Any]
+) -> None:
+    controller.platform = _ActivatingPlatform()  # type: ignore[attr-defined]
+    curtain = PrivacyCurtain(controller)
+    cleanup.append(curtain)
+    _guarded(controller)
+    controller.guard_changed.emit(True)
+    windows = curtain.windows
+    # Until the activation is confirmed nothing promises that Esc works.
+    assert all(w.hint == HINT_NO_KEYBOARD for w in windows)  # type: ignore[attr-defined]
+    QApplication.processEvents()  # the offscreen platform grants the activation
+    assert curtain.has_keyboard
+    assert all(w.hint == HINT for w in windows)  # type: ignore[attr-defined]
+    assert "Press Esc" in windows[0].accessibleDescription()
+    curtain._ensure_keyboard()  # the delayed check: focused, so no platform call
+    assert controller.platform.activated == []  # type: ignore[attr-defined]
+
+
+def test_curtain_refused_focus_asks_the_platform_and_says_click(
+    controller: FakeController, cleanup: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows' foreground lock refuses a camera-triggered activation (ui_app-04)."""
+    platform = _ActivatingPlatform()
+    controller.platform = platform  # type: ignore[attr-defined]
+    monkeypatch.setattr(PrivacyCurtain, "has_keyboard", property(lambda self: False))
+    curtain = PrivacyCurtain(controller)
+    cleanup.append(curtain)
+    _guarded(controller)
+    controller.guard_changed.emit(True)
+    curtain._ensure_keyboard()  # what the timer runs FOCUS_RECHECK_MS later
+    target = curtain.windows[0]
+    (ref,) = platform.activated
+    assert (ref.handle, ref.pid) == (int(target.winId()), os.getpid())
+    for window in curtain.windows:
+        assert window.hint == HINT_NO_KEYBOARD  # type: ignore[attr-defined]
+        assert "Click Dismiss" in window.accessibleDescription()
+        assert not window.grab().isNull()
+    # Clicking the curtain gives it the keyboard: from then on Esc works.
+    monkeypatch.setattr(PrivacyCurtain, "has_keyboard", property(lambda self: True))
+    curtain._update_hints()
+    assert all(w.hint == HINT for w in curtain.windows)  # type: ignore[attr-defined]
+    curtain.hide_curtain()
+    curtain._ensure_keyboard()  # a late timer after hiding does nothing
+    assert len(platform.activated) == 1
+
+
 # ------------------------------------------------------------------------- overlay
 def _overlay(controller: FakeController, cleanup: list[Any], **kwargs: Any) -> GazeOverlay:
     overlay = GazeOverlay(controller, **kwargs)
@@ -1284,7 +1415,7 @@ def test_preview_window_lifecycle(controller: FakeController, cleanup: list[Any]
     assert controller.calls[-1] == ("set_preview", True)
     assert window.preview_active
     assert controller.preview_enabled
-    assert window.values["backend"].text() == "mediapipe (mp-pose-iris-1)"
+    assert window.values["backend"].text() == "facemesh (facemesh-pose-iris-1)"
     assert "never saved" in window.note_label.text()
 
     frame = np.zeros((480, 640, 3), np.uint8)
@@ -1320,14 +1451,14 @@ def test_preview_window_lifecycle(controller: FakeController, cleanup: list[Any]
             "inference_ms": 9.44,
             "skip_ratio": 0.35,
             "cpu_percent": 0.84,
-            "backend": "opencv",
+            "backend": "lite",
         }
     )
     assert window.values["fps"].text() == "12 fps (target 12 fps)"
     assert window.values["inference"].text() == "9.4 ms"
     assert window.values["skipped"].text() == "35 %"
     assert window.values["cpu"].text() == "0.8 %"
-    assert window.values["backend"].text().startswith("opencv")
+    assert window.values["backend"].text().startswith("lite")
     controller.gaze_changed.emit(GazePoint(2500.0, 10.0, 1.0))
     assert window.values["monitor"].text() == "Monitor 2 · Right"
     controller.gaze_changed.emit(GazePoint(-5000.0, 10.0, 1.0))
@@ -1378,6 +1509,9 @@ def test_about_dialog(cleanup: list[Any]) -> None:
     notices = dialog.notices.toPlainText()
     for needle in ("MediaPipe", "YuNet", "OpenCV", "Qt 6", "LGPL-3.0", "Apache-2.0", "MIT"):
         assert needle in notices
+    # Only the MediaPipe models are shipped (run by OpenCV), not its runtime.
+    assert "MediaPipe Face Landmarker model" in notices
+    assert "MediaPipe runtime is not included" in notices
     assert len(THIRD_PARTY) >= 6
     info = system_info()
     for needle in (__version__, "Python", "Qt"):

@@ -65,33 +65,47 @@ def instance(env: Path) -> Iterator[Callable[[Callable[[str], str]], ipc.Instanc
 
 
 class FakeAutostart:
+    EXE = "C:\\Program Files\\Eye Tracker\\EyeTracker.exe"
+
     def __init__(self, monkeypatch: pytest.MonkeyPatch, *, supported: bool = True) -> None:
         self.enabled = False
         self.calls: list[str] = []
         self.supported = supported
         self.fail: str | None = None
+        #: What status() reports while not enabled.
+        self.idle_status = autostart.Status.DISABLED
+        #: The ``config_dir`` of every status/enable/disable call.
+        self.profiles: list[Path | None] = []
         monkeypatch.setattr(autostart, "is_supported", lambda: self.supported)
-        monkeypatch.setattr(autostart, "is_enabled", lambda: self.enabled)
+        monkeypatch.setattr(autostart, "is_enabled", lambda config_dir=None: self.enabled)
+        monkeypatch.setattr(autostart, "status", self.status)
         monkeypatch.setattr(autostart, "enable", self.enable)
         monkeypatch.setattr(autostart, "disable", self.disable)
         monkeypatch.setattr(autostart, "location", lambda: "HKCU\\Run\\EyeTracker")
-        monkeypatch.setattr(
-            autostart,
-            "launch_command",
-            lambda background=True: [
-                "C:\\Program Files\\Eye Tracker\\EyeTracker.exe",
-                "--background",
-            ],
-        )
+        monkeypatch.setattr(autostart, "registered_command", self.registered_command)
+        monkeypatch.setattr(autostart, "launch_command", self.launch_command)
 
-    def enable(self, background: bool = True) -> None:
+    def launch_command(self, background: bool = True, config_dir: Path | None = None) -> list[str]:
+        profile = ["--config-dir", str(config_dir)] if config_dir else []
+        return [self.EXE, *profile, *(["--background"] if background else [])]
+
+    def registered_command(self) -> list[str] | None:
+        return self.launch_command() if self.enabled else None
+
+    def status(self, config_dir: Path | None = None) -> autostart.Status:
+        self.profiles.append(config_dir)
+        return autostart.Status.ENABLED if self.enabled else self.idle_status
+
+    def enable(self, background: bool = True, config_dir: Path | None = None) -> None:
         self.calls.append(f"enable(background={background})")
+        self.profiles.append(config_dir)
         if self.fail:
             raise autostart.AutostartError(self.fail)
         self.enabled = True
 
-    def disable(self) -> None:
+    def disable(self, config_dir: Path | None = None) -> None:
         self.calls.append("disable")
+        self.profiles.append(config_dir)
         self.enabled = False
 
 
@@ -152,13 +166,13 @@ def test_gui_main_survives_missing_std_streams(monkeypatch: pytest.MonkeyPatch) 
 # ---------------------------------------------------------------------------- run
 def test_run_is_the_default(run_calls: list[argparse.Namespace], env: Path) -> None:
     assert cli.main([]) == 0
-    assert cli.main(["--background", "--camera", "2", "--backend", "opencv"]) == 0
+    assert cli.main(["--background", "--camera", "2", "--backend", "lite"]) == 0
     assert cli.main(["run", "--calibrate", "--log-level", "debug"]) == 0
     first, second, third = run_calls
     assert first.command is None
     assert not first.background
     assert not first.calibrate
-    assert (second.background, second.camera, second.backend) == (True, "2", "opencv")
+    assert (second.background, second.camera, second.backend) == (True, "2", "lite")
     assert third.command == "run"
     assert third.calibrate
     assert third.log_level == "DEBUG"
@@ -227,12 +241,12 @@ def test_bench_json_on_an_image(
 ) -> None:
     image = _image(tmp_path / "still.png")
     code = cli.main(
-        ["bench", "--seconds", "0.2", "--camera", str(image), "--backend", "opencv", "--json"]
+        ["bench", "--seconds", "0.2", "--camera", str(image), "--backend", "lite", "--json"]
     )
     captured = capsys.readouterr()
     assert code == cli.EXIT_OK, captured.err
     result = json.loads(captured.out)
-    assert result["backend"] == "opencv"
+    assert result["backend"] == "lite"
     assert result["device"] == "file still.png"
     assert set(result["modes"]) == {"max", "idle"}
     assert "Benchmarking" in captured.err
@@ -243,11 +257,11 @@ def test_bench_text_uses_the_settings(
 ) -> None:
     settings = Settings()
     settings.camera.device = str(_image(tmp_path / "configured.png"))
-    settings.general.backend = "opencv"
+    settings.general.backend = "lite"
     settings.save(paths.settings_file())
     assert cli.main(["bench", "--seconds", "0.2"]) == cli.EXIT_OK
     out = capsys.readouterr().out
-    assert out.startswith("Eye Tracker benchmark - opencv backend")
+    assert out.startswith("Eye Tracker benchmark - lite backend")
     assert "file configured.png" in out
 
 
@@ -341,6 +355,63 @@ def test_autostart_failure_and_unsupported(
     assert cli.main(["autostart", "enable"]) == cli.EXIT_ERROR
     assert "not supported" in capsys.readouterr().err
     assert fake.calls == ["enable(background=True)"]
+
+
+def test_autostart_follows_the_config_dir(
+    env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression (ui_app-11): a portable instance registered the default profile."""
+    fake = FakeAutostart(monkeypatch)
+    portable = tmp_path / "portable"
+    assert cli.main(["--config-dir", str(portable), "autostart", "enable"]) == cli.EXIT_OK
+    assert fake.profiles == [portable]
+    assert cli.main(["autostart", "status", "--config-dir", str(portable)]) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "Start at login: enabled" in out
+    assert f"--config-dir {portable}" in out.replace('"', "")
+    assert cli.main(["autostart", "disable", "--config-dir", str(portable)]) == cli.EXIT_OK
+    assert fake.profiles[-1] == portable
+    # Without --config-dir the running process's profile applies (None).
+    fake.profiles.clear()
+    paths.set_base_override(None)
+    try:
+        assert cli.main(["autostart", "enable"]) == cli.EXIT_OK
+    finally:
+        paths.set_base_override(env)
+    assert fake.profiles == [None]
+
+
+def test_autostart_status_explains_entries_for_other_copies(
+    env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeAutostart(monkeypatch)
+    fake.idle_status = autostart.Status.STALE
+    assert cli.main(["autostart"]) == cli.EXIT_OK
+    assert "Start at login: broken" in capsys.readouterr().out
+    fake.idle_status = autostart.Status.OTHER_PROFILE
+    assert cli.main(["autostart"]) == cli.EXIT_OK
+    assert "another profile" in capsys.readouterr().out
+    assert cli.main(["autostart", "disable"]) == cli.EXIT_OK
+    assert "left unchanged" in capsys.readouterr().out
+
+
+def test_backend_option_takes_current_and_legacy_names(
+    run_calls: list[argparse.Namespace], env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.BACKEND_CHOICES == ("auto", "facemesh", "lite")
+    for given, expected in (
+        ("facemesh", "facemesh"),
+        ("LITE", "lite"),
+        ("mediapipe", "facemesh"),  # Eye Tracker 0.1 names in old shortcuts
+        ("opencv", "lite"),
+    ):
+        assert cli.main(["--backend", given]) == 0
+        assert run_calls[-1].backend == expected
+    assert cli.main(["--backend", "tflite"]) == cli.EXIT_USAGE
+    assert "invalid choice" in capsys.readouterr().err
 
 
 # -------------------------------------------------------------------------- reset

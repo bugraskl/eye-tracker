@@ -17,6 +17,12 @@ The module has two halves:
                keyboard settings instead
   ===========  ==========================================================================
 
+A global hotkey swallows its key system-wide, so combinations that the user types
+text with are refused (:meth:`HotkeyManager.layout_conflict`): on Windows AltGr
+arrives as Ctrl+Alt (Ctrl+Alt+C is 'ć' on a Polish keyboard) and on macOS Option
+alone types characters. Keys follow the keyboard layout on every system, and
+:meth:`HotkeyManager.last_error` explains any refusal in a user-presentable way.
+
 Callbacks may be invoked on *any* thread (the hotkey thread on Windows/X11, the
 main thread on macOS). They must return quickly and marshal work to the Qt main
 thread themselves, for example by emitting a queued signal.
@@ -35,9 +41,10 @@ import queue
 import re
 import sys
 import threading
-from collections.abc import Callable, Iterable
+import unicodedata
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol
 
 log = logging.getLogger(__name__)
 
@@ -88,12 +95,14 @@ KEYS: tuple[str, ...] = _LETTERS + _DIGITS + _FKEYS + _NAMED_KEYS + tuple(_PUNCT
 _KEY_SET = frozenset(KEYS)
 
 # Keys that produce text or drive text editing. Grabbing them with Shift as the only
-# modifier would make it impossible to type capitals or use Shift+Tab system-wide.
+# modifier would make it impossible, system-wide, to type capitals, use Shift+Tab or
+# extend a selection (Shift+arrows/Home/End/PgUp/PgDn, which also scroll terminals).
 _TYPING_KEYS = frozenset(
     _LETTERS
     + _DIGITS
     + tuple(_PUNCTUATION)
     + ("space", "enter", "tab", "backspace", "delete", "insert")
+    + ("left", "right", "up", "down", "home", "end", "pageup", "pagedown")
 )
 
 
@@ -208,7 +217,10 @@ class Hotkey:
         if not mods:
             raise ValueError("a global hotkey needs at least one modifier (Ctrl, Alt, Shift, Meta)")
         if mods == {"shift"} and self.key in _TYPING_KEYS:
-            raise ValueError("Shift alone is not enough for a typing key; add Ctrl, Alt or Meta")
+            raise ValueError(
+                "Shift alone is not enough for a typing or text-navigation key; "
+                "add Ctrl, Alt or Meta"
+            )
 
     @property
     def ordered_modifiers(self) -> tuple[str, ...]:
@@ -304,12 +316,21 @@ def format_hotkey(hk: Hotkey, macos: bool | None = None) -> str:
     if macos is None:
         macos = sys.platform == "darwin"
     if macos:
-        key = _MAC_DISPLAY_NAMES.get(hk.key, hk.key.upper())
+        key = _key_label(hk.key, macos=True)
         return "".join(_MAC_MODIFIER_SYMBOLS[m] for m in hk.ordered_modifiers) + key
     meta = "Win" if sys.platform == "win32" else "Super"
     labels = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "meta": meta}
-    key = _DISPLAY_NAMES.get(hk.key, hk.key.upper())
-    return "+".join([*(labels[m] for m in hk.ordered_modifiers), key])
+    return "+".join([*(labels[m] for m in hk.ordered_modifiers), _key_label(hk.key)])
+
+
+def _key_label(key: str, macos: bool = False) -> str:
+    """Display name of a canonical key (``"pageup"`` → ``"PgUp"``, ``"t"`` → ``"T"``)."""
+    return (_MAC_DISPLAY_NAMES if macos else _DISPLAY_NAMES).get(key, key.upper())
+
+
+def _as_hotkey(hotkey: Hotkey | str) -> Hotkey:
+    """``hotkey`` itself, or the parsed string (raises ``ValueError`` if invalid)."""
+    return parse_hotkey(hotkey) if isinstance(hotkey, str) else hotkey
 
 
 # ------------------------------------------------------------------------- managers
@@ -319,9 +340,11 @@ class HotkeyManager:
     Native implementations share these semantics:
 
     * :meth:`register` starts the backend on demand and returns whether the OS
-      accepted the combination (``False`` if another application owns it).
+      accepted the combination (``False`` if another application owns it, or if
+      it would swallow a character the user types, see :meth:`layout_conflict`).
       Re-registering a name replaces its previous hotkey; registering a
       combination that another name in this manager already uses returns ``False``.
+      :meth:`last_error` says why a registration failed.
     * :meth:`start` is optional (it pre-warms the backend). :meth:`stop` releases
       every hotkey, ends the backend and is idempotent; a later :meth:`register`
       starts it again.
@@ -335,10 +358,13 @@ class HotkeyManager:
         #: Human-readable remark on availability (why hotkeys are unavailable or
         #: limited here); ``None`` when fully supported. Shown by the UI and doctor.
         self.note = note
+        # name → why its last registration failed or its hotkey stopped working.
+        self._errors: dict[str, str] = {}
 
     def register(self, name: str, hotkey: Hotkey | str, callback: HotkeyCallback) -> bool:
         """Bind ``hotkey`` to ``callback`` under ``name``. Returns success."""
         log.debug("Global hotkeys unsupported here; %r not registered", name)
+        self._errors[name] = self.note or "global hotkeys are not supported on this system"
         return False
 
     def unregister(self, name: str) -> bool:
@@ -350,8 +376,37 @@ class HotkeyManager:
 
     @property
     def registered(self) -> dict[str, Hotkey]:
-        """Currently active registrations by name."""
+        """Registrations that are currently active, by name.
+
+        A hotkey that stopped working (for example after a keyboard layout change
+        removed its key) is left out until it works again; see :meth:`last_error`.
+        """
         return {}
+
+    def last_error(self, name: str) -> str | None:
+        """Why the latest :meth:`register` of ``name`` failed, or why it stopped working.
+
+        The text is a short, user-presentable sentence such as ``"Ctrl+Alt+C is
+        AltGr+C, which types 'ć' on the Polish (Programmers) keyboard layout"``.
+        ``None`` if the hotkey is active or ``name`` was never registered.
+        """
+        return self._errors.get(name)
+
+    def layout_conflict(self, hotkey: Hotkey | str) -> str | None:
+        """Why ``hotkey`` would swallow a character the user types, or ``None``.
+
+        On Windows, Ctrl+Alt is AltGr: a global Ctrl+Alt+C would eat every 'ć' typed
+        on a Polish keyboard. On macOS, Option (+Shift) alone types characters. The
+        native managers check this on every installed (Windows) or the current
+        (macOS) keyboard layout and refuse such registrations; this method lets
+        settings UIs and diagnostics warn before registering. It never changes the
+        keyboard state or the active layout.
+
+        Raises:
+            ValueError: if ``hotkey`` is a string that is not a valid hotkey.
+        """
+        _as_hotkey(hotkey)
+        return None
 
     def start(self) -> None:
         """Start the backend early (optional; :meth:`register` starts it on demand)."""
@@ -375,6 +430,11 @@ class _NativeHotkeyManager(HotkeyManager):
     dispatch deadlock-free: ``_api_lock`` serialises public calls (and may be held
     while waiting for a backend thread), ``_table_lock`` only ever guards short
     dictionary operations and is the only lock taken when a hotkey fires.
+
+    A binding whose OS registration is lost later (an X11 or macOS keyboard layout
+    change removed its key) stays in ``_bindings`` so that the next layout change
+    can restore it, but it is marked inactive: :attr:`registered` leaves it out and
+    :meth:`last_error` explains why.
     """
 
     supported: ClassVar[bool] = True
@@ -386,22 +446,30 @@ class _NativeHotkeyManager(HotkeyManager):
         self._table_lock = threading.Lock()
         self._bindings: dict[str, _Binding] = {}
         self._by_id: dict[int, _Binding] = {}
+        self._inactive: set[int] = set()  # ids of bindings whose OS registration was lost
         self._last_id = 0
 
     # ------------------------------------------------------------------ public
     def register(self, name: str, hotkey: Hotkey | str, callback: HotkeyCallback) -> bool:
         if not callable(callback):
             raise TypeError("callback must be callable")
+        with self._table_lock:
+            self._errors.pop(name, None)
         if isinstance(hotkey, str):
             try:
                 hotkey = parse_hotkey(hotkey)
             except ValueError as exc:
                 log.warning("Hotkey for %r not registered: %s", name, exc)
+                self._set_error(name, str(exc))
                 return False
         label = format_hotkey(hotkey)
         with self._api_lock:
             existing = self._bindings.get(name)
-            if existing is not None and existing.hotkey == hotkey:
+            if (
+                existing is not None
+                and existing.hotkey == hotkey
+                and existing.id not in self._inactive
+            ):
                 with self._table_lock:
                     existing.callback = callback
                 return True
@@ -411,11 +479,13 @@ class _NativeHotkeyManager(HotkeyManager):
             )
             if clash is not None:
                 log.warning("Hotkey %s for %r is already bound to %r", label, name, clash.name)
+                self._set_error(name, f"{label} is already used for {clash.name}")
                 return False
             if existing is not None:
                 self._remove(existing)
             if not self._backend_start():
                 log.warning("Hotkey %s for %r not registered: backend unavailable", label, name)
+                self._set_error(name, self.note or "the global hotkey service is unavailable")
                 return False
             binding = _Binding(self._allocate_id(), name, hotkey, callback)
             # Publish before the OS registration so a press that arrives immediately
@@ -430,8 +500,10 @@ class _NativeHotkeyManager(HotkeyManager):
             with self._table_lock:
                 if ok:
                     self._bindings[name] = binding
+                    self._errors.pop(name, None)
                 else:
                     self._by_id.pop(binding.id, None)
+                    self._errors.setdefault(name, f"{label} could not be registered")
             if ok:
                 log.info("Registered hotkey %s for %s", label, name)
             return ok
@@ -452,7 +524,13 @@ class _NativeHotkeyManager(HotkeyManager):
     @property
     def registered(self) -> dict[str, Hotkey]:
         with self._table_lock:
-            return {name: b.hotkey for name, b in self._bindings.items()}
+            return {
+                name: b.hotkey for name, b in self._bindings.items() if b.id not in self._inactive
+            }
+
+    def last_error(self, name: str) -> str | None:
+        with self._table_lock:
+            return self._errors.get(name)
 
     def start(self) -> None:
         with self._api_lock:
@@ -483,10 +561,34 @@ class _NativeHotkeyManager(HotkeyManager):
         with self._table_lock:
             self._bindings.pop(binding.name, None)
             self._by_id.pop(binding.id, None)
+            self._inactive.discard(binding.id)
         try:
             self._native_unregister(binding)
         except Exception:
             log.exception("Unregistering hotkey %s failed", format_hotkey(binding.hotkey))
+
+    def _set_error(self, name: str, message: str) -> None:
+        with self._table_lock:
+            self._errors[name] = message
+
+    def _reject(self, binding: _Binding, message: str) -> bool:
+        """Log why the OS did not take ``binding``, remember it for :meth:`last_error`.
+
+        Called by the native hooks (on whichever thread they run); always returns
+        ``False`` so it can end a hook with ``return self._reject(...)``.
+        """
+        log.warning("Hotkey for %r not registered: %s", binding.name, message)
+        self._set_error(binding.name, message)
+        return False
+
+    def _set_active(self, binding: _Binding, active: bool) -> None:
+        """Record whether a registered binding currently holds its OS registration."""
+        with self._table_lock:
+            if active:
+                self._inactive.discard(binding.id)
+                self._errors.pop(binding.name, None)
+            elif binding.id in self._by_id:
+                self._inactive.add(binding.id)
 
     def _dispatch(self, binding_id: int) -> None:
         with self._table_lock:
@@ -755,23 +857,45 @@ def _win_modifiers(modifiers: Iterable[str]) -> int:
     return mask
 
 
-def _win_virtual_key(key: str, vk_scan: Callable[[str], int] | None = None) -> int | None:
-    """Virtual-key code for ``key``.
+def _win_virtual_key(
+    key: str,
+    vk_scan: Callable[[str], int] | None = None,
+    vk_to_scan: Callable[[int], int] | None = None,
+) -> int | None:
+    """Virtual-key code for ``key``, or ``None`` if no key of the layout produces it.
 
     Punctuation lives on different keys in different layouts (on a Turkish Q
     keyboard "." is where "/" is on a US one), so the active layout is asked first
-    via ``VkKeyScanW``; a mapping that needs Shift/AltGr is ignored because the user
-    asked for the unshifted key.
+    with ``vk_scan`` (``VkKeyScanW``). A character that the layout only types with
+    Shift or AltGr (German '/', Turkish '[') has no key of its own: the user asked
+    for the unshifted key, and the US virtual key would be a different key (Turkish
+    'ğ' for '[') or no key at all, so ``None`` is returned. The US table is only a
+    fallback for characters the layout lacks entirely (Cyrillic, Greek), where the
+    US position is the sensible guess, and even then only if a physical key produces
+    that virtual key (``vk_to_scan``, i.e. ``MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)``,
+    is non-zero).
     """
     char = _PUNCTUATION.get(key)
-    if char is not None and vk_scan is not None:
+    if char is None:
+        return _WIN_VK.get(key)
+    if vk_scan is not None:
         try:
-            result = vk_scan(char)
+            result = int(vk_scan(char))
         except Exception:
             result = -1
-        if result != -1 and (result >> 8) & 0xFF == 0:
+        if result != -1:
+            if (result >> 8) & 0xFF:
+                log.debug("%r needs Shift or AltGr on the current keyboard layout", char)
+                return None
             return result & 0xFF
-    return _WIN_VK.get(key)
+    vk = _WIN_VK[key]
+    if vk_to_scan is not None:
+        try:
+            if not vk_to_scan(vk):
+                return None
+        except Exception:
+            log.debug("MapVirtualKey(%#x) failed", vk, exc_info=True)
+    return vk
 
 
 class _Win32Api:
@@ -822,14 +946,183 @@ class _Win32Api:
         self.VkKeyScanW = user32.VkKeyScanW
         self.VkKeyScanW.argtypes = [wintypes.WCHAR]
         self.VkKeyScanW.restype = ctypes.c_short
+        self.MapVirtualKeyW = user32.MapVirtualKeyW
+        self.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+        self.MapVirtualKeyW.restype = wintypes.UINT
+        # Read-only keyboard-layout queries for the AltGr check. None of them loads or
+        # activates a layout; ToUnicodeEx is always called with flag 0x4 so that it
+        # leaves the keyboard state (including a pending dead key) untouched.
+        self.GetKeyboardLayoutList = user32.GetKeyboardLayoutList
+        self.GetKeyboardLayoutList.argtypes = [ctypes.c_int, ctypes.POINTER(wintypes.HKL)]
+        self.GetKeyboardLayoutList.restype = ctypes.c_int
+        self.MapVirtualKeyExW = user32.MapVirtualKeyExW
+        self.MapVirtualKeyExW.argtypes = [wintypes.UINT, wintypes.UINT, wintypes.HKL]
+        self.MapVirtualKeyExW.restype = wintypes.UINT
+        self.ToUnicodeEx = user32.ToUnicodeEx
+        self.ToUnicodeEx.argtypes = [
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.POINTER(ctypes.c_ubyte),
+            wintypes.LPWSTR,
+            ctypes.c_int,
+            wintypes.UINT,
+            wintypes.HKL,
+        ]
+        self.ToUnicodeEx.restype = ctypes.c_int
+        self.GetLocaleInfoW = kernel32.GetLocaleInfoW
+        self.GetLocaleInfoW.argtypes = [
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.c_int,
+        ]
+        self.GetLocaleInfoW.restype = ctypes.c_int
         self.GetCurrentThreadId = kernel32.GetCurrentThreadId
         self.GetCurrentThreadId.argtypes = []
         self.GetCurrentThreadId.restype = wintypes.DWORD
+        self.HKL = wintypes.HKL
+        self.c_ubyte = ctypes.c_ubyte
+        self.create_unicode_buffer = ctypes.create_unicode_buffer
 
 
 @functools.cache
 def _win32() -> _Win32Api:
     return _Win32Api()
+
+
+_MAPVK_VK_TO_VSC = 0
+_TOUNICODE_KEEP_STATE = 0x4  # Windows 10 1607+: do not change the keyboard state
+_LOCALE_SENGLISHDISPLAYNAME = 0x72
+_VK_SHIFT, _VK_CONTROL, _VK_MENU = 0x10, 0x11, 0x12
+_VK_LSHIFT, _VK_LCONTROL, _VK_RMENU = 0xA0, 0xA2, 0xA5
+_WIN_KEYBOARD_LAYOUTS_KEY = r"SYSTEM\CurrentControlSet\Control\Keyboard Layouts"
+
+
+class _WinLayoutProbe(Protocol):
+    """Read-only questions about the installed Windows keyboard layouts."""
+
+    def layouts(self) -> Sequence[int]:
+        """Handles (HKLs) of every keyboard layout the user has installed."""
+        ...
+
+    def altgr_text(self, vk: int, shift: bool, hkl: int) -> tuple[str, bool] | None:
+        """What Ctrl+Alt(+Shift)+``vk`` types on layout ``hkl``: ``(text, is_dead_key)``."""
+        ...
+
+    def layout_name(self, hkl: int) -> str:
+        """Display name of layout ``hkl`` such as ``"Polish (Programmers)"``."""
+        ...
+
+
+def _win_altgr_conflict(hotkey: Hotkey, vk: int, probe: _WinLayoutProbe) -> str | None:
+    """Why a Ctrl+Alt hotkey would eat a character typed with AltGr, or ``None``.
+
+    Windows reports AltGr as LCtrl+RAlt, and ``RegisterHotKey`` cannot tell left
+    from right modifiers, so a Ctrl+Alt(+Shift) hotkey fires on AltGr(+Shift) as
+    well and the character never reaches the application (Ctrl+Alt+T is AltGr+T,
+    '₺', on Turkish Q). Hotkeys are matched by virtual key whatever layout is active
+    later, so every installed layout is checked. With the Win key held AltGr cannot
+    be meant: no Windows layout uses the Win key as a character modifier.
+    """
+    mods = hotkey.modifiers
+    if not {"ctrl", "alt"} <= mods or "meta" in mods:
+        return None
+    shift = "shift" in mods
+    for hkl in probe.layouts():
+        typed = probe.altgr_text(vk, shift, hkl)
+        if typed is None:
+            continue
+        text, dead = typed
+        what = f"the dead key {text!r}" if dead else repr(text)
+        altgr = "+".join(["AltGr", *(["Shift"] if shift else []), _key_label(hotkey.key)])
+        return (
+            f"{format_hotkey(hotkey, macos=False)} is {altgr}, which types {what} on the "
+            f"{probe.layout_name(hkl)} keyboard layout"
+        )
+    return None
+
+
+def _win_layout_text(hkl: int) -> str | None:
+    """The registry's "Layout Text" of keyboard layout ``hkl`` (e.g. ``"Turkish Q"``).
+
+    The high word of an HKL is either the low word of the layout id (KLID
+    ``0000xxxx``), an IME KLID (``Exxxxxxx``) or ``Fnnn`` where ``nnn`` is the
+    layout's "Layout Id" value (variants such as Polish (214) or US-Dvorak).
+    Only reads the registry.
+    """
+    if sys.platform != "win32":  # also tells mypy that winreg exists below
+        return None
+    import winreg
+
+    hkl &= 0xFFFFFFFF
+    device = hkl >> 16
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _WIN_KEYBOARD_LAYOUTS_KEY) as layouts:
+            if device & 0xF000 == 0xF000:
+                wanted = device & 0x0FFF
+                index = 0
+                while True:
+                    try:
+                        klid = winreg.EnumKey(layouts, index)
+                    except OSError:
+                        return None
+                    index += 1
+                    with (
+                        contextlib.suppress(OSError, ValueError),
+                        winreg.OpenKey(layouts, klid) as key,
+                    ):
+                        if int(str(winreg.QueryValueEx(key, "Layout Id")[0]), 16) == wanted:
+                            return str(winreg.QueryValueEx(key, "Layout Text")[0])
+            klid = f"{hkl:08X}" if device & 0xF000 == 0xE000 else f"{device:08X}"
+            with winreg.OpenKey(layouts, klid) as key:
+                return str(winreg.QueryValueEx(key, "Layout Text")[0]) or None
+    except OSError:
+        return None
+
+
+class _Win32LayoutProbe:
+    """:class:`_WinLayoutProbe` backed by user32 (safe to use from any thread)."""
+
+    def __init__(self, api: _Win32Api) -> None:
+        self._api = api
+
+    def layouts(self) -> list[int]:
+        api = self._api
+        count = api.GetKeyboardLayoutList(0, None)
+        if count <= 0:
+            return []
+        handles = (api.HKL * count)()
+        count = api.GetKeyboardLayoutList(count, handles)
+        return [int(h or 0) for h in handles[: max(count, 0)]]
+
+    def altgr_text(self, vk: int, shift: bool, hkl: int) -> tuple[str, bool] | None:
+        api = self._api
+        scan = api.MapVirtualKeyExW(vk, _MAPVK_VK_TO_VSC, hkl)
+        if not scan:
+            return None  # no key produces this virtual key on that layout
+        state = (api.c_ubyte * 256)()
+        for vk_mod in (_VK_CONTROL, _VK_LCONTROL, _VK_MENU, _VK_RMENU):
+            state[vk_mod] = 0x80
+        if shift:
+            state[_VK_SHIFT] = state[_VK_LSHIFT] = 0x80
+        buf = api.create_unicode_buffer(8)
+        count = api.ToUnicodeEx(vk, scan, state, buf, len(buf), _TOUNICODE_KEEP_STATE, hkl)
+        if count == 0:
+            return None
+        dead = count < 0
+        raw = buf[:1] if dead else buf[: min(count, len(buf))]
+        # Control characters are not "typed text" (Ctrl+Alt+Enter may report "\r").
+        text = "".join(ch for ch in raw if unicodedata.category(ch) != "Cc")
+        return (text, dead) if text else None
+
+    def layout_name(self, hkl: int) -> str:
+        name = _win_layout_text(hkl)
+        if name:
+            return name
+        buf = self._api.create_unicode_buffer(128)
+        if self._api.GetLocaleInfoW(hkl & 0xFFFF, _LOCALE_SENGLISHDISPLAYNAME, buf, len(buf)):
+            return buf.value
+        return f"0x{hkl & 0xFFFFFFFF:08X}"
 
 
 class WindowsHotkeyManager(_ThreadedHotkeyManager):
@@ -839,14 +1132,19 @@ class WindowsHotkeyManager(_ThreadedHotkeyManager):
     registrations are posted to that thread (``PostThreadMessageW`` with a private
     ``WM_APP`` message) and executed there. ``GetMessageW`` blocks, so the thread
     costs nothing while idle.
+
+    Ctrl+Alt(+Shift) combinations that type a character with AltGr on any
+    installed keyboard layout are refused (see :func:`_win_altgr_conflict`);
+    ``layout_probe`` replaces the user32-backed layout queries in tests.
     """
 
     name: ClassVar[str] = "win32"
 
-    def __init__(self) -> None:
+    def __init__(self, *, layout_probe: _WinLayoutProbe | None = None) -> None:
         super().__init__()
         self._thread_id = 0
         self._os_ids: set[int] = set()  # touched only on the hotkey thread
+        self._layout_probe = layout_probe
 
     def _thread_setup(self) -> bool:
         api = _win32()
@@ -897,21 +1195,54 @@ class WindowsHotkeyManager(_ThreadedHotkeyManager):
     def _native_unregister(self, binding: _Binding) -> None:
         self._call_on_thread(lambda: self._unregister_on_thread(binding.id), None)
 
-    def _register_on_thread(self, binding: _Binding) -> bool:
+    def layout_conflict(self, hotkey: Hotkey | str) -> str | None:
+        hotkey = _as_hotkey(hotkey)
+        try:
+            vk = self._virtual_key(hotkey.key)
+            return None if vk is None else _win_altgr_conflict(hotkey, vk, self._probe())
+        except Exception:  # advisory only: never break a settings dialog
+            log.debug("Keyboard layout check for %s failed", hotkey, exc_info=True)
+            return None
+
+    def _probe(self) -> _WinLayoutProbe:
+        if self._layout_probe is None:
+            self._layout_probe = _Win32LayoutProbe(_win32())
+        return self._layout_probe
+
+    @staticmethod
+    def _virtual_key(key: str) -> int | None:
+        if key not in _PUNCTUATION:
+            return _win_virtual_key(key)  # layout independent: no need to load user32
         api = _win32()
-        vk = _win_virtual_key(binding.hotkey.key, api.VkKeyScanW)
+        return _win_virtual_key(
+            key, api.VkKeyScanW, lambda vk: int(api.MapVirtualKeyW(vk, _MAPVK_VK_TO_VSC))
+        )
+
+    def _register_on_thread(self, binding: _Binding) -> bool:
+        hotkey = binding.hotkey
+        label = format_hotkey(hotkey, macos=False)
+        vk = self._virtual_key(hotkey.key)
         if vk is None:
-            log.warning("No virtual-key code for %r", binding.hotkey.key)
-            return False
-        mods = _win_modifiers(binding.hotkey.modifiers) | _MOD_NOREPEAT
+            char = _PUNCTUATION.get(hotkey.key, hotkey.key)
+            return self._reject(
+                binding,
+                f"{label}: no key types {char!r} without Shift or AltGr on the current "
+                "keyboard layout",
+            )
+        try:
+            conflict = _win_altgr_conflict(hotkey, vk, self._probe())
+        except Exception:  # the check must never make hotkeys unusable
+            log.warning("Could not check %s against the keyboard layouts", label, exc_info=True)
+            conflict = None
+        if conflict is not None:
+            return self._reject(binding, conflict)
+        api = _win32()
+        mods = _win_modifiers(hotkey.modifiers) | _MOD_NOREPEAT
         if not api.RegisterHotKey(None, binding.id, mods, vk):
             error = api.get_last_error()
-            label = format_hotkey(binding.hotkey)
             if error == _ERROR_HOTKEY_ALREADY_REGISTERED:
-                log.warning("Hotkey %s is already in use by another application", label)
-            else:
-                log.warning("RegisterHotKey(%s) failed (error %s)", label, error)
-            return False
+                return self._reject(binding, f"{label} is already in use by another application")
+            return self._reject(binding, f"RegisterHotKey({label}) failed (error {error})")
         self._os_ids.add(binding.id)
         return True
 
@@ -936,6 +1267,16 @@ _NO_ERR = 0
 _EVENT_NOT_HANDLED_ERR = -9874
 _EVENT_HOTKEY_EXISTS_ERR = -9878
 _EVENT_HOTKEY_PRESSED = 5
+# kEventHotKeyExclusive: without it Carbon lets several applications register the
+# same combination, so a combination another app owns could never be reported.
+_EVENT_HOTKEY_EXCLUSIVE = 1 << 0
+_UC_KEY_ACTION_DOWN = 0
+_UC_KEY_TRANSLATE_NO_DEAD_KEYS = 1 << 0  # kUCKeyTranslateNoDeadKeysMask
+_CF_NOTIFICATION_DELIVER_IMMEDIATELY = 4
+# Key codes of the character keys whose meaning follows the keyboard layout: the
+# main block (0x00-0x32, which includes the ISO section key 0x0A) plus the JIS Yen
+# and underscore keys. Keypad keys are left out on purpose: they are separate keys.
+_MAC_CHARACTER_KEYCODES: tuple[int, ...] = (*range(0x00, 0x33), 0x5D, 0x5E)
 
 
 def _fourcc(code: str) -> int:
@@ -1046,14 +1387,70 @@ def _mac_modifiers(modifiers: Iterable[str]) -> int:
     return mask
 
 
+# Character → key code of letters, digits and punctuation at their US (ANSI) position.
+_MAC_ANSI_CHARS: dict[str, int] = {
+    _PUNCTUATION.get(key, key): code
+    for key, code in _MAC_KEYCODES.items()
+    if key in _PUNCTUATION or len(key) == 1
+}
+
+
+def _mac_char_keymap(chars: Mapping[int, str]) -> dict[str, int]:
+    """Invert ``{keycode: typed text}`` into ``{character: keycode}``.
+
+    Only single, non-blank characters are kept (lower-cased). If several keys type
+    the same character, the key at that character's US position wins, otherwise
+    the lowest key code.
+    """
+    keymap: dict[str, int] = {}
+    for code in sorted(chars):
+        text = chars[code].lower()
+        if len(text) != 1 or text.isspace():
+            continue
+        if text not in keymap or _MAC_ANSI_CHARS.get(text) == code:
+            keymap[text] = code
+    return keymap
+
+
+def _mac_keycode(key: str, keymap: Mapping[str, int] | None) -> int | None:
+    """Key code for canonical ``key`` on the layout described by ``keymap``.
+
+    ``keymap`` (from :func:`_mac_char_keymap`) makes letters, digits and punctuation
+    follow the layout, so ⌃⌥A is the key labelled A on AZERTY and Dvorak too.
+    Letters and digits that the layout does not type without modifiers (Cyrillic
+    letters, the AZERTY number row) keep their US position, which is where their
+    label is; punctuation that needs Shift/Option on this layout has no key of its
+    own and yields ``None``. Without a ``keymap`` the US positions are used.
+    """
+    char = _PUNCTUATION.get(key, key if len(key) == 1 else None)
+    if char is not None and keymap is not None:
+        code = keymap.get(char)
+        if code is not None:
+            return code
+        if key in _PUNCTUATION:
+            return None
+    return _MAC_KEYCODES.get(key)
+
+
+def _cf_global(lib: Any, name: str) -> Any:
+    """The exported ``CFStringRef`` constant ``name`` of framework ``lib``."""
+    import ctypes
+
+    return ctypes.c_void_p.in_dll(lib, name).value
+
+
 class _Carbon:
-    """ctypes binding of the handful of Carbon (HIToolbox) hot-key functions.
+    """ctypes binding of the handful of Carbon (HIToolbox) hot-key functions, plus the
+    Text Input Sources / ``UCKeyTranslate`` calls that read the keyboard layout.
 
     Every method returns plain Python values so :class:`MacHotkeyManager` can be
-    exercised with a fake on any OS.
+    exercised with a fake on any OS. The layout functions are loaded on first use;
+    if they are missing, hotkeys still work at the US key positions.
     """
 
     PATH = "/System/Library/Frameworks/Carbon.framework/Carbon"
+    CORE_FOUNDATION = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    CORE_SERVICES = "/System/Library/Frameworks/CoreServices.framework/CoreServices"
 
     def __init__(self) -> None:
         import ctypes
@@ -1073,6 +1470,8 @@ class _Carbon:
         self._EventHotKeyID = EventHotKeyID
         # OSStatus (*EventHandlerProcPtr)(EventHandlerCallRef, EventRef, void *userData)
         self._HandlerProc = ctypes.CFUNCTYPE(ctypes.c_int32, vp, vp, vp)
+        # void (*CFNotificationCallback)(center, observer, name, object, userInfo)
+        self._NotificationProc = ctypes.CFUNCTYPE(None, vp, vp, vp, vp, vp)
 
         lib.GetApplicationEventTarget.argtypes = []
         lib.GetApplicationEventTarget.restype = vp
@@ -1102,9 +1501,16 @@ class _Carbon:
         ]
         lib.GetEventParameter.restype = ctypes.c_int32
         self._lib = lib
-        # The C side only holds a raw function pointer: without this reference the
-        # trampoline would be garbage-collected and the next hotkey would crash.
+        # The C side only holds raw function pointers: without these references the
+        # trampolines would be garbage-collected and the next call would crash.
         self._proc: Any = None
+        self._layout_proc: Any = None
+        self._layout_observer: tuple[Any, Any] | None = None
+        self._layout_api: bool | None = None  # None: not loaded yet
+        self._cf: Any = None
+        self._cs: Any = None
+        self._layout_data_key: Any = None
+        self._layout_changed_name: Any = None
 
     def install_handler(self, handler: Callable[[Any], int]) -> tuple[int, Any]:
         ctypes = self._ctypes
@@ -1146,7 +1552,7 @@ class _Carbon:
             modifiers,
             self._EventHotKeyID(signature, hotkey_id),
             self._lib.GetApplicationEventTarget(),
-            0,
+            _EVENT_HOTKEY_EXCLUSIVE,
             ctypes.byref(ref),
         )
         return int(status), ref
@@ -1169,6 +1575,172 @@ class _Carbon:
         )
         return int(status), int(hk.signature), int(hk.id)
 
+    # ------------------------------------------------------------ keyboard layout
+    def _load_layout_api(self) -> bool:
+        if self._layout_api is None:
+            try:
+                self._bind_layout_api()
+                self._layout_api = True
+            except (OSError, AttributeError, TypeError, ValueError) as exc:
+                log.info("Keyboard layout API unavailable (%s); hotkeys use US key positions", exc)
+                self._layout_api = False
+        return self._layout_api
+
+    def _bind_layout_api(self) -> None:
+        ctypes = self._ctypes
+        vp = ctypes.c_void_p
+        lib = self._lib
+        cf = ctypes.CDLL(self.CORE_FOUNDATION)
+        cs = ctypes.CDLL(self.CORE_SERVICES)
+        for copy in (
+            lib.TISCopyCurrentKeyboardLayoutInputSource,
+            lib.TISCopyCurrentASCIICapableKeyboardLayoutInputSource,
+        ):
+            copy.argtypes = []
+            copy.restype = vp
+        lib.TISGetInputSourceProperty.argtypes = [vp, vp]
+        lib.TISGetInputSourceProperty.restype = vp
+        lib.LMGetKbdType.argtypes = []
+        lib.LMGetKbdType.restype = ctypes.c_uint8
+        cf.CFDataGetBytePtr.argtypes = [vp]
+        cf.CFDataGetBytePtr.restype = vp
+        cf.CFRelease.argtypes = [vp]
+        cf.CFRelease.restype = None
+        cf.CFNotificationCenterGetDistributedCenter.argtypes = []
+        cf.CFNotificationCenterGetDistributedCenter.restype = vp
+        cf.CFNotificationCenterAddObserver.argtypes = [
+            vp,
+            vp,
+            self._NotificationProc,
+            vp,
+            vp,
+            ctypes.c_long,  # CFNotificationSuspensionBehavior (CFIndex)
+        ]
+        cf.CFNotificationCenterAddObserver.restype = None
+        cf.CFNotificationCenterRemoveObserver.argtypes = [vp, vp, vp, vp]
+        cf.CFNotificationCenterRemoveObserver.restype = None
+        cs.UCKeyTranslate.argtypes = [
+            vp,  # const UCKeyboardLayout *
+            ctypes.c_uint16,  # virtualKeyCode
+            ctypes.c_uint16,  # keyAction
+            ctypes.c_uint32,  # modifierKeyState
+            ctypes.c_uint32,  # keyboardType
+            ctypes.c_uint32,  # OptionBits
+            ctypes.POINTER(ctypes.c_uint32),  # deadKeyState
+            ctypes.c_ulong,  # UniCharCount maxStringLength
+            ctypes.POINTER(ctypes.c_ulong),  # UniCharCount *actualStringLength
+            ctypes.POINTER(ctypes.c_uint16),  # UniChar unicodeString[]
+        ]
+        cs.UCKeyTranslate.restype = ctypes.c_int32
+        self._layout_data_key = _cf_global(lib, "kTISPropertyUnicodeKeyLayoutData")
+        self._layout_changed_name = _cf_global(lib, "kTISNotifySelectedKeyboardInputSourceChanged")
+        self._cf, self._cs = cf, cs
+
+    def layout_characters(
+        self, modifiers: int = 0, *, ascii_capable: bool = False
+    ) -> dict[int, str] | None:
+        """What each character key types on the current keyboard layout.
+
+        ``modifiers`` are Carbon modifier masks (``shiftKey``, ``optionKey``).
+        ``ascii_capable`` reads the ASCII-capable layout that macOS uses for
+        shortcuts while a Cyrillic layout or an input method is selected. Returns
+        ``{keycode: text}`` (dead keys give their spacing character), or ``None``
+        if the layout cannot be read. Main thread only, like all TIS calls.
+        """
+        if not self._load_layout_api():
+            return None
+        ctypes = self._ctypes
+        lib = self._lib
+        copy = (
+            lib.TISCopyCurrentASCIICapableKeyboardLayoutInputSource
+            if ascii_capable
+            else lib.TISCopyCurrentKeyboardLayoutInputSource
+        )
+        source = copy()
+        if not source:
+            return None
+        try:
+            data = lib.TISGetInputSourceProperty(source, self._layout_data_key)
+            layout = self._cf.CFDataGetBytePtr(data) if data else None
+            if not layout:
+                return None  # input methods have no Unicode key layout
+            kbd_type = int(lib.LMGetKbdType())
+            state = (modifiers >> 8) & 0xFF
+            dead = ctypes.c_uint32()
+            length = ctypes.c_ulong()
+            buf = (ctypes.c_uint16 * 4)()
+            chars: dict[int, str] = {}
+            for keycode in _MAC_CHARACTER_KEYCODES:
+                dead.value = 0
+                length.value = 0
+                status = self._cs.UCKeyTranslate(
+                    layout,
+                    keycode,
+                    _UC_KEY_ACTION_DOWN,
+                    state,
+                    kbd_type,
+                    _UC_KEY_TRANSLATE_NO_DEAD_KEYS,
+                    ctypes.byref(dead),
+                    len(buf),
+                    ctypes.byref(length),
+                    buf,
+                )
+                count = min(int(length.value), len(buf))
+                if status != _NO_ERR or count <= 0:
+                    continue
+                text = bytes(buf)[: 2 * count].decode("utf-16-le", "replace")
+                text = "".join(ch for ch in text if unicodedata.category(ch) != "Cc")
+                if text:
+                    chars[keycode] = text
+            return chars
+        finally:
+            self._cf.CFRelease(source)
+
+    def observe_layout_changes(self, callback: Callable[[], None]) -> bool:
+        """Call ``callback`` whenever the user selects another keyboard layout.
+
+        The distributed notification is delivered by the main run loop (which Qt
+        spins), so ``callback`` runs on the main thread. Returns success.
+        """
+        if self._layout_observer is not None:
+            return True
+        if not self._load_layout_api():
+            return False
+        ctypes = self._ctypes
+
+        def trampoline(_center: Any, _observer: Any, _name: Any, _obj: Any, _info: Any) -> None:
+            try:
+                callback()
+            except Exception:  # an exception must never unwind into CoreFoundation
+                log.exception("Keyboard layout change handler failed")
+
+        center = self._cf.CFNotificationCenterGetDistributedCenter()
+        if not center:
+            return False
+        proc = self._NotificationProc(trampoline)
+        observer = ctypes.c_void_p(id(self))  # any unique non-NULL token
+        self._cf.CFNotificationCenterAddObserver(
+            center,
+            observer,
+            proc,
+            self._layout_changed_name,
+            None,
+            _CF_NOTIFICATION_DELIVER_IMMEDIATELY,
+        )
+        self._layout_proc = proc
+        self._layout_observer = (center, observer)
+        return True
+
+    def stop_observing_layout_changes(self) -> None:
+        if self._layout_observer is None:
+            return
+        center, observer = self._layout_observer
+        self._cf.CFNotificationCenterRemoveObserver(
+            center, observer, self._layout_changed_name, None
+        )
+        self._layout_observer = None
+        self._layout_proc = None
+
 
 class MacHotkeyManager(_NativeHotkeyManager):
     """Carbon ``RegisterEventHotKey`` hotkeys.
@@ -1178,8 +1750,13 @@ class MacHotkeyManager(_NativeHotkeyManager):
     thread (calls from other threads are refused with a warning); callbacks run on
     the main thread, dispatched by the Cocoa run loop Qt is already running.
 
-    Key codes identify physical ANSI key positions, so on non-US layouts
-    punctuation hotkeys refer to the key at the US position.
+    Carbon matches virtual key codes, which are physical key positions. Letters,
+    digits and punctuation are therefore looked up in the current keyboard layout
+    (see :func:`_mac_keycode`), so ⌃⌥A is the key labelled A on AZERTY and Dvorak
+    as it is on Windows and X11, and the registrations move when the user switches
+    layouts. Hotkeys are registered exclusively, so a combination that another
+    application already owns is reported as unavailable, and Option(+Shift)
+    combinations that type a character are refused.
     """
 
     name: ClassVar[str] = "carbon"
@@ -1189,6 +1766,9 @@ class MacHotkeyManager(_NativeHotkeyManager):
         self._carbon = carbon  # injectable for tests; created lazily otherwise
         self._handler_ref: Any = None
         self._refs: dict[int, Any] = {}
+        self._keycodes: dict[int, int] = {}  # binding id → key code it is registered at
+        self._keymap: dict[str, int] | None = None  # character → key code (current layout)
+        self._observing = False
 
     @staticmethod
     def _on_main_thread(what: str) -> bool:
@@ -1197,11 +1777,7 @@ class MacHotkeyManager(_NativeHotkeyManager):
         log.warning("macOS hotkeys must be %s from the main thread", what)
         return False
 
-    def _backend_start(self) -> bool:
-        if self._handler_ref is not None:
-            return True
-        if not self._on_main_thread("registered"):
-            return False
+    def _load_carbon(self) -> bool:
         if self._carbon is None:
             try:
                 self._carbon = _Carbon()
@@ -1209,48 +1785,147 @@ class MacHotkeyManager(_NativeHotkeyManager):
                 log.warning("Carbon hot-key API unavailable: %s", exc)
                 self.note = "The Carbon hot-key API could not be loaded."
                 return False
+        return True
+
+    def _backend_start(self) -> bool:
+        if self._handler_ref is not None:
+            return True
+        if not self._on_main_thread("registered") or not self._load_carbon():
+            return False
         status, ref = self._carbon.install_handler(self._on_event)
         if status != _NO_ERR:
             log.warning("InstallEventHandler failed (OSStatus %s)", status)
             return False
         self._handler_ref = ref
+        self._keymap = self._read_keymap()
+        try:
+            self._observing = bool(self._carbon.observe_layout_changes(self._on_layout_changed))
+        except Exception:
+            log.debug("Cannot follow keyboard layout changes", exc_info=True)
         return True
 
     def _backend_stop(self) -> None:
         if self._handler_ref is None or not self._on_main_thread("stopped"):
             return
+        if self._observing:
+            try:
+                self._carbon.stop_observing_layout_changes()
+            except Exception:
+                log.debug("Removing the keyboard layout observer failed", exc_info=True)
+            self._observing = False
         for ref in self._refs.values():  # normally empty: stop() unregisters first
             self._carbon.unregister_hotkey(ref)
         self._refs.clear()
+        self._keycodes.clear()
         self._carbon.remove_handler(self._handler_ref)
         self._handler_ref = None
+        self._keymap = None
+
+    def layout_conflict(self, hotkey: Hotkey | str) -> str | None:
+        hotkey = _as_hotkey(hotkey)
+        if (
+            not _mac_option_types(hotkey)
+            or threading.current_thread() is not threading.main_thread()
+        ):
+            return None
+        try:
+            if not self._load_carbon():
+                return None
+            keymap = self._keymap if self._handler_ref is not None else self._read_keymap()
+            keycode = _mac_keycode(hotkey.key, keymap)
+            return None if keycode is None else self._option_conflict(hotkey, keycode)
+        except Exception:  # advisory only: never break a settings dialog
+            log.debug("Keyboard layout check for %s failed", hotkey, exc_info=True)
+            return None
+
+    def _read_keymap(self) -> dict[str, int] | None:
+        """Character → key code of the current layout, completed by the ASCII-capable one."""
+        try:
+            current = self._carbon.layout_characters(0)
+            ascii_capable = self._carbon.layout_characters(0, ascii_capable=True)
+        except Exception:
+            log.debug("Reading the keyboard layout failed", exc_info=True)
+            return None
+        if current is None and ascii_capable is None:
+            return None
+        keymap = _mac_char_keymap(ascii_capable or {})
+        keymap.update(_mac_char_keymap(current or {}))
+        return keymap
+
+    def _option_conflict(self, hotkey: Hotkey, keycode: int) -> str | None:
+        """Why an Option(+Shift) hotkey would eat a character typed with Option, or ``None``."""
+        if not _mac_option_types(hotkey):
+            return None
+        chars = self._carbon.layout_characters(_mac_modifiers(hotkey.modifiers))
+        text = (chars or {}).get(keycode)
+        if not text:
+            return None
+        return f"{format_hotkey(hotkey, macos=True)} types {text!r} on the current keyboard layout"
 
     def _native_register(self, binding: _Binding) -> bool:
         if not self._on_main_thread("registered"):
-            return False
-        keycode = _MAC_KEYCODES.get(binding.hotkey.key)
-        label = format_hotkey(binding.hotkey, macos=True)
+            return self._reject(binding, "macOS hotkeys can only be registered on the main thread")
+        return self._register_carbon(binding)
+
+    def _register_carbon(self, binding: _Binding) -> bool:
+        hotkey = binding.hotkey
+        label = format_hotkey(hotkey, macos=True)
+        keycode = _mac_keycode(hotkey.key, self._keymap)
         if keycode is None:
-            log.warning("Key %s does not exist on macOS keyboards", label)
-            return False
+            if hotkey.key in _PUNCTUATION:
+                return self._reject(
+                    binding,
+                    f"{label}: no key types {_PUNCTUATION[hotkey.key]!r} without modifiers "
+                    "on the current keyboard layout",
+                )
+            return self._reject(binding, f"{label}: Mac keyboards have no {_key_label(hotkey.key)}")
+        try:
+            conflict = self._option_conflict(hotkey, keycode)
+        except Exception:  # the check must never make hotkeys unusable
+            log.warning("Could not check %s against the keyboard layout", label, exc_info=True)
+            conflict = None
+        if conflict is not None:
+            return self._reject(binding, conflict)
         status, ref = self._carbon.register_hotkey(
-            keycode, _mac_modifiers(binding.hotkey.modifiers), _HOTKEY_SIGNATURE, binding.id
+            keycode, _mac_modifiers(hotkey.modifiers), _HOTKEY_SIGNATURE, binding.id
         )
         if status != _NO_ERR:
             if status == _EVENT_HOTKEY_EXISTS_ERR:
-                log.warning("Hotkey %s is already registered", label)
-            else:
-                log.warning("RegisterEventHotKey(%s) failed (OSStatus %s)", label, status)
-            return False
+                return self._reject(binding, f"{label} is already in use by another application")
+            return self._reject(binding, f"RegisterEventHotKey({label}) failed (OSStatus {status})")
         self._refs[binding.id] = ref
+        self._keycodes[binding.id] = keycode
         return True
 
     def _native_unregister(self, binding: _Binding) -> None:
         ref = self._refs.pop(binding.id, None)
+        self._keycodes.pop(binding.id, None)
         if ref is not None and self._on_main_thread("unregistered"):
             status = self._carbon.unregister_hotkey(ref)
             if status != _NO_ERR:
                 log.debug("UnregisterEventHotKey failed (OSStatus %s)", status)
+
+    def _on_layout_changed(self) -> None:
+        """Move every registration to the key that types its character on the new layout.
+
+        Bindings that cannot be registered on the new layout stay known (inactive)
+        and are retried on the next layout change.
+        """
+        if self._handler_ref is None or not self._on_main_thread("updated"):
+            return
+        with self._api_lock:
+            self._keymap = self._read_keymap()
+            with self._table_lock:
+                bindings = list(self._bindings.values())
+            for binding in bindings:
+                keycode = _mac_keycode(binding.hotkey.key, self._keymap)
+                if binding.id in self._refs and keycode == self._keycodes.get(binding.id):
+                    continue
+                ref = self._refs.pop(binding.id, None)
+                self._keycodes.pop(binding.id, None)
+                if ref is not None:
+                    self._carbon.unregister_hotkey(ref)
+                self._set_active(binding, self._register_carbon(binding))
 
     def _on_event(self, event: Any) -> int:
         status, signature, hotkey_id = self._carbon.hotkey_id(event)
@@ -1258,6 +1933,11 @@ class MacHotkeyManager(_NativeHotkeyManager):
             return _EVENT_NOT_HANDLED_ERR  # someone else's hot key: let it propagate
         self._dispatch(hotkey_id)
         return _NO_ERR
+
+
+def _mac_option_types(hotkey: Hotkey) -> bool:
+    """Whether ``hotkey`` uses Option without Control/Command: the macOS typing layer."""
+    return "alt" in hotkey.modifiers and not hotkey.modifiers & {"ctrl", "meta"}
 
 
 # ----------------------------------------------------------------------------- X11
@@ -1367,13 +2047,19 @@ class _XErrorCatcher:
 class X11HotkeyManager(_ThreadedHotkeyManager):
     """Passive key grabs on the X11 root window, served by a python-xlib thread.
 
-    The thread owns its own ``Display`` connection. Its loop waits in ``select`` on
-    that connection and a wake-up pipe (0.2 s timeout as a safety net), so it is
-    idle between key presses and :meth:`stop` returns promptly.
+    The thread owns its own ``Display`` connection. Its loop blocks in ``select`` on
+    that connection and a wake-up pipe, without a timeout: every cross-thread call
+    and :meth:`stop` write to the pipe after queuing their work, and events that
+    python-xlib already buffered are drained before waiting. The thread therefore
+    never wakes up while no key is pressed, and :meth:`stop` still returns promptly.
+
+    After a keyboard mapping change every binding is grabbed again at its new
+    keycode; one whose key vanished (``setxkbmap ru``) stays known, is reported
+    as inactive and is grabbed again by the next mapping change that restores it.
     """
 
     name: ClassVar[str] = "x11"
-    _SELECT_TIMEOUT_S: ClassVar[float] = 0.2
+    _SELECT_TIMEOUT_S: ClassVar[float | None] = None  # block until an event or a wake-up
 
     def __init__(
         self,
@@ -1522,12 +2208,12 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
         label = format_hotkey(binding.hotkey, macos=False)
         keycode = self._keycode_for(binding.hotkey.key)
         if not keycode:
-            log.warning("Key for hotkey %s is not on the current keyboard layout", label)
-            return False
+            return self._reject(
+                binding, f"the key of {label} is not on the current keyboard layout"
+            )
         mods = _x11_modifiers(binding.hotkey.modifiers)
         if not self._grab(keycode, mods):
-            log.warning("Hotkey %s is already grabbed by another application", label)
-            return False
+            return self._reject(binding, f"{label} is already in use by another application")
         self._grabs[binding.id] = (keycode, mods)
         self._lookup[(keycode, mods)] = binding.id
         return True
@@ -1571,18 +2257,26 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
             self._root.ungrab_key(keycode, mods | variant, onerror=quiet)
 
     def _regrab_all(self) -> None:
-        """Re-establish grabs after a keyboard layout or modifier mapping change."""
+        """Re-establish grabs after a keyboard layout or modifier mapping change.
+
+        The wanted bindings come from the live table, not from ``_grabs``: a binding
+        whose grab failed on an earlier change (its key was missing) must be retried
+        now that the key may be back. A registration in flight on this thread has
+        already grabbed but is not yet in ``_bindings``, so grabbed ``_by_id``
+        entries are included too. Bindings being removed have already left both
+        tables, so they are not grabbed again.
+        """
         with self._table_lock:
-            bindings = [b for b in self._by_id.values() if b.id in self._grabs]
-        for binding in bindings:
-            self._ungrab(binding.id)
+            wanted = {b.id: b for b in self._bindings.values()}
+            wanted.update({i: b for i, b in self._by_id.items() if i in self._grabs})
+        for binding_id in list(self._grabs):
+            self._ungrab(binding_id)
         self._numlock_mask = self._find_numlock_mask()
-        for binding in bindings:
-            if not self._grab_binding(binding):
-                log.warning(
-                    "Hotkey %s stopped working after a keyboard layout change",
-                    format_hotkey(binding.hotkey, macos=False),
-                )
+        for binding in wanted.values():
+            ok = self._grab_binding(binding)  # logs why it failed
+            if not ok:
+                log.info("Hotkey %r is retried on the next keyboard mapping change", binding.name)
+            self._set_active(binding, ok)
 
     # ------------------------------------------------------------------ events
     def _handle_event(self, event: Any) -> None:
@@ -1592,14 +2286,20 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
                 self._display.refresh_keyboard_mapping(event)
                 self._regrab_all()
             return
-        if kind not in (_X_KEY_PRESS, _X_KEY_RELEASE):
+        if kind == _X_KEY_RELEASE:
+            # A release carries the modifiers held just before it, and users often
+            # lift Ctrl/Alt before the key: match releases by keycode alone, or the
+            # binding would stay "held" and swallow every later press.
+            keycode = int(event.detail)
+            for grabbed_id, (grab_code, _mods) in self._grabs.items():
+                if grab_code == keycode:
+                    self._held.discard(grabbed_id)
+                    self._last_release[grabbed_id] = int(event.time)
+            return
+        if kind != _X_KEY_PRESS:
             return
         binding_id = self._lookup.get((int(event.detail), int(event.state) & _X_RELEVANT_MASK))
         if binding_id is None:
-            return
-        if kind == _X_KEY_RELEASE:
-            self._held.discard(binding_id)
-            self._last_release[binding_id] = int(event.time)
             return
         # X auto-repeat sends Release+Press pairs with identical timestamps while a
         # key is held; fire once per physical press (the MOD_NOREPEAT equivalent).

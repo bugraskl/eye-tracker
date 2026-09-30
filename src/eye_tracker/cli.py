@@ -41,7 +41,9 @@ EXIT_USAGE = 2
 EXIT_NOT_RUNNING = 3
 EXIT_INTERRUPTED = 130
 
-BACKEND_CHOICES = ("auto", "mediapipe", "opencv")
+BACKEND_CHOICES = ("auto", "facemesh", "lite")
+#: Backend names of Eye Tracker 0.1, still accepted (e.g. in desktop shortcuts).
+_LEGACY_BACKENDS = {"mediapipe": "facemesh", "opencv": "lite"}
 # Mirrors ipc.COMMANDS; kept here so building the parser does not import Qt.
 CTL_COMMANDS = (
     "calibrate",
@@ -210,9 +212,11 @@ def _add_global_options(parser: argparse.ArgumentParser, *, suppress: bool) -> N
     )
     group.add_argument(
         "--backend",
+        type=_backend_name,
         choices=BACKEND_CHOICES,
         default=default(None),
-        help="vision backend; overrides the settings",
+        help="vision backend: facemesh (head and eyes), lite (head only, lightest) or "
+        "auto; overrides the settings",
     )
     group.add_argument(
         "--background",
@@ -236,6 +240,12 @@ def _add_run_options(parser: argparse.ArgumentParser, *, suppress: bool) -> None
         help="append numeric tracking data (features, gaze, decisions; never images) to FILE "
         "as JSON lines, for tuning and bug reports",
     )
+
+
+def _backend_name(text: str) -> str:
+    """A ``--backend`` value, with the 0.1 names mapped to the current ones."""
+    name = text.strip().lower()
+    return _LEGACY_BACKENDS.get(name, name)
 
 
 def _positive_float(text: str) -> float:
@@ -364,29 +374,49 @@ def _cmd_autostart(args: argparse.Namespace) -> int:
     from .diagnostics import format_command
     from .platform import autostart
 
+    # The login entry starts this profile: with --config-dir it must pass the
+    # same directory, or the default profile would start at login instead.
+    profile = Path(args.config_dir) if args.config_dir else None
     if args.action == "status":
         if not autostart.is_supported():
             _out("Start at login: not supported on this system")
             return EXIT_OK
-        state = "enabled" if autostart.is_enabled() else "disabled"
-        _out(f"Start at login: {state}")
-        _out(f"Entry:   {autostart.location()}")
-        _out(f"Command: {format_command(autostart.launch_command())}")
+        status = autostart.status(config_dir=profile)
+        _out(f"Start at login: {_AUTOSTART_STATUS_TEXT.get(status.value, status.value)}")
+        _out(f"Entry:      {autostart.location()}")
+        registered = autostart.registered_command()
+        if registered:
+            _out(f"Registered: {format_command(registered)}")
+        _out(f"This copy:  {format_command(autostart.launch_command(config_dir=profile))}")
         return EXIT_OK
     if not autostart.is_supported():
         _err("error: start at login is not supported on this system.")
         return EXIT_ERROR
     try:
         if args.action == "enable":
-            autostart.enable(background=True)
+            autostart.enable(background=True, config_dir=profile)
             _out(f"Start at login enabled ({autostart.location()}).")
         else:
-            autostart.disable()
-            _out("Start at login disabled.")
+            autostart.disable(config_dir=profile)
+            if autostart.status(config_dir=profile) is autostart.Status.OTHER_PROFILE:
+                _out("Start at login starts another profile; left unchanged.")
+            else:
+                _out("Start at login disabled.")
     except autostart.AutostartError as exc:
         _err(f"error: {exc}")
         return EXIT_ERROR
     return EXIT_OK
+
+
+#: ``autostart status`` wording by :class:`~eye_tracker.platform.autostart.Status` value.
+_AUTOSTART_STATUS_TEXT = {
+    "enabled": "enabled",
+    "disabled": "disabled",
+    "stale": "broken (the registered program no longer exists or is in a temporary "
+    "location; run 'autostart enable' to repair it)",
+    "other-profile": "set up for another profile (--config-dir); "
+    "run 'autostart enable' to start this one instead",
+}
 
 
 def _cmd_reset(args: argparse.Namespace) -> int:

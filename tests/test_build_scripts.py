@@ -13,15 +13,18 @@ import importlib.metadata
 import importlib.util
 import io
 import logging
+import ntpath
 import os
 import platform
+import posixpath
 import re
 import shutil
 import subprocess
 import sys
+import tomllib
 import urllib.error
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -31,6 +34,11 @@ from eye_tracker import APP_ID, APP_NAME, __version__
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGING = REPO_ROOT / "packaging"
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
+
+# A source distribution ships the tests but not the build tooling they check:
+# skip instead of failing collection there (the loads below need these files).
+if not (REPO_ROOT / "scripts" / "fetch_models.py").is_file() or not PACKAGING.is_dir():
+    pytest.skip("build tooling is not part of this source tree", allow_module_level=True)
 
 
 def _load(path: Path, name: str) -> ModuleType:
@@ -103,6 +111,18 @@ def test_pinned_models_match_the_spec() -> None:
     }
     assert fetch_models.DEFAULT_DEST == REPO_ROOT / "src" / "eye_tracker" / "vision" / "models"
     assert all(m.url.startswith("https://") for m in fetch_models.MODELS)
+
+
+def test_model_pins_agree_everywhere(spec_helpers: dict[str, Any]) -> None:
+    """fetch_models.py, the backends and the PyInstaller spec pin the same files."""
+    from eye_tracker.vision.backends import BACKEND_MODEL_FILES, MODEL_FILES
+
+    installed = dict(pair for model in fetch_models.MODELS for pair in model.installed())
+    assert installed == MODEL_FILES
+    assert spec_helpers["pinned_models"]() == MODEL_FILES
+    assert set().union(*BACKEND_MODEL_FILES.values()) == set(MODEL_FILES)
+    # The MediaPipe bundle is only a download source now; it never ships.
+    assert "face_landmarker.task" not in MODEL_FILES
 
 
 def test_verify_statuses(tmp_path: Path) -> None:
@@ -303,6 +323,20 @@ def test_entry_point_selection(executable: str, gui: bool) -> None:
     assert entry._is_gui_executable(executable) is gui
 
 
+@pytest.mark.parametrize("flavour", [posixpath, ntpath], ids=["posixpath", "ntpath"])
+def test_entry_point_selection_does_not_depend_on_the_os(
+    monkeypatch: pytest.MonkeyPatch, flavour: ModuleType
+) -> None:
+    # os.path is posixpath on the macOS and Linux CI runners, which does not split
+    # Windows paths; the helper must give the same answers there (packaging-03).
+    monkeypatch.setattr(entry, "os", SimpleNamespace(path=flavour))
+    assert entry._is_gui_executable(r"C:\Users\me\Programs\Eye Tracker\EyeTracker.exe")
+    assert entry._is_gui_executable(r"C:\Users\me\Programs\Eye Tracker\eyetracker.EXE")
+    assert entry._is_gui_executable("/Applications/Eye Tracker.app/Contents/MacOS/Eye Tracker")
+    assert not entry._is_gui_executable(r"C:\portable\EyeTracker\eye-tracker-cli.exe")
+    assert not entry._is_gui_executable("/opt/eye-tracker/eye-tracker")
+
+
 @pytest.mark.parametrize(("executable", "expected"), [("EyeTracker.exe", "gui"), ("x-cli", "cli")])
 def test_entry_point_dispatch(
     monkeypatch: pytest.MonkeyPatch, executable: str, expected: str
@@ -373,6 +407,84 @@ def test_installer_matches_the_app() -> None:
     assert autostart.BACKGROUND_FLAG == "--background"
 
 
+def test_installer_app_id_never_changes() -> None:
+    # Upgrades and the upgrade detection in [Code] both depend on it.
+    assert _iss_define("AppGuid") == "F2F98F7C-0EEF-44D5-ADDE-173D9D8BA82B"
+    text = _iss_text()
+    assert "AppId={{{#AppGuid}}" in text
+    assert '#define UninstallKey "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{"' in (
+        text
+    )
+    assert '+ AppGuid + "}_is1"' in text
+
+
+def test_installer_upgrades_keep_the_users_autostart_choice() -> None:
+    """packaging-04 / journeys-14: an upgrade must not turn start-at-login back on.
+
+    The behaviour itself is exercised on the disposable release runner (see the
+    installer smoke test in release.yml); here the wiring is checked.
+    """
+    text = _iss_text()
+    registry = [
+        line for line in text.splitlines() if line.startswith("Root: HKCU") and "startup" in line
+    ]
+    assert len(registry) == 2
+    for line in registry:
+        assert line.endswith("Tasks: startup; Check: ShouldWriteAutostart"), line
+    code = text[text.index("[Code]") :]
+    for fragment in (
+        "function ShouldWriteAutostart: Boolean;",
+        "else if AutostartWasOn then\n    Result := False",
+        "else if WizardSilent or not StartupPageSynced then\n    Result := StartupTaskParam = 1",
+        "procedure CurPageChanged(CurPageID: Integer);",
+        "WizardSelectTasks('!startup')",
+        "IsUpgrade := RegKeyExists(HKCU, '{#UninstallKey}');",
+        "AutostartWasOn := IsUpgrade and AutostartEnabledFor(ExpandConstant('{app}'))",
+        # Task Manager's "disabled" flag: an odd first byte in StartupApproved.
+        "((Ord(Approved[1]) and 1) = 1)",
+    ):
+        assert fragment in code.replace("\r\n", "\n"), fragment
+    # The state is captured before the [Registry] section runs (ssInstall).
+    assert code.index("if CurStep = ssInstall then") < code.index("CurStep = ssPostInstall")
+
+
+def _iscc() -> str | None:
+    found = shutil.which("iscc") or shutil.which("ISCC")
+    if found:
+        return found
+    for base in (os.environ.get("PROGRAMFILES(X86)"), os.environ.get("PROGRAMFILES")):
+        if base and (Path(base) / "Inno Setup 6" / "ISCC.exe").is_file():
+            return str(Path(base) / "Inno Setup 6" / "ISCC.exe")
+    return None
+
+
+@pytest.mark.skipif(sys.platform != "win32" or _iscc() is None, reason="needs Inno Setup 6")
+def test_installer_script_compiles(tmp_path: Path) -> None:
+    """Compile (never run) the installer against a stub bundle: the [Code] must build."""
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    for name in ("EyeTracker.exe", "eye-tracker-cli.exe"):
+        (bundle / name).write_bytes(b"stub")
+    iscc = _iscc()
+    assert iscc is not None
+    proc = subprocess.run(
+        [
+            iscc,
+            "/Q",
+            "/DAppVersion=0.0.1",
+            f"/DBundleDir={bundle}",
+            f"/DOutputDir={tmp_path}",
+            str(PACKAGING / "windows" / "installer.iss"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (tmp_path / "EyeTracker-0.0.1-windows-x64-setup.exe").is_file()
+
+
 def test_linux_desktop_entry() -> None:
     lines = (PACKAGING / "linux" / "eye-tracker.desktop").read_text(encoding="utf-8").splitlines()
     assert lines[0] == "[Desktop Entry]"
@@ -405,8 +517,282 @@ def test_release_workflow_artifact_names() -> None:
         "linux-x86_64.tar.gz",
     ):
         assert f"EyeTracker-${{{{ env.VERSION }}}}-{suffix}" in text, suffix
-    assert "softprops/action-gh-release@v2" in text
+    assert "softprops/action-gh-release@" in text
     assert "SHA256SUMS.txt" in text
+
+
+def _workflow(name: str) -> str:
+    return (WORKFLOWS / name).read_text(encoding="utf-8")
+
+
+def _jobs(text: str) -> dict[str, str]:
+    """The text of each job of a workflow, by job id (two-space indented keys)."""
+    body = text[text.index("\njobs:\n") :]
+    parts = re.split(r"^  ([A-Za-z0-9_-]+):\n", body, flags=re.MULTILINE)
+    return dict(zip(parts[1::2], parts[2::2], strict=True))
+
+
+@pytest.mark.parametrize("name", ["ci.yml", "release.yml"])
+def test_workflow_actions_are_pinned_to_commits(name: str) -> None:
+    """packaging-05: a moved tag must not change what runs with release permissions."""
+    uses = re.findall(r"^\s*(?:-\s+)?uses:\s*(.+)$", _workflow(name), flags=re.MULTILINE)
+    assert uses
+    for reference in uses:
+        assert re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+", reference), reference
+
+
+def test_dependabot_keeps_actions_and_python_updated() -> None:
+    text = (REPO_ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+    assert "package-ecosystem: github-actions" in text
+    assert "package-ecosystem: uv" in text
+    assert "mediapipe" not in text
+
+
+def test_release_smoke_tests_use_the_current_backends() -> None:
+    from eye_tracker.vision.backends import BACKEND_NAMES
+
+    text = _workflow("release.yml")
+    loop = f"for backend in {' '.join(BACKEND_NAMES)}; do"
+    assert text.count(loop) == 3
+    quoted = ", ".join(f'"{name}"' for name in BACKEND_NAMES)
+    assert text.count(f"for backend in ({quoted}):") == 3
+    assert "mediapipe" not in text
+    assert "opencv" not in text.replace("opencv_", "")
+
+
+def test_release_builds_pass_the_bundle_privacy_gate() -> None:
+    """Every frozen build is scanned before it is packaged or smoke-tested."""
+    jobs = _jobs(_workflow("release.yml"))
+    for job, bundle in (
+        ("build-windows", "dist/EyeTracker"),
+        ("build-macos", '"dist/Eye Tracker.app"'),
+        ("build-linux", "dist/eye-tracker"),
+    ):
+        text = jobs[job]
+        gate = text.index(
+            f"run: uv run --no-sync python scripts/check_privacy.py --bundle {bundle}\n"
+        )
+        assert text.index("pyinstaller packaging/pyinstaller/eye-tracker.spec") < gate
+        packaging_step = {
+            "build-windows": "Create the portable ZIP",
+            "build-macos": "Sign and create the disk image",
+            "build-linux": "Create the AppImage and the tarball",
+        }[job]
+        assert gate < text.index(packaging_step)
+
+
+def test_release_notes_explain_macos_permissions_after_updates() -> None:
+    """journeys-15: ad-hoc builds lose the Accessibility grant on every update."""
+    prepare = _jobs(_workflow("release.yml"))["prepare"]
+    assert "MACOS_STABLE_SIGNATURE: ${{ secrets.MACOS_SIGNING_CERT_P12 != '' }}" in prepare
+    assert 'remove\n              Eye Tracker with "−" and add it again.' in prepare
+    macos = _jobs(_workflow("release.yml"))["build-macos"]
+    # Signing with a stable certificate is optional; without the secret the
+    # import step exits early and make_dmg.sh falls back to an ad-hoc signature.
+    assert 'if [[ -z "$CERT_P12" ]]; then' in macos
+    assert "MACOS_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}" in macos
+    assert "security delete-keychain" in macos
+
+
+def test_make_dmg_can_sign_with_a_stable_identity() -> None:
+    text = (PACKAGING / "macos" / "make_dmg.sh").read_text(encoding="utf-8")
+    assert 'IDENTITY="${MACOS_SIGN_IDENTITY:--}"' in text
+    assert "--identity) IDENTITY=" in text
+    assert 'SIGN_ARGS=(--force --deep --sign "$IDENTITY" --timestamp=none)' in text
+    # A certificate-based signature must not leave a build-specific requirement.
+    assert '"$REQUIREMENT" == *cdhash*' in text
+
+
+@pytest.mark.parametrize(
+    ("script", "help_range"),
+    [("macos/make_dmg.sh", "2,24"), ("linux/build_appimage.sh", "2,27")],
+)
+def test_script_help_prints_the_whole_header(script: str, help_range: str) -> None:
+    lines = (PACKAGING / script).read_text(encoding="utf-8").splitlines()
+    assert f"sed -n '{help_range}p'" in "\n".join(lines)
+    first, last = (int(n) for n in help_range.split(","))
+    header = lines[first - 1 : last]
+    assert all(line.startswith("#") for line in header), header
+    assert not lines[last].startswith("#")  # the line after the header
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def test_appimage_tools_are_pinned() -> None:
+    """packaging-06: appimagetool and the embedded runtime are fixed and verified."""
+    text = (PACKAGING / "linux" / "build_appimage.sh").read_text(encoding="utf-8")
+    assert "continuous" not in text.replace('"continuous" channel', "")
+    assert re.search(r'^APPIMAGETOOL_VERSION="\d+\.\d+\.\d+"', text, re.MULTILINE)
+    assert re.search(r'^APPIMAGE_RUNTIME_VERSION="\d{8}"', text, re.MULTILINE)
+    for tool in ("appimagetool", "runtime"):
+        for arch in ("x86_64", "aarch64"):
+            match = re.search(rf'^\s+{tool}:{arch}\) echo "([^"]+)" ;;$', text, re.MULTILINE)
+            assert match, (tool, arch)
+            assert _SHA256.fullmatch(match.group(1)), (tool, arch)
+    assert 'TOOL_ARGS=(--no-appstream --runtime-file "$RUNTIME_FILE")' in text
+    assert "--allow-unpinned" in text
+    assert "refusing to download" in text
+
+
+_FAKE_CURL = r"""#!/bin/sh
+out=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output) out="$2"; shift 2 ;;
+    --retry) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+echo "$url" >> "$FAKE_CURL_LOG"
+case "$url" in
+  *appimagetool*) cat "$FAKE_TOOL" > "$out" ;;
+  *) printf 'runtime' > "$out" ;;
+esac
+"""
+
+_FAKE_TOOL = """#!/bin/sh
+echo "$@" > "$FAKE_TOOL_LOG"
+for last; do :; done
+: > "$last"
+"""
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("bash") is None or shutil.which("sha256sum") is None,
+    reason="build_appimage.sh runs on Linux",
+)
+def test_build_appimage_verifies_its_downloads(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "packaging" / "linux").mkdir(parents=True)
+    for name in ("build_appimage.sh", "AppRun", "eye-tracker.desktop", "eye-tracker.png"):
+        shutil.copy(PACKAGING / "linux" / name, repo / "packaging" / "linux" / name)
+    (repo / "src" / "eye_tracker").mkdir(parents=True)
+    (repo / "src" / "eye_tracker" / "__init__.py").write_text('__version__ = "9.9.9"\n')
+    (repo / "LICENSE").write_text("MIT\n")
+    bundle = repo / "dist" / "eye-tracker"
+    (bundle / "_internal").mkdir(parents=True)
+    (bundle / "eye-tracker").write_text("#!/bin/sh\n")
+    (bundle / "eye-tracker").chmod(0o755)
+    (bundle / "_internal" / "libxcb-cursor.so.0").write_bytes(b"x")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "curl").write_text(_FAKE_CURL)
+    (bin_dir / "curl").chmod(0o755)
+    tool = tmp_path / "tool"
+    tool.write_text(_FAKE_TOOL)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin",
+        "ARCH": "x86_64",
+        "FAKE_TOOL": str(tool),
+        "FAKE_TOOL_LOG": str(tmp_path / "tool.log"),
+        "FAKE_CURL_LOG": str(tmp_path / "curl.log"),
+    }
+
+    def run(**extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "packaging/linux/build_appimage.sh", "--version", "9.9.9"],
+            cwd=repo,
+            env={**env, **extra},
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+    # The real pinned checksums do not match the fake downloads: refused, nothing kept.
+    failed = run()
+    assert failed.returncode != 0
+    assert "checksum mismatch" in failed.stderr
+    assert not list((repo / "build" / "tools").glob("*"))
+
+    tool_sha = hashlib.sha256(tool.read_bytes()).hexdigest()
+    runtime_sha = hashlib.sha256(b"runtime").hexdigest()
+    done = run(APPIMAGETOOL_SHA256=tool_sha, APPIMAGE_RUNTIME_SHA256=runtime_sha)
+    assert done.returncode == 0, done.stderr
+    downloads = (tmp_path / "curl.log").read_text().split()
+    assert downloads[-2:] == [
+        "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage",
+        "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64",
+    ]
+    arguments = (tmp_path / "tool.log").read_text().split()
+    runtime = str(repo / "build" / "tools" / "runtime-20251108-x86_64")
+    assert arguments[arguments.index("--runtime-file") + 1] == runtime
+    assert (repo / "dist" / "EyeTracker-9.9.9-linux-x86_64.tar.gz").is_file()
+
+    # A custom download without a checksum is refused.
+    unpinned = run(APPIMAGETOOL_URL="https://example.invalid/tool.AppImage")
+    assert unpinned.returncode != 0
+    assert "refusing to download" in unpinned.stderr
+
+
+def test_pyproject_metadata() -> None:
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    project = data["project"]
+    # packaging-10: the PEP 639 list form of license-files needs hatchling 1.27.
+    assert isinstance(project["license-files"], list)
+    [hatchling] = [r for r in data["build-system"]["requires"] if r.startswith("hatchling")]
+    minimum = re.fullmatch(r"hatchling>=(\d+)\.(\d+)", hatchling)
+    assert minimum
+    assert (int(minimum.group(1)), int(minimum.group(2))) >= (1, 27)
+    # The MediaPipe runtime is gone (packaging-01/08); nothing may pull it back in.
+    assert not any("mediapipe" in dep for dep in project["dependencies"])
+    assert "mediapipe" not in project["keywords"]
+    assert "override-dependencies" not in data.get("tool", {}).get("uv", {})
+
+
+_DOCS = {"docs/troubleshooting.md", "docs/privacy.md", "docs/platform-support.md"}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "pyproject.toml",
+        ".github/ISSUE_TEMPLATE/config.yml",
+        ".github/ISSUE_TEMPLATE/bug_report.yml",
+        ".github/workflows/release.yml",
+    ],
+)
+def test_documentation_links_point_to_real_pages(path: str) -> None:
+    """packaging-12: no links to a docs/ folder listing or to pages that do not exist."""
+    text = (REPO_ROOT / path).read_text(encoding="utf-8")
+    assert "tree/main/docs" not in text
+    for target in re.findall(r"eye-tracker/blob/main/([\w./-]+)", text):
+        # "docs" alone is the base URL that release.yml formats pages onto.
+        assert target in _DOCS | {"CHANGELOG.md", "docs"}, target
+    for target in re.findall(r"\{docs\}/([\w.-]+\.md)", text):
+        assert f"docs/{target}" in _DOCS, target
+
+
+def test_model_files_are_binary_in_git() -> None:
+    attributes = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8").splitlines()
+    models = REPO_ROOT / "src" / "eye_tracker" / "vision" / "models"
+    suffixes = {p.suffix for p in models.iterdir() if p.is_file() and p.suffix != ".md"}
+    assert suffixes
+    for suffix in suffixes:
+        assert f"*{suffix} binary" in attributes, suffix
+
+
+def test_sdist_without_build_tooling_skips_these_tests(tmp_path: Path) -> None:
+    """packaging-09: the tests that need scripts/ and packaging/ skip in an sdist."""
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    for name in ("test_build_scripts.py", "test_privacy.py"):
+        shutil.copy(REPO_ROOT / "tests" / name, tests / name)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", tmp_path],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    # 5 = "no tests collected": every module skipped itself, none errored.
+    assert proc.returncode in (0, 5), proc.stdout + proc.stderr
+    assert "2 skipped" in proc.stdout
+    assert "error" not in proc.stdout.lower()
 
 
 def test_changelog_has_a_section_for_the_current_version() -> None:
@@ -423,6 +809,8 @@ _SPEC_HELPERS = (
     "hide_foreign_openssl_from_path",
     "prune_unreferenced_openssl",
     "macos_minimum_version",
+    "pinned_models",
+    "verify_models",
     "_unwanted",
 )
 
@@ -437,6 +825,7 @@ def spec_helpers() -> dict[str, Any]:
         "__name__": "eye_tracker_spec_helpers",
         "log": logging.getLogger("eye-tracker.spec.test"),
         "PROJECT": "eye-tracker",
+        "PACKAGE": REPO_ROOT / "src" / "eye_tracker",
     }
     exec(compile(ast.Module(body=body, type_ignores=[]), "eye-tracker.spec", "exec"), namespace)
     missing = [name for name in _SPEC_HELPERS if name not in namespace]
@@ -455,6 +844,40 @@ def test_runtime_distributions_is_the_dependency_closure(spec_helpers: dict[str,
     # Neither the project itself (editable install) nor dev tools or overridden deps.
     assert found.isdisjoint({"eye-tracker", "pytest", "ruff", "mypy", "pyinstaller", "pillow"})
     assert found.isdisjoint({"matplotlib", "sounddevice", "opencv-contrib-python"})
+    # The MediaPipe runtime and what it pulled in are gone for good.
+    assert found.isdisjoint({"mediapipe", "absl-py", "flatbuffers", "certifi"})
+
+
+def test_spec_ships_the_opencv_models_and_never_mediapipe() -> None:
+    source = _spec_text()
+    assert "collect_dynamic_libs" not in source
+    assert "mediapipe.tasks" not in source
+    # "mediapipe" only appears as an exclusion.
+    assert re.findall(r'"mediapipe[^"]*"', source) == ['"mediapipe"']
+    excludes = source[source.index("EXCLUDES = [") :]
+    assert '\n    "mediapipe",\n' in excludes[: excludes.index("\n]\n")]
+    assert 'MODEL_NOTICE = "NOTICE.md"' in source
+    assert "for _model in (*MODEL_FILES, MODEL_NOTICE):" in source
+
+
+def test_spec_refuses_missing_or_modified_models(
+    spec_helpers: dict[str, Any], tmp_path: Path
+) -> None:
+    good, bad = b"weights", b"tampered"
+    pins = {
+        "a.tflite": hashlib.sha256(good).hexdigest(),
+        "b.onnx": hashlib.sha256(good).hexdigest(),
+    }
+    (tmp_path / "a.tflite").write_bytes(good)
+    (tmp_path / "b.onnx").write_bytes(good)
+    spec_helpers["verify_models"](pins, tmp_path)  # all present and intact
+
+    (tmp_path / "b.onnx").write_bytes(bad)
+    with pytest.raises(SystemExit, match=r"b\.onnx does not match its pinned SHA-256"):
+        spec_helpers["verify_models"](pins, tmp_path)
+    (tmp_path / "a.tflite").unlink()
+    with pytest.raises(SystemExit, match=r"a\.tflite is missing"):
+        spec_helpers["verify_models"](pins, tmp_path)
 
 
 class _FakeDist:
@@ -513,7 +936,8 @@ def test_macos_minimum_version(
         ("PySide6/Qt/plugins/platforms/libqxcb.so", False),
         ("PySide6/plugins/imageformats/qico.dll", False),
         ("cv2/cv2.pyd", False),
-        ("eye_tracker/vision/models/face_landmarker.task", False),
+        ("eye_tracker/vision/models/face_landmarks_detector.tflite", False),
+        ("eye_tracker/vision/models/NOTICE.md", False),
     ],
 )
 def test_unwanted_qt_files(spec_helpers: dict[str, Any], dest: str, unwanted: bool) -> None:
@@ -560,12 +984,13 @@ def test_prune_drops_openssl_nobody_imports(
 def test_prune_keeps_openssl_that_is_imported(
     spec_helpers: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # libmediapipe needs libssl, which in turn needs libcrypto: both stay.
+    # A library that needs libssl (as FFmpeg builds may), which in turn needs
+    # libcrypto: both stay.
     _fake_imports(
         monkeypatch,
-        {"libmediapipe.so": {"libssl.so.3"}, "libssl.so.3": {"libcrypto.so.3"}},
+        {"libavformat.so.61": {"libssl.so.3"}, "libssl.so.3": {"libcrypto.so.3"}},
     )
-    entries = _toc("libmediapipe.so", "libssl.so.3", "libcrypto.so.3")
+    entries = _toc("libavformat.so.61", "libssl.so.3", "libcrypto.so.3")
     assert spec_helpers["prune_unreferenced_openssl"](entries) == entries
 
 

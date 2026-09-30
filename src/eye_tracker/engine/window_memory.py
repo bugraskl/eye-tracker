@@ -18,6 +18,13 @@ log = logging.getLogger(__name__)
 #: Accepted values of ``mode`` in :func:`choose_cursor_target`.
 CURSOR_MODES = ("last", "center", "gaze")
 
+#: A gaze-placed cursor keeps this fraction of the monitor size (but at least
+#: :data:`GAZE_INSET_MIN_PX`) away from the monitor's edges: a pointer parked on
+#: the outermost pixel row, column or corner opens auto-hidden taskbars, docks
+#: and panels and fires hot corners (GNOME Activities, KWin, macOS actions).
+GAZE_INSET_FRACTION = 0.02
+GAZE_INSET_MIN_PX = 16
+
 
 class WindowMemory:
     """Last cursor position and last focused window, per monitor index."""
@@ -63,7 +70,8 @@ def choose_cursor_target(
       the part of ``window_rect`` (the window about to get focus) that lies on
       the monitor; else the monitor centre.
     * ``"center"`` - the monitor centre.
-    * ``"gaze"`` - the gaze point; else the monitor centre.
+    * ``"gaze"`` - the gaze point, kept a small inset away from the monitor's
+      edges (see :data:`GAZE_INSET_FRACTION`); else the monitor centre.
 
     The result always lies inside ``monitor.rect``. Unknown modes behave like
     ``"center"``.
@@ -79,10 +87,23 @@ def choose_cursor_target(
                 return rect.clamp(*visible.center)
     elif mode == "gaze":
         if gaze is not None and math.isfinite(gaze[0]) and math.isfinite(gaze[1]):
-            return rect.clamp(gaze[0], gaze[1])
+            return _clamp_inset(rect, gaze[0], gaze[1])
     elif mode != "center":
         log.warning("Unknown cursor target mode %r; using the monitor centre", mode)
     return rect.clamp(*rect.center)
+
+
+def _clamp_inset(rect: Rect, px: float, py: float) -> tuple[int, int]:
+    """Nearest integer point of ``rect`` shrunk by the gaze inset on every side.
+
+    For monitors too small for the inset the range collapses to the centre, so
+    the result always stays inside ``rect``.
+    """
+    ix = min(max(GAZE_INSET_MIN_PX, round(GAZE_INSET_FRACTION * rect.w)), max(0, (rect.w - 1) // 2))
+    iy = min(max(GAZE_INSET_MIN_PX, round(GAZE_INSET_FRACTION * rect.h)), max(0, (rect.h - 1) // 2))
+    x = min(max(round(px), rect.x + ix), rect.right - 1 - ix)
+    y = min(max(round(py), rect.y + iy), rect.bottom - 1 - iy)
+    return x, y
 
 
 def _intersection(a: Rect, b: Rect) -> Rect | None:

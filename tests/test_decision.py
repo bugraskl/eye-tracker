@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
-from collections.abc import Sequence
+import random
+from collections.abc import Callable, Sequence
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from eye_tracker.config import SwitchingSettings
 from eye_tracker.engine.decision import (
     PENDING_HORIZON_S,
+    READING_FORGET_S,
     REASONS,
     Decision,
     SwitchConfig,
@@ -260,6 +265,73 @@ def test_off_screen_margin_scales_with_diagonal() -> None:
     assert step(d, 0.1, (2900.0, 1380.0), current=0).reason == "dwell"
 
 
+@pytest.mark.parametrize("gy", [1300.0, -220.0])
+def test_off_screen_gaze_just_across_the_seam_is_held_by_hysteresis(gy: float) -> None:
+    # Looking down at the keyboard (or up) centred under the seam: 5 px past the
+    # seam is no more a reason to switch than 5 px past the bezel on screen.
+    d = decider()
+    out = run(d, ticks(0, 2), (1925.0, gy), current=0)
+    assert all(o.reason == "hysteresis" and o.candidate == 1 for o in out)
+    back = run(d, ticks(2.1, 4), (1915.0, gy), current=1)
+    assert all(o.reason == "hysteresis" and o.candidate == 0 for o in back)
+
+
+def test_off_screen_hysteresis_grows_with_distance_below_the_screens() -> None:
+    d = decider()
+    # 220 px below the screens the gaze must favour the right monitor by 64.8 px:
+    # hypot(dx, 220) - 220 >= 64.8 needs dx >= ~180 px past the seam.
+    assert step(d, 0.0, (2000.0, 1300.0), current=0).reason == "hysteresis"
+    out = run(d, [0.1, 0.4], (2150.0, 1300.0), current=0)
+    assert [o.reason for o in out] == ["dwell", "switch"]
+
+
+def test_on_screen_hysteresis_is_unchanged_by_the_off_screen_rule() -> None:
+    d = decider()
+    assert step(d, 0.0, (1925.0, 540.0), current=0).reason == "hysteresis"
+    assert step(d, 0.1, (1990.0, 540.0), current=0).reason == "dwell"
+
+
+@pytest.mark.parametrize("gy", [540.0, 1150.0, 1250.0, 1500.0, 1800.0])
+def test_jitter_around_the_seam_never_flaps(gy: float) -> None:
+    rng = random.Random(1234)
+    d = decider()
+    current = 0
+    switches = 0
+    for i in range(600):  # 60 s at 10 fps
+        t = i * 0.1
+        dec = step(d, t, (1920.0 + rng.gauss(0.0, 40.0), gy), current=current)
+        if dec.fired:
+            assert dec.target is not None
+            switches += 1
+            current = dec.target
+            d.notify_switched(t, current)
+    assert switches == 0
+
+
+# ------------------------------------------------------------- looking away
+def test_looking_away_is_off_screen_and_resets_dwell() -> None:
+    d = decider()
+    run(d, [0.0, 0.1, 0.2], RIGHT, current=0)
+    away = d.update(0.25, RIGHT, 0, NEVER, NEVER, looking_away=True)
+    assert away.reason == "off_screen"
+    assert away.candidate is None
+    assert not away.fired
+    assert not away.pending
+    back = run(d, [0.3, 0.4, 0.5, 0.6], RIGHT, current=0)
+    assert [o.reason for o in back] == ["dwell", "dwell", "dwell", "switch"]
+
+
+def test_looking_away_without_gaze_is_off_screen() -> None:
+    d = decider()
+    assert d.update(0.0, None, 0, NEVER, NEVER, looking_away=True).reason == "off_screen"
+
+
+def test_disabled_takes_precedence_over_looking_away() -> None:
+    d = decider()
+    dec = d.update(0.0, RIGHT, 0, NEVER, NEVER, enabled=False, looking_away=True)
+    assert dec.reason == "disabled"
+
+
 # ------------------------------------------------------------------- layouts
 def test_three_monitor_row_switch_to_far_right() -> None:
     d = decider(TRIPLE)
@@ -433,6 +505,213 @@ def test_switch_from_no_monitor_after_dwell() -> None:
     assert out[-1].target == 0
 
 
+# ------------------------------------------------------ reading while typing
+Gaze = tuple[float, float] | None
+KeyClock = Callable[[float], float]
+
+
+def keystrokes(*bursts: tuple[float, float], every: float = 0.25) -> KeyClock:
+    """Last keystroke time at ``t`` for key presses every ``every`` s during ``bursts``."""
+
+    def last_key(t: float) -> float:
+        best = NEVER
+        for start, stop in bursts:
+            if t >= start:
+                n = math.floor((min(t, stop) - start) / every + 1e-9)
+                best = max(best, start + n * every)
+        return best
+
+    return last_key
+
+
+def frames(start: float, stop: float, gaze: Gaze, dt: float) -> list[tuple[float, Gaze]]:
+    return [(t, gaze) for t in ticks(start, stop, dt)]
+
+
+def play(
+    d: SwitchDecider,
+    script: Sequence[tuple[float, Gaze]],
+    *,
+    current: int,
+    key: KeyClock,
+) -> list[tuple[float, Decision]]:
+    """Run a script of ``(time, gaze)`` frames; the cursor follows every switch."""
+    out: list[tuple[float, Decision]] = []
+    for t, gaze in script:
+        dec = step(d, t, gaze, current=current, key=key(t))
+        out.append((t, dec))
+        if dec.target is not None:
+            d.notify_switched(t, dec.target)
+            current = dec.target
+    return out
+
+
+def switch_times(out: Sequence[tuple[float, Decision]]) -> list[float]:
+    return [t for t, dec in out if dec.fired]
+
+
+def test_reading_one_monitor_while_typing_on_the_other_keeps_focus() -> None:
+    # Transcribing from a document on the left into an editor on the right: the
+    # gaze stays on the left, keystrokes until t=8, then a reading pause.
+    d = decider()
+    key = keystrokes((0.0, 8.0))
+    typing_phase = play(d, frames(0.0, 10.0, LEFT, 0.5), current=1, key=key)
+    assert switch_times(typing_phase) == []
+    assert d.reading_monitor == 0
+    pause = play(d, frames(10.25, 16.0, LEFT, 0.25), current=1, key=key)
+    # The plain typing guard would have switched at t=10 (2 s after the last
+    # key); a reading monitor needs reading_grace_s (6 s) of pause.
+    assert switch_times(pause) == [pytest.approx(14.0)]
+    blocked = [dec for t, dec in pause if t < 14.0 - 1e-9]
+    assert {dec.reason for dec in blocked} == {"typing"}
+    # The camera stays at the slow rate until the switch is about to happen.
+    assert not any(dec.pending for t, dec in pause if t < 14.0 - PENDING_HORIZON_S - 1e-9)
+    assert any(dec.pending for t, dec in pause if 14.0 - PENDING_HORIZON_S <= t < 14.0)
+
+
+def test_glancing_back_at_the_editor_keeps_the_reading_monitor() -> None:
+    d = decider()
+    key = keystrokes((0.0, 6.0))
+    script = [
+        *frames(0.0, 4.5, LEFT, 0.5),  # reading the source while typing
+        *frames(5.0, 6.0, RIGHT, 0.5),  # looks at the editor to fix a typo
+        *frames(6.5, 13.0, LEFT, 0.5),  # back to the source, reading pause
+    ]
+    out = play(d, script, current=1, key=key)
+    assert switch_times(out) == [pytest.approx(12.0)]
+
+
+def test_finishing_a_word_while_looking_over_uses_the_typing_grace() -> None:
+    # The eyes move to the right monitor 0.2 s before the last keystroke: that is
+    # a user about to work there, not someone reading while typing.
+    d = decider()
+    key = keystrokes((0.0, 3.0))
+    script = [*frames(0.0, 2.6, LEFT, 0.2), *frames(2.8, 6.0, RIGHT, 0.2)]
+    out = play(d, script, current=0, key=key)
+    assert d.reading_monitor is None
+    assert switch_times(out) == [pytest.approx(5.0)]
+
+
+def test_typing_resumed_right_after_a_look_makes_it_a_reading_monitor() -> None:
+    d = decider()
+    key = keystrokes((0.0, 2.0), (3.6, 6.0))
+    script = [
+        *frames(0.0, 2.0, LEFT, 0.5),
+        *frames(2.5, 3.0, RIGHT, 0.5),  # reads something on the right, no switch yet
+        *frames(3.5, 6.0, LEFT, 0.5),  # back to the editor and typing again
+    ]
+    out = play(d, script, current=0, key=key)
+    assert switch_times(out) == []
+    assert d.reading_monitor == 1
+    later = play(d, frames(6.5, 13.0, RIGHT, 0.25), current=0, key=key)
+    assert switch_times(later) == [pytest.approx(12.0)]
+
+
+def test_a_single_noisy_sample_does_not_make_a_reading_monitor() -> None:
+    d = decider()
+    key = keystrokes((0.0, 10.0))
+    script = [(t, RIGHT if t % 2.0 == 1.0 else LEFT) for t in ticks(0.0, 10.0, 0.5)]
+    out = play(d, script, current=0, key=key)
+    assert switch_times(out) == []
+    assert d.reading_monitor is None
+    later = play(d, frames(10.5, 13.0, RIGHT, 0.25), current=0, key=key)
+    assert switch_times(later) == [pytest.approx(12.0)]
+
+
+def test_reading_is_recognised_at_the_slowest_typing_frame_rate() -> None:
+    # Eco profile: 1 fps while typing. Gaps above max_gap_s restart the dwell,
+    # but must not hide that the user reads the other monitor.
+    d = decider()
+    key = keystrokes((0.0, 8.0))
+    out = play(d, frames(0.0, 8.0, LEFT, 1.0), current=1, key=key)
+    assert switch_times(out) == []
+    assert d.reading_monitor == 0
+    pause = play(d, frames(8.5, 15.0, LEFT, 0.5), current=1, key=key)
+    assert switch_times(pause) == [pytest.approx(14.0)]
+
+
+def test_reading_monitor_is_forgotten_when_no_longer_looked_at() -> None:
+    d = decider()
+    key = keystrokes((0.0, 70.0))
+    play(d, frames(0.0, 5.0, RIGHT, 0.5), current=0, key=key)
+    assert d.reading_monitor == 1
+    # Keeps typing, now looking at the editor on the left only.
+    play(d, frames(5.5, 5.0 + READING_FORGET_S - 0.5, LEFT, 0.5), current=0, key=key)
+    assert d.reading_monitor == 1
+    play(d, frames(5.0 + READING_FORGET_S + 0.5, 70.0, LEFT, 0.5), current=0, key=key)
+    assert d.reading_monitor is None
+    out = play(d, frames(70.5, 73.0, RIGHT, 0.25), current=0, key=key)
+    assert switch_times(out) == [pytest.approx(72.0)]
+
+
+def test_reading_monitor_ends_with_a_long_typing_pause() -> None:
+    d = decider()
+    key = keystrokes((0.0, 5.0))
+    play(d, frames(0.0, 5.0, LEFT, 0.5), current=1, key=key)
+    assert d.reading_monitor == 0
+    play(d, frames(5.5, 11.5, RIGHT, 0.5), current=1, key=key)  # reviews the text
+    assert d.reading_monitor is None
+    out = play(d, frames(12.0, 13.0, LEFT, 0.25), current=1, key=key)
+    assert switch_times(out) == [pytest.approx(12.5)]  # an ordinary dwell
+
+
+def test_reading_monitor_is_dropped_when_the_cursor_changes_monitor() -> None:
+    d = decider()
+    key = keystrokes((0.0, 5.0))
+    play(d, frames(0.0, 5.0, LEFT, 0.5), current=1, key=key)
+    assert d.reading_monitor == 0
+    step(d, 5.5, LEFT, current=0, key=key(5.5))  # the user took the cursor there
+    assert d.reading_monitor is None
+    play(d, frames(0.0, 5.0, LEFT, 0.5), current=1, key=key)
+    d.notify_switched(5.0, 0)
+    assert d.reading_monitor is None
+
+
+def test_reading_rule_can_be_turned_off() -> None:
+    d = decider(reading_grace_s=2.0)  # not above typing_grace_s: plain typing guard
+    key = keystrokes((0.0, 8.0))
+    out = play(d, frames(0.0, 12.0, LEFT, 0.5), current=1, key=key)
+    assert d.reading_monitor is None
+    assert switch_times(out) == [pytest.approx(10.0)]
+
+
+def test_reading_monitor_does_not_delay_switches_to_other_monitors() -> None:
+    d = decider(TRIPLE)
+    left, right = (-1000.0, 500.0), (2900.0, 500.0)
+    key = keystrokes((0.0, 5.0))
+    play(d, frames(0.0, 5.0, left, 0.5), current=1, key=key)
+    assert d.reading_monitor == 0
+    out = play(d, frames(5.5, 8.0, right, 0.25), current=1, key=key)
+    assert switch_times(out) == [pytest.approx(7.0)]
+
+
+def test_clock_going_backwards_forgets_the_reading_monitor() -> None:
+    d = decider()
+    play(d, frames(0.0, 5.0, LEFT, 0.5), current=1, key=keystrokes((0.0, 5.0)))
+    assert d.reading_monitor == 0
+    step(d, 1.0, LEFT, current=1, key=0.9)
+    assert d.reading_monitor is None
+
+
+def test_gaze_held_at_the_bezel_is_no_look_at_the_other_monitor() -> None:
+    d = decider()
+    near_bezel = (1900.0, 500.0)  # 20 px into the left monitor, cursor on the right
+    out = play(d, frames(0.0, 5.0, near_bezel, 0.5), current=1, key=keystrokes((0.0, 5.0)))
+    assert {dec.reason for _, dec in out} == {"hysteresis"}
+    assert d.reading_monitor is None
+
+
+def test_reset_forgets_the_reading_monitor() -> None:
+    d = decider()
+    play(d, frames(0.0, 5.0, LEFT, 0.5), current=1, key=keystrokes((0.0, 5.0)))
+    assert d.reading_monitor == 0
+    d.reset()
+    assert d.reading_monitor is None
+    play(d, frames(0.0, 5.0, LEFT, 0.5), current=1, key=keystrokes((0.0, 5.0)))
+    d.set_monitors(DUAL)
+    assert d.reading_monitor is None
+
+
 # ------------------------------------------------------------ configuration
 def test_disabled_resets_dwell() -> None:
     d = decider()
@@ -493,7 +772,14 @@ def test_config_from_settings_converts_milliseconds() -> None:
         mouse_grace_s=1.0,
         typing_grace_s=2.5,
         max_gap_s=SwitchConfig().max_gap_s,
+        reading_grace_s=SwitchConfig().reading_grace_s,
     )
+
+
+def test_config_from_settings_reads_the_reading_grace() -> None:
+    values = {**dataclasses.asdict(SwitchingSettings()), "reading_grace_ms": 9000}
+    s = cast(SwitchingSettings, SimpleNamespace(**values))
+    assert SwitchConfig.from_settings(s).reading_grace_s == pytest.approx(9.0)
 
 
 def test_defaults_match_settings_defaults() -> None:

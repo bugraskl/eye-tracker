@@ -82,7 +82,21 @@ def test_first_listed_app_wins() -> None:
         (".exe", ".exe"),
         ("python3.12", "python3.12"),
         ("dir/sub\\Tool.EXE", "tool"),
+        ('"C:\\Program Files\\obs-studio\\bin\\64bit\\obs64.exe"', "obs64"),
+        ("'C:\\Program Files\\obs-studio\\bin\\64bit\\obs64.exe'", "obs64"),
+        ('  "obs64.exe"  ', "obs64"),
+        ("'/Applications/zoom.us.app'", "zoom.us"),
+        ('"', ""),
     ],
 )
 def test_normalize_process_name(name: str, expected: str) -> None:
     assert normalize_process_name(name) == expected
+
+
+def test_quoted_path_from_copy_as_path_matches_and_is_reported_unquoted() -> None:
+    # Explorer's "Copy as path" (Ctrl+Shift+C) adds the double quotes.
+    entry = '"C:\\Program Files\\obs-studio\\bin\\64bit\\obs64.exe"'
+    inputs = YieldInputs(None, {"obs64.exe"}, [entry])
+    ok, reason = should_yield(inputs, yield_camera=True)
+    assert ok
+    assert reason == "C:\\Program Files\\obs-studio\\bin\\64bit\\obs64.exe is running"

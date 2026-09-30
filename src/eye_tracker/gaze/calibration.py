@@ -7,8 +7,10 @@ The flow driven by the calibration window is::
     collector.start(now)
     ...every UI tick:   events = collector.update(now)
     ...every frame:     collector.add(observation)
-    model, report = evaluate(collector.samples, monitors)
+    model, report = evaluate(collector.samples, monitors, nonlinear=gaze_indices)
 
+``gaze_indices`` are the backend's gaze-direction features
+(``model.gaze_feature_indices(backend.feature_names, backend.gaze_features)``).
 Everything here is plain Python/numpy and driven by an injected clock, so the
 whole procedure is unit-testable without a camera or a screen.
 """
@@ -17,8 +19,9 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import Counter
 from collections.abc import Iterable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import numpy as np
@@ -206,6 +209,7 @@ class CalibrationCollector:
         self._skipped: list[int] = []
         self._events: list[str] = []
         self._n_features: int | None = None
+        self._frame_sizes: Counter[tuple[int, int]] = Counter()
 
     # ------------------------------------------------------------- control
     def start(self, now: float) -> None:
@@ -258,6 +262,9 @@ class CalibrationCollector:
         self._pending.append(
             CalibrationSample(features, target.x, target.y, target.monitor_index, target.point_id)
         )
+        width, height = obs.frame_size
+        if width > 0 and height > 0:
+            self._frame_sizes[(int(width), int(height))] += 1
         return True
 
     # ------------------------------------------------------------- properties
@@ -326,6 +333,18 @@ class CalibrationCollector:
         """Point ids that were skipped for lack of usable observations."""
         return list(self._skipped)
 
+    @property
+    def frame_size(self) -> tuple[int, int]:
+        """Camera frame size ``(w, h)`` of the recorded observations, ``(0, 0)`` if unknown.
+
+        The most common one if the camera changed its size mid-calibration. Store
+        it in ``CalibrationData.frame_size`` so a later change of the camera's
+        aspect ratio is noticed.
+        """
+        if not self._frame_sizes:
+            return (0, 0)
+        return self._frame_sizes.most_common(1)[0][0]
+
     # ------------------------------------------------------------- internals
     def _enter(self, phase: str, now: float) -> None:
         self._phase = phase
@@ -392,6 +411,10 @@ class CalibrationReport:
     grade: str
     #: Polynomial degree chosen for the model (see ``gaze.model``).
     degree: int = 2
+    #: Monitors without a single surviving calibration dot (usually the face was
+    #: not found while looking at them). They appear in ``per_monitor_accuracy``
+    #: with 0.0 and cap the grade at "fair".
+    uncovered_monitors: list[int] = field(default_factory=list)
 
     def summary(self) -> str:
         """One human-readable line, e.g. ``"Excellent — 99% monitor accuracy, 180 samples"``."""
@@ -400,6 +423,9 @@ class CalibrationReport:
         text = f"{self.grade.capitalize()} — {pct}% monitor accuracy, {self.n_samples} samples"
         if math.isfinite(self.mean_error_px):
             text += f", mean error {self.mean_error_px:.0f} px"
+        if self.uncovered_monitors:
+            n = len(self.uncovered_monitors)
+            text += f"; {n} screen{'s' if n > 1 else ''} not calibrated"
         return text
 
     def to_dict(self) -> dict[str, Any]:
@@ -425,8 +451,9 @@ class CalibrationReport:
                 alpha=_float(data["alpha"]),
                 grade=str(data["grade"]),
                 degree=int(data.get("degree", 2)),
+                uncovered_monitors=[int(i) for i in data.get("uncovered_monitors") or []],
             )
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError) as exc:
             raise ValueError(f"invalid calibration report: {exc}") from exc
 
 
@@ -442,6 +469,8 @@ def evaluate(
     samples: Sequence[CalibrationSample],
     monitors: Sequence[Monitor],
     degree: int | None = None,
+    *,
+    nonlinear: Sequence[int] | None = None,
 ) -> tuple[GazeModel, CalibrationReport]:
     """Fit the final model and estimate how well it will work.
 
@@ -450,6 +479,15 @@ def evaluate(
     polynomial degree too unless ``degree`` is given. The report is computed from
     the held-out predictions of the chosen settings, so it reflects accuracy on
     gaze points the model has not seen. The returned model is fitted on all samples.
+
+    ``nonlinear`` should be the backend's gaze-direction feature indices (see
+    ``gaze.model.gaze_feature_indices``): only they get polynomial terms, which
+    keeps the model accurate when the user's posture changes. ``None`` expands
+    every feature (the behaviour before backends declared them).
+
+    A monitor without any calibration dot (possible with three or more monitors)
+    is reported with 0 % accuracy in ``per_monitor_accuracy``, listed in
+    ``uncovered_monitors`` and caps the grade at "fair".
 
     Raises ``ValueError("not enough calibration data")`` with fewer than 10
     samples, fewer than 3 points, or points on fewer than two monitors (one on a
@@ -476,12 +514,26 @@ def evaluate(
     bounds = virtual_bounds(monitor_list)
     degrees = SUPPORTED_DEGREES if degree is None else (degree,)
     selection = select_model(
-        X, Y, point_ids, alphas=DEFAULT_ALPHAS, degrees=degrees, bounds=bounds, weights=W
+        X,
+        Y,
+        point_ids,
+        alphas=DEFAULT_ALPHAS,
+        degrees=degrees,
+        bounds=bounds,
+        weights=W,
+        nonlinear=nonlinear,
     )
     preds = selection.predictions
     if preds is None:  # every candidate diverged; still report honest held-out errors
         preds = lopo_predictions(
-            X, Y, point_ids, selection.alpha, degree=selection.degree, bounds=bounds, weights=W
+            X,
+            Y,
+            point_ids,
+            selection.alpha,
+            degree=selection.degree,
+            bounds=bounds,
+            weights=W,
+            nonlinear=nonlinear,
         )
 
     truth = np.array([s.monitor_index for s in usable])
@@ -490,20 +542,33 @@ def evaluate(
     errors = np.hypot(preds[:, 0] - Y[:, 0], preds[:, 1] - Y[:, 1])
     finite = errors[np.isfinite(errors)]
 
+    # A monitor without dots was never calibrated: the model only extrapolates
+    # there, and gaze at it is often where the face is lost. An "Excellent"
+    # grade computed over the other monitors would hide that.
+    uncovered = sorted(known - covered)
+    per_monitor = {int(idx): float(np.mean(correct[truth == idx])) for idx in sorted(covered)}
+    per_monitor.update({int(idx): 0.0 for idx in uncovered})
+    grade = grade_for(float(np.mean(correct)))
+    if uncovered and grade in ("excellent", "good"):
+        grade = "fair"
+    if uncovered:
+        log.warning("Calibration has no points on monitor(s) %s", uncovered)
+
     report = CalibrationReport(
         monitor_accuracy=float(np.mean(correct)),
         mean_error_px=float(np.mean(finite)) if finite.size else math.nan,
         median_error_px=float(np.median(finite)) if finite.size else math.nan,
-        per_monitor_accuracy={
-            int(idx): float(np.mean(correct[truth == idx])) for idx in sorted(covered)
-        },
+        per_monitor_accuracy=dict(sorted(per_monitor.items())),
         n_samples=len(usable),
         n_points=int(np.unique(point_ids).shape[0]),
         alpha=selection.alpha,
-        grade=grade_for(float(np.mean(correct))),
+        grade=grade,
         degree=selection.degree,
+        uncovered_monitors=[int(i) for i in uncovered],
     )
-    model = GazeModel(degree=selection.degree, alpha=selection.alpha).fit(X, Y, W, bounds)
+    model = GazeModel(degree=selection.degree, alpha=selection.alpha, nonlinear=nonlinear).fit(
+        X, Y, W, bounds
+    )
     log.info(
         "Calibration evaluated: %s (degree %d, alpha %g)",
         report.summary(),

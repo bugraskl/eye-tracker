@@ -1,11 +1,18 @@
-"""Tests for scripts/check_privacy.py, the "no network, no frames on disk" guard."""
+"""Tests for scripts/check_privacy.py, the "no network, no frames on disk" guard.
+
+It checks the source tree and (``--bundle``) the frozen PyInstaller output; the
+bundle tests use small synthetic PE, ELF and Mach-O files built here.
+"""
 
 from __future__ import annotations
 
 import importlib.util
+import os
+import struct
 import subprocess
 import sys
 import textwrap
+from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
 
@@ -13,6 +20,11 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "check_privacy.py"
+
+# A source distribution ships the tests but not scripts/: skip instead of
+# failing collection there.
+if not SCRIPT.is_file():
+    pytest.skip("build tooling is not part of this source tree", allow_module_level=True)
 
 
 def _load_script() -> ModuleType:
@@ -61,6 +73,8 @@ def test_default_target_is_the_package() -> None:
         ("def f():\n    import ftplib", "network-import"),
         ("import importlib\nimportlib.import_module('smtplib')", "network-import"),
         ("__import__('httpx')", "network-import"),
+        ("import sentry_sdk", "network-import"),
+        ("import mediapipe as mp", "network-import"),
         ("from PySide6.QtNetwork import QTcpSocket", "qt-network"),
         ("from PySide6.QtNetwork import QLocalSocket, QNetworkAccessManager", "qt-network"),
         ("from PySide6.QtNetwork import *", "qt-network"),
@@ -93,15 +107,135 @@ def test_detects_violation(source: str, rule: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("source", "rule"),
+    [
+        # QAbstractSocket is constructible and has connectToHost(): not local IPC.
+        ("from PySide6.QtNetwork import QAbstractSocket", "qt-network"),
+        (
+            "from PySide6.QtNetwork import QAbstractSocket\n"
+            "s = QAbstractSocket(QAbstractSocket.SocketType.TcpSocket, None)\n"
+            "s.connectToHost('example.org', 443)",
+            "qt-network",
+        ),
+        (
+            "from PySide6 import QtNetwork\nQtNetwork.QAbstractSocket.SocketType.TcpSocket",
+            "qt-network",
+        ),
+        # The class names give it away however the module was reached.
+        ("import PySide6.QtNetwork as n\nm = n\nm.QTcpSocket()", "qt-network"),
+        ("mod = load()\nmod.QNetworkAccessManager()", "qt-network"),
+        ("getattr(load(), 'QUdpSocket')", "qt-network"),
+        # asyncio streams, servers and loop connections.
+        ("import asyncio\nasyncio.open_connection('example.org', 443)", "network-api"),
+        ("import asyncio\nasyncio.start_server(handle, '0.0.0.0', 8080)", "network-api"),
+        ("from asyncio import open_connection", "network-api"),
+        ("loop.create_connection(Protocol, 'example.org', 443)", "network-api"),
+        ("loop.create_datagram_endpoint(Protocol, remote_addr=('x', 53))", "network-api"),
+        ("loop.create_server(Protocol, port=1)", "network-api"),
+        ("await loop.sock_connect(sock, ('example.org', 80))", "network-api"),
+        ("import asyncio\nasyncio.open_unix_connection('/tmp/s')", "network-api"),
+        # multiprocessing's sockets.
+        ("import multiprocessing.connection", "network-import"),
+        ("from multiprocessing.connection import Client", "network-import"),
+        ("from multiprocessing import connection", "network-import"),
+        ("from multiprocessing.managers import BaseManager", "network-import"),
+        (
+            "import multiprocessing\nmultiprocessing.connection.Client(('example.org', 443))",
+            "network-import",
+        ),
+        (
+            "import importlib\nimportlib.import_module('multiprocessing.connection')",
+            "network-import",
+        ),
+        # The C modules behind socket, ssl and asyncio/multiprocessing on Windows.
+        ("import _socket\n_socket.socket().connect(('example.org', 80))", "network-import"),
+        ("import _ssl", "network-import"),
+        ("from _overlapped import WSAConnect", "network-import"),
+        ("import _multiprocessing", "network-import"),
+        # Raw sockets through ctypes (what select() would then poll).
+        ("import ctypes\nlibc = ctypes.CDLL(None)\nfd = libc.socket(2, 1, 0)", "native-network"),
+        ("import ctypes\nctypes.CDLL('libc.so.6').connect(fd, addr, 16)", "native-network"),
+        (
+            "import ctypes\n"
+            "def _libc():\n    return ctypes.CDLL(None, use_errno=True)\n"
+            "lib = _libc()\nlib.connect(fd, addr, 16)",
+            "native-network",
+        ),
+        (
+            "import ctypes\n"
+            "class C:\n"
+            "    def __init__(self):\n        self._libc = ctypes.CDLL(None)\n"
+            "    def go(self):\n        self._libc.sendto(fd, b'x', 1, 0, addr, 16)",
+            "native-network",
+        ),
+        ("import ctypes\nlibc = ctypes.CDLL(None)\ngetattr(libc, 'connect')", "native-network"),
+        ("import ctypes\nctypes.cdll.msvcrt.bind(fd, addr, 16)", "native-network"),
+        (
+            "import ctypes\nlibc = ctypes.CDLL(None)\nlibc.getaddrinfo(host, None, None, res)",
+            "native-network",
+        ),
+        ("import ctypes\nctypes.windll.ws2_32.WSAStartup(0x202, data)", "native-network"),
+        ("api.WinHttpOpen(None, 0, None, None, 0)", "native-network"),
+        ("getattr(lib, 'gethostbyname')", "native-network"),
+        ("import ctypes\nctypes.WinDLL('winhttp.dll')", "native-network"),
+        ("import ctypes\nctypes.WinDLL('dnsapi')", "native-network"),
+        ("import ctypes\nctypes.CDLL('libcurl-gnutls.so.4')", "native-network"),
+        ("import ctypes.util\nctypes.util.find_library('curl')", "native-network"),
+        ("import ctypes\nctypes.CDLL('/usr/lib/x86_64-linux-gnu/libssl.so.3')", "native-network"),
+        (
+            "import ctypes\n"
+            "ctypes.CDLL('/System/Library/Frameworks/CFNetwork.framework/CFNetwork')",
+            "native-network",
+        ),
+        # Network tools behind shells and wrappers.
+        (
+            "import subprocess\nsubprocess.run(['sh', '-c', 'curl https://x.org'])",
+            "network-command",
+        ),
+        ("import subprocess\nsubprocess.run(['sudo', 'wget', 'https://x.org'])", "network-command"),
+        ("import os\nos.system('echo hi && curl https://x.org')", "network-command"),
+        (
+            "import subprocess\nsubprocess.run('powershell -c iwr https://x.org', shell=True)",
+            "network-command",
+        ),
+        (
+            "import subprocess\nsubprocess.run(['cmd', '/c', 'certutil -urlcache -f x y'])",
+            "network-command",
+        ),
+        (
+            "from PySide6.QtCore import QProcess\nQProcess.startDetached('curl', ['x'])",
+            "network-command",
+        ),
+        ("import os\nos.posix_spawn('/usr/bin/wget', args, env)", "network-command"),
+        # Log records sent over the network.
+        ("import logging.handlers\nlogging.handlers.HTTPHandler('x.org', '/log')", "network-api"),
+        ("from logging.handlers import SocketHandler", "network-api"),
+        (
+            "import logging.handlers\nh = logging.handlers.SysLogHandler(('x.org', 514))",
+            "network-api",
+        ),
+        ("import logging.config\nlogging.config.listen(9999)", "network-api"),
+    ],
+)
+def test_detects_bypasses(source: str, rule: str) -> None:
+    """Ordinary APIs that used to slip past the check (packaging-07)."""
+    assert rule in _rules(source)
+
+
+@pytest.mark.parametrize(
     "source",
     [
         # Local IPC is the one allowed use of QtNetwork.
-        "from PySide6.QtNetwork import QLocalServer, QLocalSocket, QAbstractSocket",
+        "from PySide6.QtNetwork import QLocalServer, QLocalSocket",
         "from PySide6 import QtNetwork\nQtNetwork.QLocalSocket()\nQtNetwork.QLocalServer.listen",
         "import PySide6.QtNetwork as qn\nqn.QLocalServer()",
         "from PySide6.QtNetwork import QLocalSocket\ns = QLocalSocket.LocalSocketState.Connected",
+        "from PySide6.QtNetwork import QLocalSocket\ns = QLocalSocket()\ns.connectToServer('x')",
         "from PySide6 import QtNetwork\ngetattr(QtNetwork, 'QLocalSocket')",
         "from PySide6.QtWidgets import QApplication\nfrom PySide6.QtGui import QImage",
+        # Qt signals, servers of the local kind and look-alike method names.
+        "button.clicked.connect(on_click)\nserver.listen(name)\nsocket.accept_later()",
+        "self.worker.connect(self.slot)\nwatcher.bind(key)",
         # Requesting MJPG from a camera builds a codec code; nothing is written.
         "import cv2\ncode = cv2.VideoWriter.fourcc(*'MJPG')",
         "import cv2\ncode = cv2.VideoWriter_fourcc(*'MJPG')",
@@ -109,11 +243,22 @@ def test_detects_violation(source: str, rule: str) -> None:
         # Ordinary system tools, local modules and look-alike names are fine.
         "import subprocess\nsubprocess.run(['loginctl', 'lock-session'], check=False)",
         "import subprocess\nsubprocess.run(['gdbus', 'call', '--session'])",
+        "import subprocess\nsubprocess.run(['sh', '-c', 'xset dpms force off'])",
+        "import subprocess\nsubprocess.run(['sudo', 'true'])",
+        "import os\nos.system('xdg-open /tmp')",
         "from . import socket\nfrom .http import thing",
         "import select, selectors, os, sys",
+        "import select\nselect.select([fd], [], [], 1.0)",
         "import sockets_helper\nimport httpish",
         "import importlib\nmodule = importlib.import_module(f'{__name__}.windows')",
         "import ctypes\nuser32 = ctypes.WinDLL('user32', use_last_error=True)",
+        "import ctypes\nuser32 = ctypes.WinDLL('user32')\nuser32.GetCursorPos(point)",
+        "import ctypes\nlibc = ctypes.CDLL(None)\nlibc.fanotify_init(0, 0)\nlibc.inotify_init1(0)",
+        "import ctypes.util\nctypes.CDLL(ctypes.util.find_library('c'))",
+        "import logging.handlers\nlogging.handlers.RotatingFileHandler('app.log')",
+        "import multiprocessing\nmultiprocessing.cpu_count()",
+        "import asyncio\nasyncio.run(main())\nasyncio.sleep(1)",
+        "def create_menu():\n    pass",
         "REPO_URL = 'https://github.com/bugraskl/eye-tracker'",
         "ws = 'curl is just a word in a string'",
     ],
@@ -209,3 +354,425 @@ def test_script_runs_standalone(tmp_path: Path) -> None:
     )
     assert proc.returncode == 1, proc.stderr
     assert "network-import" in proc.stdout
+
+
+# ================================================================ synthetic native binaries
+def _pe(imports: Sequence[str] = (), delay: Sequence[str] = (), *, pe32: bool = False) -> bytes:
+    """A minimal PE image with one section holding the import tables."""
+    section_rva, section_offset = 0x1000, 0x200
+    descriptors = 20 * (len(imports) + 1)
+    delay_start = descriptors
+    names_start = delay_start + 32 * (len(delay) + 1)
+    names = b""
+    name_rvas: list[int] = []
+    for name in (*imports, *delay):
+        name_rvas.append(section_rva + names_start + len(names))
+        names += name.encode("ascii") + b"\0"
+    body = b"".join(struct.pack("<IIIII", 0, 0, 0, rva, 0) for rva in name_rvas[: len(imports)])
+    body += b"\0" * 20
+    body += b"".join(
+        struct.pack("<IIIIIIII", 1, rva, 0, 0, 0, 0, 0, 0) for rva in name_rvas[len(imports) :]
+    )
+    body += b"\0" * 32 + names
+    body += b"\0" * (-len(body) % 0x200)
+
+    optional_size = 224 if pe32 else 240
+    optional = bytearray(optional_size)
+    struct.pack_into("<H", optional, 0, 0x10B if pe32 else 0x20B)
+    directories = 96 if pe32 else 112
+    struct.pack_into("<I", optional, directories - 4, 16)
+    struct.pack_into("<II", optional, directories + 8, section_rva, descriptors)
+    if delay:
+        struct.pack_into("<II", optional, directories + 8 * 13, section_rva + delay_start, 32)
+    coff = struct.pack("<HHIIIHH", 0x14C if pe32 else 0x8664, 1, 0, 0, 0, optional_size, 0x2022)
+    section = struct.pack(
+        "<8sIIIIIIHHI", b".idata", len(body), section_rva, len(body), section_offset, 0, 0, 0, 0, 0
+    )
+    dos = bytearray(0x40)
+    dos[:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 0x40)
+    header = bytes(dos) + b"PE\0\0" + coff + bytes(optional) + section
+    return header + b"\0" * (section_offset - len(header)) + body
+
+
+def _elf(
+    needed: Sequence[str] = (),
+    undefined: Sequence[str] = (),
+    defined: Sequence[str] = (),
+    *,
+    is64: bool = True,
+    big_endian: bool = False,
+) -> bytes:
+    """A minimal ELF shared object: .dynstr, .dynamic and .dynsym sections only."""
+    end = ">" if big_endian else "<"
+    strings = b"\0"
+    offsets: dict[str, int] = {}
+    for name in (*needed, *undefined, *defined):
+        offsets[name] = len(strings)
+        strings += name.encode("ascii") + b"\0"
+    word, entry = ("Q", 16) if is64 else ("I", 8)
+    dynamic = b"".join(
+        struct.pack(end + ("q" if is64 else "i") + word, 1, offsets[lib]) for lib in needed
+    )
+    dynamic += b"\0" * entry
+    symbols = b"\0" * (24 if is64 else 16)  # the null symbol
+    for name, index in [(n, 0) for n in undefined] + [(n, 7) for n in defined]:
+        info = (1 << 4) | 2  # GLOBAL FUNC
+        if is64:
+            symbols += struct.pack(end + "IBBHQQ", offsets[name], info, 0, index, 0, 0)
+        else:
+            symbols += struct.pack(end + "IIIBBH", offsets[name], 0, 0, info, 0, index)
+    header_size = 64 if is64 else 52
+    strings_offset = header_size
+    dynamic_offset = strings_offset + len(strings)
+    symbols_offset = dynamic_offset + len(dynamic)
+    sections_offset = symbols_offset + len(symbols)
+
+    def section(kind: int, offset: int, size: int, link: int) -> bytes:
+        if is64:
+            return struct.pack(end + "IIQQQQIIQQ", 0, kind, 0, 0, offset, size, link, 0, 0, 0)
+        return struct.pack(end + "IIIIIIIIII", 0, kind, 0, 0, offset, size, link, 0, 0, 0)
+
+    table = (
+        section(0, 0, 0, 0)
+        + section(3, strings_offset, len(strings), 0)
+        + section(6, dynamic_offset, len(dynamic), 1)
+        + section(11, symbols_offset, len(symbols), 1)
+    )
+    ident = b"\x7fELF" + bytes([2 if is64 else 1, 2 if big_endian else 1, 1]) + b"\0" * 9
+    if is64:
+        header = ident + struct.pack(
+            end + "HHIQQQIHHHHHH", 3, 62, 1, 0, 0, sections_offset, 0, 64, 56, 0, 64, 4, 0
+        )
+    else:
+        header = ident + struct.pack(
+            end + "HHIIIIIHHHHHH", 3, 3, 1, 0, 0, sections_offset, 0, 52, 32, 0, 40, 4, 0
+        )
+    return header + strings + dynamic + symbols + table
+
+
+def _macho(
+    dylibs: Sequence[str] = (),
+    undefined: Sequence[str] = (),
+    defined: Sequence[str] = (),
+    *,
+    fat: bool = False,
+) -> bytes:
+    """A minimal 64-bit little-endian Mach-O dylib, optionally in a universal wrapper."""
+    commands = b""
+    for path in dylibs:
+        name = path.encode("utf-8") + b"\0"
+        name += b"\0" * (-(24 + len(name)) % 8)
+        commands += struct.pack("<IIIIII", 0xC, 24 + len(name), 24, 0, 0, 0) + name
+    strings = b"\0"
+    entries: list[tuple[int, int]] = []
+    for names, kind in ((undefined, 0x01), (defined, 0x0F)):
+        for symbol in names:
+            entries.append((len(strings), kind))
+            strings += b"_" + symbol.encode("ascii") + b"\0"
+    header_size = 32
+    commands_size = len(commands) + 24
+    symbols_offset = header_size + commands_size
+    symbols = b"".join(struct.pack("<IBBHQ", offset, kind, 0, 0, 0) for offset, kind in entries)
+    strings_offset = symbols_offset + len(symbols)
+    commands += struct.pack(
+        "<IIIIII", 0x2, 24, symbols_offset, len(entries), strings_offset, len(strings)
+    )
+    count = len(dylibs) + 1
+    header = struct.pack("<IiiIIIII", 0xFEEDFACF, 0x0100000C, 0, 6, count, commands_size, 0, 0)
+    thin = header + commands + symbols + strings
+    if not fat:
+        return thin
+    offset = 0x1000
+    wrapper = struct.pack(">II", 0xCAFEBABE, 1) + struct.pack(
+        ">iiIII", 0x0100000C, 0, offset, len(thin), 12
+    )
+    return wrapper + b"\0" * (offset - len(wrapper)) + thin
+
+
+# ------------------------------------------------------------------------- binary readers
+@pytest.mark.parametrize("pe32", [False, True])
+def test_pe_imports_and_delay_imports(pe32: bool) -> None:
+    data = _pe(["KERNEL32.dll", "WS2_32.dll"], delay=["WININET.dll"], pe32=pe32)
+    binary = check_privacy.parse_binary(data)
+    assert binary.format == "pe"
+    assert binary.libraries == ("KERNEL32.dll", "WS2_32.dll", "WININET.dll")
+    keys = [indicator.key for indicator in check_privacy.network_indicators(binary)]
+    assert keys == ["ws2_32", "wininet"]
+
+
+@pytest.mark.parametrize(("is64", "big_endian"), [(True, False), (False, True), (False, False)])
+def test_elf_needed_libraries_and_undefined_symbols(is64: bool, big_endian: bool) -> None:
+    data = _elf(
+        needed=["libc.so.6", "libcurl.so.4"],
+        undefined=["getaddrinfo", "connect", "socket"],
+        defined=["gethostbyname"],  # defined here, not imported: not an indicator
+        is64=is64,
+        big_endian=big_endian,
+    )
+    binary = check_privacy.parse_binary(data)
+    assert binary.format == "elf"
+    assert binary.libraries == ("libc.so.6", "libcurl.so.4")
+    assert binary.symbols == {"getaddrinfo", "connect", "socket"}
+    indicators = check_privacy.network_indicators(binary)
+    # socket/connect are also local IPC: only the resolver and libcurl count.
+    assert [(i.rule, i.key) for i in indicators] == [
+        ("network-library", "libcurl"),
+        ("network-symbol", "getaddrinfo"),
+    ]
+
+
+@pytest.mark.parametrize("fat", [False, True])
+def test_macho_dylibs_and_undefined_symbols(fat: bool) -> None:
+    data = _macho(
+        dylibs=[
+            "/System/Library/Frameworks/CFNetwork.framework/Versions/A/CFNetwork",
+            "/usr/lib/libSystem.B.dylib",
+            "/usr/lib/libresolv.9.dylib",
+        ],
+        undefined=["getaddrinfo", "malloc"],
+        defined=["gethostbyname"],
+        fat=fat,
+    )
+    binary = check_privacy.parse_binary(data)
+    assert binary.format == "macho"
+    assert binary.libraries[1] == "/usr/lib/libSystem.B.dylib"
+    assert binary.symbols == {"getaddrinfo", "malloc"}
+    keys = [i.key for i in check_privacy.network_indicators(binary)]
+    assert keys == ["cfnetwork", "libresolv", "getaddrinfo"]
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"",
+        b"plain text, not a binary",
+        b"\x89PNG\r\n\x1a\n" + b"\0" * 64,
+        # A Java class file shares the universal-binary magic number.
+        b"\xca\xfe\xba\xbe\x00\x00\x00\x34" + b"\0" * 64,
+    ],
+)
+def test_non_binaries_are_not_parsed(data: bytes) -> None:
+    assert check_privacy.parse_binary(data) is None
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        _pe(["WS2_32.dll"])[:0x90],
+        b"MZ" + b"\0" * 0x3A + struct.pack("<I", 0x40) + b"NOPE" + b"\0" * 64,
+        _elf(["libc.so.6"], ["getaddrinfo"])[:80],
+        _macho(["/usr/lib/libSystem.B.dylib"])[:40],
+    ],
+)
+def test_truncated_binaries_are_reported(data: bytes) -> None:
+    with pytest.raises(check_privacy.BinaryFormatError):
+        check_privacy.parse_binary(data)
+
+
+def test_telemetry_markers_ascii_and_utf16_any_case() -> None:
+    assert check_privacy.telemetry_markers(b"xx https://PLAY.googleapis.com/log xx") == [
+        "play.googleapis.com"
+    ]
+    wide = "AVClearcutLogger".encode("utf-16-le")
+    assert check_privacy.telemetry_markers(b"\0\0" + wide) == ["clearcut"]
+    # The model NOTICE names where the weights came from; that is not telemetry.
+    assert check_privacy.telemetry_markers(b"https://storage.googleapis.com/mediapipe-models") == []
+
+
+def test_committed_models_contain_no_telemetry_markers() -> None:
+    models = REPO_ROOT / "src" / "eye_tracker" / "vision" / "models"
+    files = [p for p in models.iterdir() if p.is_file()]
+    assert files
+    for path in files:
+        assert check_privacy.telemetry_markers(path.read_bytes()) == [], path
+
+
+def test_allowlist_entries_are_explained_and_normalised() -> None:
+    for rule in check_privacy.BUNDLE_ALLOWLIST:
+        assert rule.reason.strip(), rule
+        assert rule.indicators, rule
+        assert all(i == i.lower() for i in rule.indicators), rule
+    # Markers are never allow-listed: that list only holds libraries and symbols.
+    every = set().union(*(r.indicators for r in check_privacy.BUNDLE_ALLOWLIST))
+    assert not every & {m.lower() for m in check_privacy.TELEMETRY_MARKERS}
+
+
+# ------------------------------------------------------------------------------ bundle scans
+def _write(root: Path, relative: str, data: bytes) -> None:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def _bundle(tmp_path: Path, files: dict[str, bytes]) -> Path:
+    root = tmp_path / "EyeTracker"
+    for relative, data in files.items():
+        _write(root, relative, data)
+    return root
+
+
+def _summary(result: object) -> set[tuple[str, str]]:
+    return {(f.relative, f.rule) for f in result.violations}  # type: ignore[attr-defined]
+
+
+def test_clean_bundle_passes_with_allowed_networking(tmp_path: Path) -> None:
+    root = _bundle(
+        tmp_path,
+        {
+            "EyeTracker.exe": _pe(["KERNEL32.dll"]),
+            "_internal/_socket.pyd": _pe(["WS2_32.dll", "IPHLPAPI.DLL", "python312.dll"]),
+            "_internal/PySide6/Qt6Network.dll": _pe(["WS2_32.dll", "DNSAPI.dll", "WINHTTP.dll"]),
+            "_internal/PySide6/Qt/lib/libQt6Network.so.6": _elf(
+                ["libgssapi_krb5.so.2", "libc.so.6"], ["getaddrinfo", "res_nquery"]
+            ),
+            "_internal/libxcb.so.1": _elf(["libXau.so.6"], ["getaddrinfo", "connect"]),
+            "_internal/cv2/opencv_python_headless.libs/libavformat-4d3f2b1c.so.61.1.100": _elf(
+                ["libssl-8e5a0a1b.so.3"], ["getaddrinfo"]
+            ),
+            "Contents/Frameworks/PySide6/Qt/lib/QtNetwork.framework/Versions/A/QtNetwork": _macho(
+                ["/System/Library/Frameworks/CFNetwork.framework/Versions/A/CFNetwork"],
+                ["getaddrinfo"],
+            ),
+            "_internal/eye_tracker/vision/models/NOTICE.md": (
+                b"https://storage.googleapis.com/mediapipe-models/face_landmarker.task"
+            ),
+            "_internal/numpy-2.5.3.dist-info/METADATA": b"Name: numpy",
+        },
+    )
+    result = check_privacy.scan_bundle(root)
+    assert result.ok, [str(v) for v in result.violations]
+    assert result.binaries == 7
+    assert result.files == 9
+    allowed = {(f.relative.rsplit("/", 1)[-1], f.detail) for f in result.allowed}
+    assert ("Qt6Network.dll", "links WINHTTP.dll") in allowed
+    assert ("libQt6Network.so.6", "imports getaddrinfo") in allowed
+
+
+@pytest.mark.parametrize(
+    ("relative", "needed", "undefined"),
+    [
+        # What these libraries import on Ubuntu (measured with readelf / nm -D).
+        ("_internal/libxcb.so.1", ["libXau.so.6", "libXdmcp.so.6"], ["getaddrinfo"]),
+        ("_internal/libX11.so.6", ["libxcb.so.1"], ["getaddrinfo"]),
+        ("_internal/libdbus-1.so.3", ["libsystemd.so.0"], ["getaddrinfo", "getnameinfo"]),
+        ("_internal/libsystemd.so.0", ["libcap.so.2"], ["getaddrinfo"]),
+        ("_internal/libcrypto.so.3", [], ["getaddrinfo", "gethostbyname", "getnameinfo"]),
+        ("_internal/libgssapi_krb5.so.2", ["libkrb5.so.3", "libkrb5support.so.0"], []),
+        (
+            "_internal/libkrb5.so.3",
+            ["libkrb5support.so.0", "libresolv.so.2"],
+            ["getnameinfo", "res_nsearch"],
+        ),
+        ("_internal/libkrb5support.so.0", [], ["getaddrinfo", "getnameinfo"]),
+        ("_internal/libk5crypto.so.3", ["libkrb5support.so.0"], []),
+        (
+            "_internal/lib-dynload/_socket.cpython-312-x86_64-linux-gnu.so",
+            [],
+            ["getaddrinfo", "gethostbyaddr_r", "gethostbyname_r", "getnameinfo"],
+        ),
+        ("_internal/libpython3.12.so.1.0", [], ["getaddrinfo", "getnameinfo"]),
+    ],
+)
+def test_linux_system_libraries_are_allowed(
+    tmp_path: Path, relative: str, needed: list[str], undefined: list[str]
+) -> None:
+    root = _bundle(tmp_path, {relative: _elf(needed, [*undefined, "malloc"])})
+    result = check_privacy.scan_bundle(root)
+    assert result.ok, [str(v) for v in result.violations]
+
+
+def test_mediapipe_like_bundle_fails(tmp_path: Path) -> None:
+    """What the MediaPipe runtime put into the 0.1 bundle must never pass again."""
+    libmediapipe = _pe(["KERNEL32.dll", "WININET.dll"]) + b"https://play.googleapis.com/log\0"
+    root = _bundle(
+        tmp_path,
+        {
+            "_internal/mediapipe/tasks/c/libmediapipe.dll": libmediapipe,
+            "_internal/mediapipe-1.0.1.dist-info/METADATA": b"Name: mediapipe",
+        },
+    )
+    result = check_privacy.scan_bundle(root)
+    assert not result.ok
+    assert _summary(result) == {
+        ("_internal/mediapipe/tasks/c/libmediapipe.dll", "forbidden-package"),
+        ("_internal/mediapipe/tasks/c/libmediapipe.dll", "telemetry-endpoint"),
+        ("_internal/mediapipe/tasks/c/libmediapipe.dll", "network-library"),
+    }
+    # One report per distribution, however many of its files are bundled.
+    assert sum(v.rule == "forbidden-package" for v in result.violations) == 1
+
+
+def test_unknown_or_unexpected_networking_fails(tmp_path: Path) -> None:
+    root = _bundle(
+        tmp_path,
+        {
+            # An allowed file that gains a new networking dependency.
+            "_internal/_socket.pyd": _pe(["WS2_32.dll", "WINHTTP.dll"]),
+            # Networking where none is expected.
+            "_internal/somelib.dll": _pe(["WS2_32.dll"]),
+            "_internal/libsomething.so.1": _elf(["libc.so.6"], ["gethostbyname"]),
+            "_internal/libfetch.so": _elf(["libcurl-gnutls.so.4"]),
+            "_internal/broken.dll": b"MZ" + b"\0" * 0x3A + struct.pack("<I", 0x40) + b"XXXX",
+            "_internal/data/config.json": b'{"endpoint": "https://api.segment.io/v1"}',
+        },
+    )
+    result = check_privacy.scan_bundle(root)
+    details = {(f.relative.rsplit("/", 1)[-1], f.rule, f.detail) for f in result.violations}
+    assert details == {
+        ("_socket.pyd", "network-library", "links WINHTTP.dll"),
+        ("somelib.dll", "network-library", "links WS2_32.dll"),
+        ("libsomething.so.1", "network-symbol", "imports gethostbyname"),
+        ("libfetch.so", "network-library", "links libcurl-gnutls.so.4"),
+        ("broken.dll", "unreadable-binary", "cannot be verified: MZ file without a PE header"),
+        ("config.json", "telemetry-endpoint", "contains the telemetry marker 'api.segment.io'"),
+    }
+    # The allowed part of _socket.pyd is still reported as allowed.
+    assert [f.detail for f in result.allowed] == ["links WS2_32.dll"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_symlinks_are_not_followed(tmp_path: Path) -> None:
+    root = _bundle(tmp_path, {"Versions/A/QtCore": _pe(["KERNEL32.dll"])})
+    outside = tmp_path / "outside.dll"
+    outside.write_bytes(_pe(["WININET.dll"]))
+    os.symlink(outside, root / "linked.dll")
+    os.symlink("A", root / "Versions" / "Current")
+    result = check_privacy.scan_bundle(root)
+    assert result.ok
+    assert result.files == 1
+
+
+def test_bundle_command_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    good = _bundle(tmp_path / "good", {"_internal/_socket.pyd": _pe(["WS2_32.dll"])})
+    bad = _bundle(tmp_path / "bad", {"_internal/x.dll": _pe(["WININET.dll"])})
+
+    assert check_privacy.main(["--bundle", str(good)]) == 0
+    out = capsys.readouterr().out
+    assert "_internal/_socket.pyd: allowed WS2_32.dll: CPython" in out
+    assert "OK: 1 native binaries in 1 files" in out
+
+    assert check_privacy.main(["--bundle", str(bad), "--quiet"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "_internal/x.dll: network-library: links WININET.dll\n"
+    assert "FAILED: 1 problem(s)" in captured.err
+
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert check_privacy.main(["--bundle", str(bad)]) == 1
+    assert capsys.readouterr().out.startswith(
+        "::error title=Privacy check (bundle)::_internal/x.dll"
+    )
+
+    assert check_privacy.main(["--bundle", str(tmp_path / "missing")]) == 2
+    with pytest.raises(SystemExit) as exc:
+        check_privacy.main(["--bundle", str(good), "src"])
+    assert exc.value.code == 2
+
+
+def test_bundle_scan_of_a_single_file(tmp_path: Path) -> None:
+    library = tmp_path / "libmediapipe.so"
+    library.write_bytes(_elf(["libc.so.6"]) + b"clearcut")
+    result = check_privacy.scan_bundle(library)
+    assert _summary(result) == {("libmediapipe.so", "telemetry-endpoint")}

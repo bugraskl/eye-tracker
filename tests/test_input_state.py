@@ -77,6 +77,27 @@ def test_tiny_jitter_is_not_mouse_activity() -> None:
     assert tr.last_mouse_activity == -math.inf
 
 
+def test_slow_drag_is_mouse_activity() -> None:
+    # Dragging a slider at ~15 px/s: 1.5 px per 100 ms poll, below the per-poll
+    # move threshold every time.
+    tr = InputTracker(lambda: None, lambda: None)
+    moves = []
+    for i in range(31):
+        t = round(1.0 + 0.1 * i, 6)
+        tr.poll(t, (round(500 + 1.5 * i), 500))
+        moves.append(tr.manual_move)
+    assert any(moves)
+    assert tr.last_mouse_activity >= 3.0  # detected again and again, not just once
+    assert tr.last_key_activity == -math.inf
+
+
+def test_one_pixel_jitter_never_adds_up_to_a_move() -> None:
+    tr = InputTracker(lambda: None, lambda: None)
+    for i in range(100):
+        tr.poll(1.0 + 0.1 * i, (500 + i % 2, 500 - (i // 2) % 2))
+    assert tr.last_mouse_activity == -math.inf
+
+
 def test_programmatic_move_is_not_user_activity() -> None:
     tr = InputTracker(lambda: None, lambda: None)
     tr.poll(1.0, (500, 500))
@@ -197,6 +218,20 @@ def test_stale_cached_idle_value_is_ignored() -> None:
     tr.poll(1.0, (0, 0))
     tr.poll(1.5, (0, 0))
     tr.poll(2.0, (0, 0))
+    assert tr.last_key_activity == -math.inf
+
+
+def test_quantised_idle_timer_during_mouse_motion_is_not_typing() -> None:
+    # Windows ticks the idle timer in 15.6 ms steps: two polls during continuous
+    # mouse motion both read 0.0. The second reading must still be consumed.
+    readings = iter([5.0, 0.0, 0.0, 0.1, 0.2])
+    tr = InputTracker(lambda: next(readings), lambda: None)
+    tr.poll(1.0, (100, 100))
+    tr.poll(1.1, (130, 100))  # moving
+    tr.poll(1.2, (160, 100))  # still moving; same idle reading as before
+    tr.poll(1.3, (160, 100))  # stopped: last input at 1.2 was the mouse
+    tr.poll(1.4, (160, 100))
+    assert tr.last_mouse_activity == pytest.approx(1.2)
     assert tr.last_key_activity == -math.inf
 
 

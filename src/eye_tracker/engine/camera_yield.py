@@ -16,6 +16,13 @@ log = logging.getLogger(__name__)
 
 _SUFFIXES = (".exe", ".app")
 _PATH_SEPARATORS = re.compile(r"[\\/]")
+#: Windows Explorer's "Copy as path" wraps the path in double quotes; shells and
+#: users sometimes use single quotes.
+_QUOTES = "\"'"
+
+
+def _unquote(text: str) -> str:
+    return text.strip().strip(_QUOTES).strip()
 
 
 @dataclass
@@ -31,8 +38,12 @@ class YieldInputs:
 
 
 def normalize_process_name(name: str) -> str:
-    """Canonical form for matching: lower case, no directory, no ``.exe``/``.app`` suffix."""
-    base = _PATH_SEPARATORS.split(name.strip())[-1].strip().lower()
+    """Canonical form for matching: lower case, no quotes, no directory, no ``.exe``/``.app``.
+
+    Accepts what users paste, e.g. ``"C:\\Program Files\\obs-studio\\bin\\64bit\\obs64.exe"``
+    (with the quotes Explorer's "Copy as path" adds) or ``/Applications/zoom.us.app``.
+    """
+    base = _unquote(_PATH_SEPARATORS.split(_unquote(name))[-1]).lower()
     for suffix in _SUFFIXES:
         if base.endswith(suffix) and len(base) > len(suffix):
             return base[: -len(suffix)]
@@ -46,7 +57,7 @@ def matching_app(running: Iterable[str], pause_for_apps: Iterable[str]) -> str |
     for entry in pause_for_apps:
         wanted = normalize_process_name(entry)
         if wanted and wanted in names:
-            return entry.strip()
+            return _unquote(entry)
     return None
 
 

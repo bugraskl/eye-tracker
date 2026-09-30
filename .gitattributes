@@ -22,8 +22,8 @@ packaging/linux/AppRun text eol=lf
 *.gif binary
 *.webp binary
 *.onnx binary
-*.task binary
 *.tflite binary
+*.binarypb binary
 
 # SVG is text, but a textual diff of drawing data is rarely useful.
 *.svg text eol=lf -diff

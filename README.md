@@ -84,7 +84,8 @@ Default hotkeys:
 | Calibrate | `Ctrl+Alt+Win+C` | `⌃⌥C` | `Ctrl+Alt+Shift+C` |
 
 The defaults avoid combinations that type characters on keyboards with AltGr (Ctrl+Alt+T is `₺` on
-Turkish Q, for example). You can change them in **Settings → Hotkeys**.
+Turkish Q, for example). You can change them in **Settings → Hotkeys**. Every other option is listed
+in the [configuration reference](docs/configuration.md).
 
 ## How it works
 

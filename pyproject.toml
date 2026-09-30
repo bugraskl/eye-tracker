@@ -1,0 +1,136 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "eye-tracker"
+dynamic = ["version"]
+description = "Look at a monitor and your cursor and keyboard focus follow. Webcam-based, private, offline and cross-platform."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Buğra Şıkel" }]
+requires-python = ">=3.11,<3.15"
+keywords = [
+  "eye-tracking",
+  "head-tracking",
+  "gaze",
+  "multi-monitor",
+  "dual-monitor",
+  "productivity",
+  "webcam",
+  "mediapipe",
+  "accessibility",
+  "privacy",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: X11 Applications :: Qt",
+  "Environment :: Win32 (MS Windows)",
+  "Environment :: MacOS X",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Desktop Environment",
+  "Topic :: Scientific/Engineering :: Image Recognition",
+  "Topic :: Utilities",
+]
+dependencies = [
+  "numpy>=1.26",
+  "opencv-python-headless>=4.10",
+  "PySide6-Essentials>=6.7",
+  "platformdirs>=4.2",
+  "psutil>=5.9",
+  # MediaPipe publishes no macOS x86_64 wheel; Intel Macs fall back to the OpenCV backend.
+  "mediapipe>=1.0.1,<2; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+  "python-xlib>=0.33; sys_platform == 'linux'",
+  "pyobjc-framework-Cocoa>=10.3; sys_platform == 'darwin'",
+  "pyobjc-framework-Quartz>=10.3; sys_platform == 'darwin'",
+  "pyobjc-framework-ApplicationServices>=10.3; sys_platform == 'darwin'",
+  "pyobjc-framework-AVFoundation>=10.3; sys_platform == 'darwin'",
+]
+
+[project.urls]
+Homepage = "https://github.com/bugraskl/eye-tracker"
+Documentation = "https://github.com/bugraskl/eye-tracker/tree/main/docs"
+Issues = "https://github.com/bugraskl/eye-tracker/issues"
+Changelog = "https://github.com/bugraskl/eye-tracker/blob/main/CHANGELOG.md"
+
+[project.scripts]
+eye-tracker = "eye_tracker.cli:main"
+
+[project.gui-scripts]
+eye-tracker-gui = "eye_tracker.cli:gui_main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.2",
+  "ruff>=0.6",
+  "mypy>=1.11",
+]
+build = [
+  "pyinstaller>=6.10",
+  "pillow>=10.4",
+]
+
+[tool.uv]
+default-groups = ["dev", "build"]
+# MediaPipe 1.x declares heavyweight dependencies that this app never imports:
+# opencv-contrib-python (bundles its own Qt on Linux and clashes with PySide6 and
+# opencv-python-headless), matplotlib and sounddevice. They are excluded here and
+# the single import MediaPipe makes of matplotlib is satisfied by a shim
+# (see src/eye_tracker/vision/_mp_shim.py).
+override-dependencies = [
+  "opencv-contrib-python; sys_platform == 'never'",
+  "matplotlib; sys_platform == 'never'",
+  "sounddevice; sys_platform == 'never'",
+]
+
+[tool.hatch.version]
+path = "src/eye_tracker/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eye_tracker"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/eye_tracker", "tests", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "PL", "PT", "C4"]
+ignore = [
+  "PLR0911", # too many return statements
+  "PLR0912", # too many branches
+  "PLR0913", # too many arguments
+  "PLR0915", # too many statements
+  "PLR0917", # too many positional arguments (spec-level APIs)
+  "PLR2004", # magic values in comparisons
+  "PLC0415", # imports inside functions are intentional (optional/platform deps)
+  "RUF001",  # ambiguous unicode characters in UI strings
+  "RUF002",
+  "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004", "PLC2701", "S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = false
+check_untyped_defs = true
+files = ["src/eye_tracker"]

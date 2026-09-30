@@ -1,0 +1,11 @@
+# Code owners are requested for review automatically on every pull request.
+# https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+* @bugraskl
+
+# Privacy-critical areas: changes here need an explicit look from the maintainer.
+/scripts/check_privacy.py @bugraskl
+/src/eye_tracker/vision/ @bugraskl
+/src/eye_tracker/ipc.py @bugraskl
+/.github/workflows/ @bugraskl
+/packaging/ @bugraskl

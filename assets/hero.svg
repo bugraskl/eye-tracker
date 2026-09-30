@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B1022"/>
+      <stop offset="1" stop-color="#060914"/>
+    </linearGradient>
+    <radialGradient id="glowIndigo" cx="0.72" cy="0.42" r="0.55">
+      <stop offset="0" stop-color="#6366F1" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#6366F1" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowCyan" cx="0.12" cy="0.95" r="0.5">
+      <stop offset="0" stop-color="#22D3EE" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#22D3EE" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#818CF8"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#22D3EE" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#6366F1" stop-opacity="0.05"/>
+    </linearGradient>
+    <linearGradient id="screenOn" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1E2548"/>
+      <stop offset="1" stop-color="#141A36"/>
+    </linearGradient>
+    <linearGradient id="screenOff" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#121729"/>
+      <stop offset="1" stop-color="#0E1222"/>
+    </linearGradient>
+    <filter id="blur12" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="12"/>
+    </filter>
+    <filter id="blur4" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="4"/>
+    </filter>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#FFFFFF" stroke-opacity="0.035" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <!-- background -->
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <rect width="1280" height="640" fill="url(#grid)"/>
+  <rect width="1280" height="640" fill="url(#glowIndigo)"/>
+  <rect width="1280" height="640" fill="url(#glowCyan)"/>
+
+  <!-- ============ left: copy ============ -->
+  <g font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif">
+    <rect x="80" y="150" width="292" height="36" rx="18" fill="#6366F1" fill-opacity="0.14" stroke="#818CF8" stroke-opacity="0.45"/>
+    <circle cx="102" cy="168" r="5" fill="#22D3EE"/>
+    <text x="116" y="174" font-size="15" font-weight="600" letter-spacing="1.6" fill="#C7D2FE">OPEN SOURCE · 100% OFFLINE</text>
+
+    <text x="78" y="276" font-size="84" font-weight="700" fill="#F8FAFC" letter-spacing="-1.5">Eye Tracker</text>
+    <text x="80" y="336" font-size="32" font-weight="500" fill="#CBD5E1">Look at a screen.</text>
+    <text x="80" y="378" font-size="32" font-weight="600" fill="url(#accent)">Your cursor and focus follow.</text>
+
+    <text x="80" y="438" font-size="19" fill="#94A3B8">Any webcam · head pose + iris fusion · ~1% CPU</text>
+    <text x="80" y="466" font-size="19" fill="#94A3B8">Walk-away lock · privacy mode · shoulder guard</text>
+
+    <g font-size="15" font-weight="600" fill="#E2E8F0">
+      <rect x="80" y="506" width="110" height="34" rx="9" fill="#FFFFFF" fill-opacity="0.06" stroke="#FFFFFF" stroke-opacity="0.12"/>
+      <text x="135" y="528" text-anchor="middle">Windows</text>
+      <rect x="202" y="506" width="96" height="34" rx="9" fill="#FFFFFF" fill-opacity="0.06" stroke="#FFFFFF" stroke-opacity="0.12"/>
+      <text x="250" y="528" text-anchor="middle">macOS</text>
+      <rect x="310" y="506" width="88" height="34" rx="9" fill="#FFFFFF" fill-opacity="0.06" stroke="#FFFFFF" stroke-opacity="0.12"/>
+      <text x="354" y="528" text-anchor="middle">Linux</text>
+    </g>
+  </g>
+
+  <!-- ============ right: scene ============ -->
+  <!-- desk shadow -->
+  <ellipse cx="950" cy="455" rx="300" ry="18" fill="#000000" fill-opacity="0.45" filter="url(#blur12)"/>
+
+  <!-- left monitor (not looked at) -->
+  <g opacity="0.72">
+    <rect x="676" y="190" width="258" height="166" rx="12" fill="#1A2035" stroke="#2A3352" stroke-width="2"/>
+    <rect x="686" y="200" width="238" height="146" rx="6" fill="url(#screenOff)"/>
+    <g fill="#334155">
+      <rect x="700" y="216" width="92" height="8" rx="4"/>
+      <rect x="700" y="236" width="196" height="6" rx="3" fill-opacity="0.7"/>
+      <rect x="700" y="250" width="172" height="6" rx="3" fill-opacity="0.7"/>
+      <rect x="700" y="264" width="184" height="6" rx="3" fill-opacity="0.7"/>
+      <rect x="700" y="290" width="120" height="40" rx="6" fill-opacity="0.55"/>
+      <rect x="830" y="290" width="80" height="40" rx="6" fill-opacity="0.35"/>
+    </g>
+    <rect x="793" y="356" width="24" height="44" fill="#1A2035"/>
+    <rect x="760" y="398" width="90" height="10" rx="5" fill="#1A2035"/>
+  </g>
+
+  <!-- right monitor (looked at) -->
+  <rect x="954" y="190" width="258" height="166" rx="12" fill="#6366F1" fill-opacity="0.35" filter="url(#blur12)"/>
+  <rect x="954" y="190" width="258" height="166" rx="12" fill="#1C2340" stroke="url(#accent)" stroke-width="2.5"/>
+  <rect x="964" y="200" width="238" height="146" rx="6" fill="url(#screenOn)"/>
+  <!-- editor-ish content -->
+  <g>
+    <circle cx="978" cy="212" r="3.5" fill="#F87171"/>
+    <circle cx="990" cy="212" r="3.5" fill="#FBBF24"/>
+    <circle cx="1002" cy="212" r="3.5" fill="#34D399"/>
+    <rect x="978" y="228" width="64" height="7" rx="3.5" fill="#818CF8"/>
+    <rect x="1048" y="228" width="92" height="7" rx="3.5" fill="#475569"/>
+    <rect x="990" y="243" width="120" height="7" rx="3.5" fill="#22D3EE" fill-opacity="0.85"/>
+    <rect x="990" y="258" width="84" height="7" rx="3.5" fill="#64748B"/>
+    <rect x="1080" y="258" width="60" height="7" rx="3.5" fill="#A78BFA"/>
+    <rect x="990" y="273" width="140" height="7" rx="3.5" fill="#64748B"/>
+    <rect x="978" y="288" width="52" height="7" rx="3.5" fill="#818CF8"/>
+    <rect x="978" y="303" width="104" height="7" rx="3.5" fill="#475569"/>
+    <!-- text caret -->
+    <rect x="1086" y="301" width="2.5" height="12" rx="1" fill="#F8FAFC"/>
+  </g>
+  <rect x="1071" y="356" width="24" height="44" fill="#1C2340"/>
+  <rect x="1038" y="398" width="90" height="10" rx="5" fill="#1C2340"/>
+
+  <!-- webcam on the right monitor -->
+  <rect x="1060" y="178" width="46" height="14" rx="7" fill="#0F172A" stroke="#334155"/>
+  <circle cx="1083" cy="185" r="4" fill="#22D3EE"/>
+  <circle cx="1083" cy="185" r="8" fill="#22D3EE" fill-opacity="0.25" filter="url(#blur4)"/>
+
+  <!-- gaze beam from the viewer to the right monitor -->
+  <path d="M944 552 L1020 262 L1156 262 L964 552 Z" fill="url(#beam)" opacity="0.55"/>
+  <path d="M954 548 L1088 270" stroke="#22D3EE" stroke-width="2" stroke-dasharray="4 7" stroke-linecap="round" opacity="0.9"/>
+
+  <!-- target ring + cursor -->
+  <circle cx="1092" cy="266" r="26" fill="none" stroke="#22D3EE" stroke-opacity="0.35" stroke-width="2"/>
+  <circle cx="1092" cy="266" r="15" fill="#22D3EE" fill-opacity="0.16" stroke="#22D3EE" stroke-opacity="0.8" stroke-width="1.5"/>
+  <path d="M1092 260 l0 30 l7.5 -7 l5.5 12 l5 -2.4 l-5.5 -11.6 l10.5 -0.6 Z" fill="#F8FAFC" stroke="#0B1022" stroke-width="1.6" stroke-linejoin="round"/>
+
+  <!-- viewer eye -->
+  <g transform="translate(954 560)">
+    <ellipse rx="64" ry="34" fill="#22D3EE" fill-opacity="0.12" filter="url(#blur12)"/>
+    <path d="M-50 0 Q0 -42 50 0 Q0 42 -50 0 Z" fill="#0F172A" stroke="url(#accent)" stroke-width="3"/>
+    <circle r="17" fill="url(#accent)"/>
+    <circle r="8" fill="#0B1022"/>
+    <circle cx="5" cy="-6" r="3.5" fill="#F8FAFC"/>
+  </g>
+</svg>

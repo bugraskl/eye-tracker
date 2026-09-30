@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Eye Tracker
+GenericName=Gaze Monitor Switcher
+Comment=Move the cursor and keyboard focus to the monitor you look at
+Exec=eye-tracker
+Icon=eye-tracker
+Terminal=false
+Categories=Utility;Accessibility;
+Keywords=eye;gaze;head;tracking;webcam;monitor;multi-monitor;cursor;focus;presence;
+StartupNotify=false
+X-GNOME-UsesNotifications=true

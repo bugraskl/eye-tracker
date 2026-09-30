@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="420" viewBox="0 0 960 420" role="img" aria-label="Animation: when you look at the left monitor the cursor and keyboard focus jump there; look right and they come back.">
+  <title>Eye Tracker: glance to switch monitors</title>
+  <style>
+    .anim { animation-duration: 6s; animation-iteration-count: infinite; animation-timing-function: ease-in-out; }
+    #pupil { animation-name: pupil; }
+    @keyframes pupil { 0%, 6% { transform: translate(9px, -2px); } 13%, 50% { transform: translate(-9px, -2px); } 57%, 100% { transform: translate(9px, -2px); } }
+    #beamL { animation-name: beamL; opacity: 0; }
+    @keyframes beamL { 0%, 9% { opacity: 0; } 14%, 50% { opacity: 1; } 55%, 100% { opacity: 0; } }
+    #beamR { animation-name: beamR; }
+    @keyframes beamR { 0%, 6% { opacity: 1; } 11%, 53% { opacity: 0; } 58%, 100% { opacity: 1; } }
+    #ringL { animation-name: ringL; }
+    @keyframes ringL { 0%, 13% { stroke-dashoffset: 100; opacity: 1; } 19% { stroke-dashoffset: 0; opacity: 1; } 23%, 100% { stroke-dashoffset: 0; opacity: 0; } }
+    #ringR { animation-name: ringR; }
+    @keyframes ringR { 0%, 57% { stroke-dashoffset: 100; opacity: 0; } 58% { stroke-dashoffset: 100; opacity: 1; } 63% { stroke-dashoffset: 0; opacity: 1; } 67%, 100% { stroke-dashoffset: 0; opacity: 0; } }
+    #cursor { animation-name: cursor; animation-timing-function: cubic-bezier(.6,0,.2,1); }
+    @keyframes cursor { 0%, 19% { transform: translate(0px, 0px); } 21%, 63% { transform: translate(-352px, 18px); } 65%, 100% { transform: translate(0px, 0px); } }
+    #focusL { animation-name: focusL; }
+    @keyframes focusL { 0%, 19% { opacity: 0; } 21%, 63% { opacity: 1; } 65%, 100% { opacity: 0; } }
+    #focusR { animation-name: focusR; }
+    @keyframes focusR { 0%, 19% { opacity: 1; } 21%, 63% { opacity: 0; } 65%, 100% { opacity: 1; } }
+    #capL { animation-name: focusL; }
+    #capR { animation-name: focusR; }
+    @media (prefers-reduced-motion: reduce) { .anim { animation: none; } }
+  </style>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0D1226"/>
+      <stop offset="1" stop-color="#080B18"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#818CF8"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#22D3EE" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#6366F1" stop-opacity="0.04"/>
+    </linearGradient>
+    <filter id="soft" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="10"/></filter>
+  </defs>
+
+  <rect width="960" height="420" rx="18" fill="url(#bg)"/>
+
+  <!-- monitors -->
+  <g font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif">
+    <!-- left -->
+    <rect x="120" y="48" width="330" height="200" rx="12" fill="#161C33" stroke="#27304F" stroke-width="2"/>
+    <rect x="132" y="60" width="306" height="176" rx="6" fill="#111733"/>
+    <g fill="#3B4668">
+      <rect x="150" y="80" width="120" height="9" rx="4.5"/>
+      <rect x="150" y="104" width="250" height="7" rx="3.5" fill-opacity="0.7"/>
+      <rect x="150" y="120" width="220" height="7" rx="3.5" fill-opacity="0.7"/>
+      <rect x="150" y="136" width="236" height="7" rx="3.5" fill-opacity="0.7"/>
+      <rect x="150" y="166" width="150" height="50" rx="7" fill-opacity="0.5"/>
+      <rect x="312" y="166" width="104" height="50" rx="7" fill-opacity="0.35"/>
+    </g>
+    <rect id="focusL" class="anim" x="120" y="48" width="330" height="200" rx="12" fill="none" stroke="url(#accent)" stroke-width="3"/>
+    <rect x="273" y="248" width="24" height="36" fill="#161C33"/>
+    <rect x="235" y="282" width="100" height="10" rx="5" fill="#161C33"/>
+
+    <!-- right -->
+    <rect x="510" y="48" width="330" height="200" rx="12" fill="#161C33" stroke="#27304F" stroke-width="2"/>
+    <rect x="522" y="60" width="306" height="176" rx="6" fill="#111733"/>
+    <g>
+      <circle cx="538" cy="74" r="4" fill="#F87171"/><circle cx="552" cy="74" r="4" fill="#FBBF24"/><circle cx="566" cy="74" r="4" fill="#34D399"/>
+      <rect x="538" y="94" width="80" height="8" rx="4" fill="#818CF8"/>
+      <rect x="626" y="94" width="120" height="8" rx="4" fill="#475569"/>
+      <rect x="552" y="112" width="160" height="8" rx="4" fill="#22D3EE" fill-opacity="0.85"/>
+      <rect x="552" y="130" width="110" height="8" rx="4" fill="#64748B"/>
+      <rect x="670" y="130" width="80" height="8" rx="4" fill="#A78BFA"/>
+      <rect x="552" y="148" width="190" height="8" rx="4" fill="#64748B"/>
+      <rect x="538" y="166" width="70" height="8" rx="4" fill="#818CF8"/>
+      <rect x="538" y="184" width="140" height="8" rx="4" fill="#475569"/>
+    </g>
+    <rect id="focusR" class="anim" x="510" y="48" width="330" height="200" rx="12" fill="none" stroke="url(#accent)" stroke-width="3"/>
+    <rect x="663" y="248" width="24" height="36" fill="#161C33"/>
+    <rect x="625" y="282" width="100" height="10" rx="5" fill="#161C33"/>
+    <!-- webcam -->
+    <rect x="652" y="37" width="46" height="13" rx="6.5" fill="#0F172A" stroke="#334155"/>
+    <circle cx="675" cy="43.5" r="3.5" fill="#22D3EE"/>
+
+    <!-- gaze beams -->
+    <path id="beamL" class="anim" d="M470 344 L262 146 L346 146 L490 344 Z" fill="url(#beam)"/>
+    <path id="beamR" class="anim" d="M470 344 L614 132 L698 132 L490 344 Z" fill="url(#beam)"/>
+
+    <!-- dwell rings -->
+    <circle id="ringL" class="anim" cx="304" cy="152" r="20" fill="none" stroke="#22D3EE" stroke-width="3" pathLength="100" stroke-dasharray="100" transform="rotate(-90 304 152)"/>
+    <circle id="ringR" class="anim" cx="656" cy="134" r="20" fill="none" stroke="#22D3EE" stroke-width="3" pathLength="100" stroke-dasharray="100" transform="rotate(-90 656 134)"/>
+
+    <!-- cursor (drawn at the right-monitor position; animation moves it left) -->
+    <g id="cursor" class="anim">
+      <path d="M656 128 l0 30 l7.5 -7 l5.5 12 l5 -2.4 l-5.5 -11.6 l10.5 -0.6 Z" fill="#F8FAFC" stroke="#0B1022" stroke-width="1.6" stroke-linejoin="round"/>
+    </g>
+
+    <!-- viewer eye -->
+    <g transform="translate(480 350)">
+      <ellipse rx="56" ry="28" fill="#22D3EE" fill-opacity="0.12" filter="url(#soft)"/>
+      <path d="M-42 0 Q0 -34 42 0 Q0 34 -42 0 Z" fill="#0F172A" stroke="url(#accent)" stroke-width="2.5"/>
+      <g id="pupil" class="anim">
+        <circle r="13" fill="url(#accent)"/>
+        <circle r="6" fill="#0B1022"/>
+        <circle cx="4" cy="-4" r="2.6" fill="#F8FAFC"/>
+      </g>
+    </g>
+
+    <!-- captions -->
+    <g font-size="15" fill="#CBD5E1" text-anchor="middle">
+      <text id="capR" class="anim" x="480" y="402">Looking right → cursor and keyboard focus on the right screen</text>
+      <text id="capL" class="anim" x="480" y="402">Looking left → cursor and keyboard focus jump to the left screen</text>
+    </g>
+  </g>
+</svg>

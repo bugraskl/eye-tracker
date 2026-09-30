@@ -1,0 +1,137 @@
+name: Bug report
+description: Something does not work as described. Please include the "eye-tracker doctor" output.
+title: "[Bug]: "
+labels:
+  - bug
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem!
+
+        **Security or privacy issue?** Do not file it here; use
+        [private vulnerability reporting](https://github.com/bugraskl/eye-tracker/security/advisories/new) instead.
+
+        Never attach camera images or screenshots that show your face. The diagnostics
+        report below contains no images and shows paths relative to your home folder.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the problem. What did you expect to happen instead?
+      placeholder: When I look at my right monitor the cursor jumps back to the left one after a second…
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of steps that shows the problem.
+      placeholder: |
+        1. Calibrate with 2 monitors side by side
+        2. Look at the right monitor for 2 seconds
+        3. …
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS (Apple silicon)
+        - macOS (Intel)
+        - Linux (X11)
+        - Linux (Wayland)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version and desktop
+      description: For example "Windows 11 24H2", "macOS 15.3", "Ubuntu 24.04, GNOME 46 on Wayland".
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Eye Tracker version
+      description: Shown in About, or run `eye-tracker --version`.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-type
+    attributes:
+      label: How did you install it?
+      options:
+        - Windows installer (setup.exe)
+        - Windows portable ZIP
+        - macOS disk image (.dmg)
+        - Linux AppImage
+        - Linux tarball (.tar.gz)
+        - From source (uv / pip)
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `eye-tracker doctor`
+      description: |
+        Paste the whole report. It lists versions, monitors, backends, permissions and paths (no images).
+        You can also copy it from **Settings → Diagnostics → Copy**. From a terminal:
+
+        - Windows installer: `"%LOCALAPPDATA%\Programs\Eye Tracker\eye-tracker-cli.exe" doctor`
+        - Windows portable: `eye-tracker-cli.exe doctor` in the extracted folder
+        - macOS: `"/Applications/Eye Tracker.app/Contents/MacOS/eye-tracker-cli" doctor`
+        - Linux AppImage: `./EyeTracker-*.AppImage doctor`
+        - Linux tarball: `./eye-tracker/eye-tracker doctor`
+        - From source: `uv run eye-tracker doctor`
+
+        If the problem is about cameras, run `doctor --probe-cameras` instead.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines (optional)
+      description: |
+        The doctor report shows where the log file is. Start the app with `--log-level DEBUG`
+        for more detail, reproduce the problem, then paste the lines around it.
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Camera and monitor setup (optional)
+      description: Camera model and where it sits, number of monitors and how they are arranged.
+      placeholder: Logitech C920 on top of the left monitor; 2 × 27" side by side
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues and this has not been reported yet.
+          required: true
+        - label: I am using the latest release (or I checked the problem still happens with it).
+          required: false
+        - label: I removed anything I do not want to share publicly from the pasted text.
+          required: true

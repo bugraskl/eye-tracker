@@ -1,0 +1,62 @@
+name: Feature request
+description: Suggest an idea or an improvement for Eye Tracker.
+title: "[Feature]: "
+labels:
+  - enhancement
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! Eye Tracker aims to stay small, fast and fully offline. Features that
+        would send data over the network, store camera images or noticeably raise CPU use are out of
+        scope, but a problem statement is always welcome: there may be another way to solve it.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the situation and what is hard or impossible today.
+      placeholder: With three monitors stacked in a pyramid, I often look at the top one only briefly…
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How could Eye Tracker help? Settings, behaviour, UI, commands…
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use today or other approaches you thought about.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: platforms
+    attributes:
+      label: Which platforms does this concern?
+      multiple: true
+      options:
+        - Windows
+        - macOS
+        - Linux (X11)
+        - Linux (Wayland)
+        - All
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues and discussions for a similar request.
+          required: true
+        - label: I would be willing to help implement or test this.
+          required: false

@@ -1,0 +1,496 @@
+"""Command-line entry points: ``eye-tracker`` (console) and ``eye-tracker-gui`` (windowed).
+
+Without a subcommand the tray app starts (``run``). Other subcommands help with
+setup and troubleshooting and never need a display, except ``doctor``, which
+reports monitors when one is available.
+
+Exit codes: 0 success, 1 error, 2 usage error, 3 the app is not running
+(``ctl``), 130 interrupted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import logging
+import os
+import sys
+from collections.abc import Callable, Sequence
+from pathlib import Path
+
+from . import APP_NAME, APP_SLUG, __version__, paths
+from .config import Settings
+from .logging_setup import LEVELS, setup_logging
+
+__all__ = [
+    "EXIT_ERROR",
+    "EXIT_NOT_RUNNING",
+    "EXIT_OK",
+    "EXIT_USAGE",
+    "build_parser",
+    "gui_main",
+    "main",
+]
+
+log = logging.getLogger(__name__)
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+EXIT_NOT_RUNNING = 3
+EXIT_INTERRUPTED = 130
+
+BACKEND_CHOICES = ("auto", "mediapipe", "opencv")
+# Mirrors ipc.COMMANDS; kept here so building the parser does not import Qt.
+CTL_COMMANDS = (
+    "calibrate",
+    "pause",
+    "privacy-off",
+    "privacy-on",
+    "privacy-toggle",
+    "quit",
+    "resume",
+    "settings",
+    "show",
+    "status",
+    "toggle",
+)
+
+_EPILOG = f"""\
+examples:
+  {APP_SLUG}                         start the tray app
+  {APP_SLUG} calibrate               calibrate (in the running app, if there is one)
+  {APP_SLUG} ctl privacy-toggle      bind this to a desktop shortcut (e.g. on Wayland)
+  {APP_SLUG} doctor                  show a diagnostics report for bug reports
+  {APP_SLUG} bench --seconds 10      measure CPU use and latency on this machine
+  {APP_SLUG} autostart enable        start at login
+
+exit codes: 0 ok, 1 error, 2 usage error, 3 not running (ctl), 130 interrupted
+"""
+
+
+# ---------------------------------------------------------------------- parser
+def build_parser() -> argparse.ArgumentParser:
+    """The argument parser (global options work before or after the subcommand)."""
+    parser = argparse.ArgumentParser(
+        prog=APP_SLUG,
+        description=(
+            f"{APP_NAME}: look at a monitor and the mouse cursor and keyboard focus follow. "
+            "Webcam-based, private and offline."
+        ),
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
+    _add_global_options(parser, suppress=False)
+    _add_run_options(parser, suppress=False)
+
+    # Subparsers repeat the global options with SUPPRESS defaults, so a value given
+    # after the subcommand wins and an absent one does not reset the main parser's.
+    common = argparse.ArgumentParser(add_help=False)
+    _add_global_options(common, suppress=True)
+
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND", title="commands")
+
+    run = sub.add_parser(
+        "run",
+        parents=[common],
+        help="start the tray app (the default)",
+        description=(
+            "Start the tray app. If it is already running, the running instance is shown."
+        ),
+    )
+    _add_run_options(run, suppress=True)
+
+    sub.add_parser(
+        "calibrate",
+        parents=[common],
+        help="calibrate now",
+        description="Open the calibration in the running app, or start the app and calibrate.",
+    )
+
+    doctor = sub.add_parser(
+        "doctor",
+        parents=[common],
+        help="print a diagnostics report",
+        description="Print everything useful for a bug report (paths are shown relative to ~).",
+    )
+    doctor.add_argument("--json", action="store_true", help="machine-readable output")
+    doctor.add_argument(
+        "--probe-cameras",
+        action="store_true",
+        help="briefly open cameras 0-3 to list the working ones (their lights may flash)",
+    )
+
+    bench = sub.add_parser(
+        "bench",
+        parents=[common],
+        help="measure CPU use and latency",
+        description=(
+            "Run the capture and analysis loop without the UI, first as fast as possible and "
+            "then at the idle rate the app uses while you sit still. Use --camera to benchmark "
+            "a video or image file instead of the configured camera."
+        ),
+    )
+    bench.add_argument(
+        "--seconds",
+        type=_positive_float,
+        default=5.0,
+        metavar="N",
+        help="duration of each of the two runs (default: 5)",
+    )
+    bench.add_argument("--json", action="store_true", help="machine-readable output")
+
+    ctl = sub.add_parser(
+        "ctl",
+        parents=[common],
+        help="send a command to the running app",
+        description=(
+            "Send a command to the running app. Bind these to desktop keyboard shortcuts where "
+            "global hotkeys are unavailable (Wayland). 'status' prints JSON."
+        ),
+    )
+    ctl.add_argument(
+        "action", choices=CTL_COMMANDS, metavar="COMMAND", help=", ".join(CTL_COMMANDS)
+    )
+    ctl.add_argument(
+        "--timeout",
+        type=int,
+        default=1500,
+        metavar="MS",
+        help="how long to wait for an answer (default: 1500)",
+    )
+
+    autostart = sub.add_parser(
+        "autostart",
+        parents=[common],
+        help="start at login: enable, disable or status",
+        description="Manage starting the app at login (per user, no administrator rights).",
+    )
+    autostart.add_argument(
+        "action", nargs="?", default="status", choices=("enable", "disable", "status")
+    )
+
+    reset = sub.add_parser(
+        "reset",
+        parents=[common],
+        help="delete the calibration and/or settings",
+        description="Delete stored data. The app must not be running.",
+    )
+    reset.add_argument("--calibration", action="store_true", help="delete the calibration")
+    reset.add_argument("--settings", action="store_true", help="restore default settings")
+    reset.add_argument("--all", action="store_true", help="both of the above")
+    return parser
+
+
+def _add_global_options(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
+    def default(value: object) -> object:
+        return argparse.SUPPRESS if suppress else value
+
+    group = parser.add_argument_group("global options")
+    group.add_argument(
+        "--config-dir",
+        metavar="DIR",
+        default=default(None),
+        help="keep settings, calibration and logs in DIR (portable mode; a separate instance)",
+    )
+    group.add_argument(
+        "--log-level",
+        type=str.upper,
+        choices=LEVELS,
+        default=default(None),
+        help="logging verbosity (default: from the settings, INFO)",
+    )
+    group.add_argument(
+        "--camera",
+        metavar="DEV",
+        default=default(None),
+        help="camera index (0, 1, ...) or a video/image file; overrides the settings",
+    )
+    group.add_argument(
+        "--backend",
+        choices=BACKEND_CHOICES,
+        default=default(None),
+        help="vision backend; overrides the settings",
+    )
+    group.add_argument(
+        "--background",
+        action="store_true",
+        default=default(False),
+        help="start quietly, as at login: no first-run wizard, no startup notifications",
+    )
+
+
+def _add_run_options(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        default=argparse.SUPPRESS if suppress else False,
+        help="open the calibration right after start",
+    )
+    parser.add_argument(
+        "--trace",
+        metavar="FILE",
+        default=argparse.SUPPRESS if suppress else None,
+        help="append numeric tracking data (features, gaze, decisions; never images) to FILE "
+        "as JSON lines, for tuning and bug reports",
+    )
+
+
+def _positive_float(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not value > 0 or value == float("inf"):
+        raise argparse.ArgumentTypeError("must be a positive number")
+    return value
+
+
+# ------------------------------------------------------------------ entry points
+def main(argv: Sequence[str] | None = None) -> int:
+    """Console entry point. Returns the process exit code."""
+    _prepare_std_streams()
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:  # --help, --version and usage errors
+        return _exit_code(exc)
+    if args.config_dir:
+        paths.set_base_override(Path(args.config_dir))
+    command = args.command or "run"
+    handler = _HANDLERS[command]
+    try:
+        return handler(args)
+    except KeyboardInterrupt:
+        return EXIT_INTERRUPTED
+
+
+def gui_main(argv: Sequence[str] | None = None) -> int:
+    """Entry point of the windowed launcher (``eye-tracker-gui``, ``pythonw`` and the
+    windowed frozen builds).
+
+    Such a process has no console: ``sys.stdout``/``sys.stderr`` may be ``None``
+    (``pythonw`` on Windows), so they are pointed at ``os.devnull`` before anything
+    can print. Everything else is the same as :func:`main`.
+    """
+    return main(argv)
+
+
+# -------------------------------------------------------------------- commands
+def _cmd_run(args: argparse.Namespace) -> int:
+    from .app import run_app
+
+    return run_app(args)
+
+
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    # run_app forwards "calibrate" to a running instance instead of "show", so this
+    # covers both "open it in the running app" and "start the app and calibrate".
+    args.calibrate = True
+    from .app import run_app
+
+    return run_app(args)
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    _setup_cli_logging(args)
+    from .diagnostics import collect_report, format_report
+
+    report = collect_report(probe_cameras=args.probe_cameras)
+    if args.json:
+        _out(json.dumps(report, indent=2, default=str))
+    else:
+        _out(format_report(report), end="")
+    return EXIT_OK
+
+
+def _cmd_bench(args: argparse.Namespace) -> int:
+    _setup_cli_logging(args)
+    from .diagnostics import BenchError, format_bench, run_bench
+    from .vision.backends import BackendUnavailable
+    from .vision.camera import CameraError
+
+    settings = _read_settings()
+    device = args.camera if args.camera is not None else settings.camera.device
+    backend = args.backend or settings.general.backend
+    _err(f"Benchmarking for 2 x {args.seconds:g} s...")
+    try:
+        result = run_bench(
+            args.seconds,
+            device,
+            backend,
+            width=settings.camera.width,
+            height=settings.camera.height,
+            api=settings.camera.api,
+        )
+    except (BenchError, CameraError, BackendUnavailable) as exc:
+        message = str(exc)
+        if device.strip().isdigit() and _instance_running():
+            message += (
+                f"\n{APP_NAME} is running and may be holding the camera; "
+                f"release it with '{APP_SLUG} ctl privacy-on' and try again."
+            )
+        _err(f"error: {message}")
+        return EXIT_ERROR
+    if args.json:
+        _out(json.dumps(result, indent=2))
+    else:
+        _out(format_bench(result), end="")
+    return EXIT_OK
+
+
+def _cmd_ctl(args: argparse.Namespace) -> int:
+    _setup_cli_logging(args)
+    from . import ipc
+
+    reply = ipc.send_command(args.action, timeout_ms=max(1, args.timeout))
+    if reply is None:
+        if ipc.is_running():
+            _err(f"error: {APP_NAME} is running but did not answer within {args.timeout} ms.")
+            return EXIT_ERROR
+        _err(f"{APP_NAME} is not running. Start it with '{APP_SLUG}'.")
+        return EXIT_NOT_RUNNING
+    if reply.startswith("error"):
+        _err(reply)
+        return EXIT_ERROR
+    _out(reply)
+    return EXIT_OK
+
+
+def _cmd_autostart(args: argparse.Namespace) -> int:
+    _setup_cli_logging(args)
+    from .diagnostics import format_command
+    from .platform import autostart
+
+    if args.action == "status":
+        if not autostart.is_supported():
+            _out("Start at login: not supported on this system")
+            return EXIT_OK
+        state = "enabled" if autostart.is_enabled() else "disabled"
+        _out(f"Start at login: {state}")
+        _out(f"Entry:   {autostart.location()}")
+        _out(f"Command: {format_command(autostart.launch_command())}")
+        return EXIT_OK
+    if not autostart.is_supported():
+        _err("error: start at login is not supported on this system.")
+        return EXIT_ERROR
+    try:
+        if args.action == "enable":
+            autostart.enable(background=True)
+            _out(f"Start at login enabled ({autostart.location()}).")
+        else:
+            autostart.disable()
+            _out("Start at login disabled.")
+    except autostart.AutostartError as exc:
+        _err(f"error: {exc}")
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def _cmd_reset(args: argparse.Namespace) -> int:
+    _setup_cli_logging(args)
+    targets: list[Path] = []
+    if args.all or args.settings:
+        settings_file = paths.settings_file()
+        # Settings.load moves an unreadable file aside under this name.
+        targets += [settings_file, settings_file.with_suffix(settings_file.suffix + ".corrupt")]
+    if args.all or args.calibration:
+        targets.append(paths.calibration_file())
+    if not targets:
+        _err("error: choose what to reset: --calibration, --settings or --all")
+        return EXIT_USAGE
+    if _instance_running():
+        _err(
+            f"error: {APP_NAME} is running and would write its data back. "
+            f"Quit it first ('{APP_SLUG} ctl quit'), then run reset again."
+        )
+        return EXIT_ERROR
+    removed = 0
+    for path in targets:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            _err(f"error: could not delete {path}: {exc}")
+            return EXIT_ERROR
+        _out(f"Deleted {path}")
+        removed += 1
+    if not removed:
+        _out("Nothing to reset.")
+    return EXIT_OK
+
+
+_HANDLERS: dict[str, Callable[[argparse.Namespace], int]] = {
+    "run": _cmd_run,
+    "calibrate": _cmd_calibrate,
+    "doctor": _cmd_doctor,
+    "bench": _cmd_bench,
+    "ctl": _cmd_ctl,
+    "autostart": _cmd_autostart,
+    "reset": _cmd_reset,
+}
+
+
+# ---------------------------------------------------------------------- helpers
+def _prepare_std_streams() -> None:
+    """Make printing safe without a console and on legacy code pages."""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        if stream is None:
+            # pythonw and windowed builds have no console; argparse would crash.
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))  # noqa: SIM115
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            with contextlib.suppress(Exception):
+                reconfigure(errors="replace")
+
+
+def _exit_code(exc: SystemExit) -> int:
+    code = exc.code
+    if code is None:
+        return EXIT_OK
+    if isinstance(code, int):
+        return code
+    return EXIT_ERROR
+
+
+def _setup_cli_logging(args: argparse.Namespace) -> None:
+    # Command-line tools report on the terminal and leave the app's log file alone.
+    setup_logging(args.log_level or "WARNING", console=True, log_to_file=False)
+
+
+def _read_settings() -> Settings:
+    """Settings as the app would see them, without moving a corrupt file aside."""
+    path = paths.settings_file()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return Settings()
+    except (OSError, ValueError) as exc:
+        log.warning("Ignoring unreadable settings %s: %s", path, exc)
+        return Settings()
+    return Settings.from_dict(data)
+
+
+def _instance_running() -> bool:
+    from . import ipc
+
+    try:
+        return ipc.is_running()
+    except Exception:
+        log.debug("Could not check for a running instance", exc_info=True)
+        return False
+
+
+def _out(message: str, end: str = "\n") -> None:
+    sys.stdout.write(message + end)
+    sys.stdout.flush()
+
+
+def _err(message: str) -> None:
+    sys.stderr.write(message + "\n")
+    sys.stderr.flush()

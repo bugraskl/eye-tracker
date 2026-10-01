@@ -65,7 +65,7 @@ body:
     attributes:
       label: Eye Tracker version
       description: Shown in About, or run the command-line tool (see below) with `--version`.
-      placeholder: "0.1.0"
+      placeholder: "0.2.0"
     validations:
       required: true
 

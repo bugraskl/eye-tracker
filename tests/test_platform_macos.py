@@ -20,7 +20,7 @@ import pytest
 
 from eye_tracker.platform import macos
 from eye_tracker.platform.base import PlatformServices
-from eye_tracker.types import Rect, WindowRef
+from eye_tracker.types import AppIdentity, Rect, WindowRef
 
 PYOBJC_MODULES = (
     "Quartz",
@@ -733,6 +733,22 @@ def test_window_rect(plat: macos.MacPlatform, ax: FakeAX, quartz: FakeQuartz) ->
     assert plat.window_rect(WindowRef(handle=(PID, "win"))) == Rect(5, 6, 70, 80)
     assert plat.window_rect(WindowRef(handle=(PID, None))) == Rect(1, 2, 30, 40)
     assert plat.window_rect(WindowRef(handle=None)) is None
+    # The content area is approximated by the frame.
+    assert plat.window_client_rect(WindowRef(handle=(PID, "win"))) == Rect(5, 6, 70, 80)
+
+
+def test_window_app_names_process_and_bundle(
+    monkeypatch: pytest.MonkeyPatch, plat: macos.MacPlatform, appkit: FakeAppKit
+) -> None:
+    appkit.apps[PID].bundleIdentifier = lambda: "com.github.wez.wezterm"  # type: ignore[attr-defined]
+    names = {PID: "wezterm-gui", OTHER_PID: "kitty"}
+    monkeypatch.setattr(plat, "_app_process_name", names.get)
+    assert plat.window_app(WindowRef(handle=(PID, "win"))) == AppIdentity(
+        "wezterm-gui", "com.github.wez.wezterm"
+    )
+    # Not a running application AppKit knows: the process name alone.
+    assert plat.window_app(WindowRef(handle=(OTHER_PID, None))) == AppIdentity("kitty", "")
+    assert plat.window_app(WindowRef(handle=None)) is None
 
 
 def test_cursor_position_is_reliable(plat: macos.MacPlatform) -> None:
@@ -1145,7 +1161,9 @@ def test_capabilities_with_frameworks(plat: macos.MacPlatform, recorder: Recorde
     caps = plat.capabilities()
     assert set(caps) == set(PlatformServices().capabilities())
     assert all(caps[key] for key in ("lock", "display_off", "wake_display", "input_idle"))
-    assert all(caps[key] for key in ("key_idle", "session_locked", "focus", "cursor", "hotkeys"))
+    assert all(
+        caps[key] for key in ("key_idle", "session_locked", "focus", "cursor", "hotkeys", "panes")
+    )
     assert caps["camera_in_use"] is False
 
 

@@ -61,9 +61,9 @@ the bundled FFmpeg decodes an AVI and an MP4 file (written on the spot with the 
 OpenCV), and that camera probing runs (AVFoundation on macOS). It writes only to a temporary folder:
 
 ```bash
-uv run python scripts/smoke_test_bundle.py --version 0.1.0 dist/EyeTracker/eye-tracker-cli.exe
-uv run python scripts/smoke_test_bundle.py --version 0.1.0 "dist/Eye Tracker.app/Contents/MacOS/eye-tracker-cli"
-uv run python scripts/smoke_test_bundle.py --version 0.1.0 dist/eye-tracker/eye-tracker
+uv run python scripts/smoke_test_bundle.py --version 0.2.0 dist/EyeTracker/eye-tracker-cli.exe
+uv run python scripts/smoke_test_bundle.py --version 0.2.0 "dist/Eye Tracker.app/Contents/MacOS/eye-tracker-cli"
+uv run python scripts/smoke_test_bundle.py --version 0.2.0 dist/eye-tracker/eye-tracker
 ```
 
 ## Packages
@@ -71,8 +71,8 @@ uv run python scripts/smoke_test_bundle.py --version 0.1.0 dist/eye-tracker/eye-
 **Windows installer and portable ZIP**
 
 ```powershell
-iscc /DAppVersion=0.1.0 packaging\windows\installer.iss   # -> dist\EyeTracker-0.1.0-windows-x64-setup.exe
-Compress-Archive dist\EyeTracker dist\EyeTracker-0.1.0-windows-x64-portable.zip
+iscc /DAppVersion=0.2.0 packaging\windows\installer.iss   # -> dist\EyeTracker-0.2.0-windows-x64-setup.exe
+Compress-Archive dist\EyeTracker dist\EyeTracker-0.2.0-windows-x64-portable.zip
 ```
 
 The installer is per user (no administrator rights), creates a Start menu shortcut, and optionally
@@ -93,8 +93,8 @@ when it lists `startup`.
 **macOS disk image**
 
 ```bash
-bash packaging/macos/make_dmg.sh --app "dist/Eye Tracker.app" --version 0.1.0 \
-  --out dist/EyeTracker-0.1.0-macos-arm64.dmg
+bash packaging/macos/make_dmg.sh --app "dist/Eye Tracker.app" --version 0.2.0 \
+  --out dist/EyeTracker-0.2.0-macos-arm64.dmg
 ```
 
 The script refuses an app that contains a symbolic link to a missing file, and names the links,
@@ -107,7 +107,7 @@ permissions survive updates. In CI, set the repository secrets `MACOS_SIGNING_CE
 **Linux AppImage and tarball**
 
 ```bash
-bash packaging/linux/build_appimage.sh --version 0.1.0
+bash packaging/linux/build_appimage.sh --version 0.2.0
 ```
 
 `appimagetool` and the AppImage runtime are downloaded at pinned versions and verified against their
@@ -183,7 +183,7 @@ uv run python -m http.server 8000 --directory _site
 
 1. Update `__version__` in `src/eye_tracker/__init__.py` and move the **Unreleased** notes in
    `CHANGELOG.md` under a new `## [x.y.z] - YYYY-MM-DD` heading, leaving `## [Unreleased]` empty.
-2. Commit, then tag and push: `git tag v0.1.0 && git push origin v0.1.0`.
+2. Commit, then tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
 3. The release workflow builds and tests every package as described above and publishes the GitHub
    release with the notes from `CHANGELOG.md`. It fails before building anything when the tag does
    not match `__version__`, when `CHANGELOG.md` has no section for the version, or when notes are

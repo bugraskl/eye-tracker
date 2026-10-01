@@ -46,6 +46,7 @@ bile göndermez.
 | 🧠 | **Baş pozu + iris füzyonu** | Sadece baş yönü değil; iki iris dahil 478 yüz noktası. Gözlükle de çalışır. |
 | 🛡️ | **Yanlışlıkla geçiş yok** | Bekleme süresi, çerçeve kenarında histerezis, yazma ve fare bekleme süreleri; telefona veya masaya kısa bakışlar yok sayılır. |
 | 📖 | **Okumayı anlar** | Diğer ekrandaki bir belgeden mi kopyalıyorsunuz? Siz okurken odak editörünüzde kalır. |
+| 🪟 | **Bölünmüş panel odağı** (deneysel) | Varsayılan olarak kapalı. Bir tmux, WezTerm veya Windows Terminal penceresinin başka bir paneline bakın, klavye odağı o panele geçsin (imleç de, o panelde en son bıraktığınız yere gider); kalibrasyonunuzun doğruluğuna göre fazla küçük paneller hesaba katılmaz. Windows'ta isteğe bağlı: Claude masaüstü uygulamasında yan yana iki oturum ya da ChatGPT (ve Codex) masaüstü uygulamasında sohbet ve yan sohbet; baktığınız oturumun mesaj kutusu odağı alır ([ayrıntılar](docs/panes.md), İngilizce). |
 | 🎯 | **Kullandıkça öğrenir** | Fareyi bir yere götürüp her durdurduğunuzda kalibrasyon biraz daha iyileşir. |
 | 🚶 | **Uzaklaşınca kilit** | 45 sn boyunca yüz ve girdi yoksa kilit ve/veya ekranları kapatma; son saniyelerde 10 sn'lik bir geri sayımla duyurulur. Döndüğünüzde ekranlar açılır. Kurulum yardımcısı tamamlanana kadar yalnızca bildirim gösterir. |
 | 🙈 | **Gizlilik modu** | Tek kısayolla kamera tamamen bırakılır; webcam ışığı söner. Siz kapatana kadar yeniden başlatmadan veya güncellemeden sonra da açık kalır. |
@@ -225,7 +226,7 @@ Bu proje Glance Switch'ten ilham aldı. Karşılaştırma, [glanceswitch.com](ht
 | Kaynak kod | Açık | Kapalı |
 | Ağ kullanımı | Yok | Lisans anahtarı kontrolü + günlük güncelleme kontrolü |
 | İzleme | Baş pozu + iris noktaları | Baş pozu (+ paneller için göz konumu) |
-| Terminal ve editörlerde bölünmüş panel odağı | Henüz yok | ✅ |
+| Terminal ve editörlerde bölünmüş panel odağı | Deneysel: terminaller, Claude ve ChatGPT/Codex masaüstü uygulamaları | ✅ |
 | Fare kullanımından öğrenme | ✅ | ✅ (tıklamalardan) |
 | Uzaklaşınca kilit / ekranları kapatma | ✅ | Listelenmemiş |
 | Omuz koruması | ✅ | Listelenmemiş |
@@ -294,7 +295,7 @@ yerleştirin; yerini değiştirirseniz yeniden kalibre edin.
 
 ## Yol haritası
 
-- Terminal ve editörler için bölünmüş panel odağı
+- Editörlerde (VS Code ve Cursor, JetBrains IDE'leri) ve bölünmüş Windows Terminal içindeki tmux'ta bölünmüş panel odağı
 - İmzalı ve notarize edilmiş derlemeler
 - Intel macOS derlemeleri
 - Arayüz çevirileri

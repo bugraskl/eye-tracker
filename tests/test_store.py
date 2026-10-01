@@ -19,6 +19,7 @@ from eye_tracker.gaze.store import (
     MAX_PROFILES,
     CalibrationData,
     CalibrationLibrary,
+    axis_error,
     load_calibration,
     same_aspect,
     save_calibration,
@@ -636,3 +637,104 @@ def test_empty_library_saves_a_valid_file(tmp_path: Path) -> None:
     CalibrationLibrary().save(path)
     assert json.loads(path.read_text(encoding="utf-8"))["profiles"] == []
     assert load_calibration(path) is None
+
+
+# ------------------------------------------------------------ gaze accuracy
+SIDE_BY_SIDE = [
+    Monitor(0, "left", Rect(0, 0, 1920, 1080), primary=True),
+    Monitor(1, "right", Rect(1920, 0, 1920, 1080)),
+]
+
+
+def _linear_data(report: dict[str, Any]) -> CalibrationData:
+    """Two monitors; the features are the gaze point in kilo-pixels plus noise."""
+    rng = np.random.default_rng(11)
+    samples = []
+    point = 0
+    for m in SIDE_BY_SIDE:
+        for nx in (0.1, 0.5, 0.9):
+            for ny in (0.1, 0.5, 0.9):
+                x, y = m.rect.denormalize(nx, ny)
+                for _ in range(4):
+                    noisy = np.array([x, y]) / 1000.0 + rng.normal(scale=0.02, size=2)
+                    samples.append(CalibrationSample(noisy, x, y, m.index, point))
+                point += 1
+    X = np.array([s.features for s in samples])
+    Y = np.array([(s.x, s.y) for s in samples])
+    model = GazeModel(degree=1, alpha=0.01).fit(X, Y, bounds=virtual_bounds(SIDE_BY_SIDE))
+    return CalibrationData(
+        backend="lite",
+        feature_version="v1",
+        layout_signature=layout_signature(SIDE_BY_SIDE),
+        monitors=list(SIDE_BY_SIDE),
+        samples=samples,
+        implicit_samples=[],
+        model=model,
+        report=report,
+    )
+
+
+def test_axis_error_prefers_the_stored_value() -> None:
+    data = _linear_data({"per_monitor_error_px": {"0": [12.0, 34.0]}, "mean_error_px": 99.0})
+    assert axis_error(data, data.monitors[0]) == (12.0, 34.0)
+    # Matched by rectangle: the same screen under another number.
+    assert axis_error(data, Monitor(5, "left", data.monitors[0].rect)) == (12.0, 34.0)
+    # A monitor without a stored value falls back to the mean error / √2.
+    assert axis_error(data, data.monitors[1]) == pytest.approx((70.0, 70.0), abs=0.01)
+
+
+def test_axis_error_is_recomputed_for_old_profiles_and_saved(tmp_path: Path) -> None:
+    data = _linear_data({"grade": "good", "alpha": 0.01, "degree": 1, "mean_error_px": 500.0})
+    sx, sy = axis_error(data, data.monitors[1]) or (0.0, 0.0)
+    # Feature noise of 0.02 kilo-pixels is some 20 px of gaze error, far below the
+    # fallback from the (deliberately wrong) mean error.
+    assert 5.0 < sx < 80.0
+    assert 5.0 < sy < 80.0
+    assert set(data.report["per_monitor_error_px"]) == {"0", "1"}
+    path = tmp_path / "calibration.json"
+    CalibrationLibrary([data]).save(path)
+    reloaded = load_calibration(path)
+    assert reloaded is not None
+    assert axis_error(reloaded, reloaded.monitors[1]) == pytest.approx((sx, sy))
+
+
+def test_axis_error_without_any_information() -> None:
+    data = _linear_data({"mean_error_px": None})
+    data.samples = data.samples[:4]  # a single dot: nothing can be held out
+    assert axis_error(data, data.monitors[0]) is None
+    data = _linear_data({"mean_error_px": 42.0})
+    data.samples = []
+    assert axis_error(data, data.monitors[0]) == pytest.approx((29.7, 29.7), abs=0.01)
+
+
+def test_recomputing_an_old_profile_is_cheap_enough_for_the_gui_thread() -> None:
+    """The first axis_error of an old profile runs on the GUI thread (see its docs):
+    a realistic two-monitor calibration (16 dots per monitor, 30 samples each,
+    degree 3, the face-mesh gaze features nonlinear) must take milliseconds."""
+    import time
+
+    from eye_tracker.gaze.calibration import evaluate
+    from gaze_synth import GAZE, TWO, calibration_samples
+
+    samples = calibration_samples(
+        TWO, np.random.default_rng(3), noise=1.0, per_point=30, points_per_monitor=16
+    )
+    model, report = evaluate(samples, TWO, degree=3, nonlinear=GAZE)
+    saved = report.to_dict()
+    expected = saved.pop("per_monitor_error_px")  # as written by an earlier version
+    data = CalibrationData(
+        backend="facemesh",
+        feature_version="v",
+        layout_signature=layout_signature(TWO),
+        monitors=list(TWO),
+        samples=samples,
+        implicit_samples=[],
+        model=model,
+        report=saved,
+    )
+    started = time.perf_counter()
+    sigma = axis_error(data, TWO[1])
+    elapsed = time.perf_counter() - started
+    assert sigma == pytest.approx(tuple(expected["1"]), rel=1e-6)  # same as a new report
+    # Measured: ~4 ms on a desktop. The bound leaves room for slow CI machines.
+    assert elapsed < 0.25, f"{elapsed * 1000:.0f} ms"

@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import Any, ParamSpec, Protocol, TypeVar, cast
 
 from .. import APP_ID
-from ..types import Rect, WindowRef
+from ..types import AppIdentity, Rect, WindowRef
 from .base import PlatformServices
 
 log = logging.getLogger(__name__)
@@ -198,6 +198,15 @@ def _norm_path(path: str) -> str:
     return ntpath.normcase(ntpath.normpath(path))
 
 
+def _real_path(path: str) -> str | None:
+    """``path`` with links and packaged-app file redirection resolved; ``None`` on error."""
+    try:
+        real = os.path.realpath(path)
+    except (OSError, ValueError):
+        return None
+    return real.removeprefix("\\\\?\\")
+
+
 def _unix_to_filetime(seconds: float) -> int:
     """Unix time (seconds, as psutil reports it) as a ``FILETIME`` tick count."""
     return int((seconds + FILETIME_UNIX_OFFSET_S) * FILETIME_TICKS_PER_S)
@@ -290,6 +299,10 @@ class _Win32:
             user32, "GetClassNameW", ctypes.c_int, hwnd, w.LPWSTR, ctypes.c_int
         )
         self._GetWindowRect = _bind(user32, "GetWindowRect", w.BOOL, hwnd, ctypes.POINTER(w.RECT))
+        self._GetClientRect = _bind(user32, "GetClientRect", w.BOOL, hwnd, ctypes.POINTER(w.RECT))
+        self._ClientToScreen = _bind(
+            user32, "ClientToScreen", w.BOOL, hwnd, ctypes.POINTER(w.POINT)
+        )
         self._WindowFromPoint = _bind(user32, "WindowFromPoint", hwnd, w.POINT)
         self._GetTopWindow = _bind(user32, "GetTopWindow", hwnd, hwnd)
         self._GetWindow = _bind(user32, "GetWindow", hwnd, hwnd, w.UINT)
@@ -449,6 +462,19 @@ class _Win32:
         if width <= 0 or height <= 0:
             return None
         return Rect(int(rect.left), int(rect.top), int(width), int(height))
+
+    def client_rect(self, hwnd: int) -> Rect | None:
+        """Client area in physical pixels (the process is per-monitor DPI aware)."""
+        rect = wintypes.RECT()
+        if not self._GetClientRect(hwnd, ctypes.byref(rect)):
+            return None
+        origin = wintypes.POINT(0, 0)
+        if not self._ClientToScreen(hwnd, ctypes.byref(origin)):
+            return None
+        width, height = rect.right - rect.left, rect.bottom - rect.top
+        if width <= 0 or height <= 0:
+            return None
+        return Rect(int(origin.x), int(origin.y), int(width), int(height))
 
     def is_window(self, hwnd: int) -> bool:
         return bool(self._IsWindow(hwnd))
@@ -900,6 +926,7 @@ class WindowsPlatform(PlatformServices):
             cursor=True,
             camera_in_use=True,
             hotkeys=True,
+            panes=True,
         )
         return caps
 
@@ -1112,6 +1139,27 @@ class WindowsPlatform(PlatformServices):
             return None
         return self._api.frame_rect(hwnd)
 
+    @_best_effort(None)
+    def window_client_rect(self, ref: WindowRef) -> Rect | None:
+        hwnd = _hwnd_of(ref)
+        if hwnd is None or not self._api.is_window(hwnd):
+            return None
+        return self._api.client_rect(hwnd)
+
+    @_best_effort(None)
+    def window_app(self, ref: WindowRef) -> AppIdentity | None:
+        api = self._api
+        hwnd = _hwnd_of(ref)
+        if hwnd is None or not api.is_window(hwnd):
+            return None
+        pid = api.thread_process(hwnd)[1]
+        if not pid or (ref.pid is not None and pid != ref.pid):
+            return None  # gone, or the handle was recycled for another process's window
+        name = self._app_process_name(pid)
+        if name is None:
+            return None
+        return AppIdentity(process=name, app_id=api.class_name(hwnd))
+
     # ------------------------------------------------------------------- camera
     def _own_executables(self) -> frozenset[str]:
         if self._own_paths is None:
@@ -1122,6 +1170,12 @@ class WindowsPlatform(PlatformServices):
                 candidates.append(self._api.process_image_path())
             except Exception:
                 log.debug("Could not read the process image path", exc_info=True)
+            # Started from a packaged (MSIX) app, such as a terminal inside
+            # another app, this process sees redirected paths (``AppData\Roaming``)
+            # while the consent store records the real file under
+            # ``AppData\Local\Packages\<family>\LocalCache``. Resolving the path
+            # through the file system gives that real location.
+            candidates += [_real_path(p) for p in candidates if p]
             self._own_paths = frozenset(_norm_path(p) for p in candidates if p)
         return self._own_paths
 

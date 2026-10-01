@@ -266,6 +266,9 @@ def _non_default_settings() -> Settings:
     s.switching.cursor_target = "gaze"
     s.switching.focus_window = False
     s.switching.smoothing = 0.377
+    s.panes.enabled = True
+    s.panes.move_cursor = False
+    s.panes.precision = 3.33
     s.presence.enabled = False
     s.presence.action = "display_off"
     s.presence.away_timeout_s = 120
@@ -304,8 +307,29 @@ def dialog(controller: FakeController) -> Iterator[SettingsDialog]:
 
 
 #: Settings without a widget: only the setup assistant sets the first-run flag
-#: (while it is False the walk-away lock is only a notification).
-UNBOUND = {"general.first_run_done"}
+#: (while it is False the walk-away lock is only a notification). Split-pane
+#: focus is experimental: the dialog offers the switch and the precision, the
+#: finer tuning is in settings.json only (docs/configuration.md).
+UNBOUND = {
+    "general.first_run_done",
+    *(
+        f"panes.{name}"
+        for name in (
+            "dwell_ms",
+            "typing_grace_ms",
+            "reading_grace_ms",
+            "cooldown_ms",
+            "after_monitor_switch_ms",
+            "hysteresis",
+            "min_pane_px",
+            "tmux",
+            "wezterm",
+            "windows_terminal",
+        )
+    ),
+}
+# ``panes.desktop_apps`` has a checkbox: it reads another app's accessibility
+# tree, so it is a visible, deliberate choice (off by default).
 
 
 def test_every_setting_has_a_widget(dialog: SettingsDialog) -> None:
@@ -330,6 +354,55 @@ def test_input_that_the_system_does_not_report_is_marked(
     dlg = SettingsDialog(controller)
     try:
         box = dlg.widget_for("presence.require_input_idle")
+        assert isinstance(box, QCheckBox)
+        assert box.text().endswith("(not supported on this system)")
+    finally:
+        _dispose(dlg)
+
+
+def test_split_pane_options_on_the_switching_page(
+    controller: FakeController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dlg = SettingsDialog(controller)
+    try:
+        follow = dlg.widget_for("panes.enabled")
+        precision = dlg.widget_for("panes.precision")
+        move = dlg.widget_for("panes.move_cursor")
+        assert isinstance(follow, QCheckBox)
+        assert isinstance(move, QCheckBox)
+        assert not follow.isChecked()  # experimental: off by default
+        assert move.isChecked()  # but once on, the cursor follows like for monitors
+        assert not precision.isEnabled()
+        assert not move.isEnabled()
+        follow.setChecked(True)
+        assert precision.isEnabled()
+        assert move.isEnabled()
+        precision.setValue(4.0)  # type: ignore[attr-defined]
+        move.setChecked(False)
+        assert dlg.apply()
+        new = controller.applied[-1]
+        assert new.panes.enabled is True
+        assert new.panes.move_cursor is False
+        assert new.panes.precision == pytest.approx(4.0)
+        assert new.panes.dwell_ms == 400  # not in the dialog: kept as it was
+        assert new.panes.desktop_apps is False  # opt-in, not switched on with the rest
+        desktop = dlg.widget_for("panes.desktop_apps")
+        assert isinstance(desktop, QCheckBox)
+        assert desktop.isEnabled()
+        assert "Claude" in desktop.text()
+        desktop.setChecked(True)
+        assert dlg.apply()
+        assert controller.applied[-1].panes.desktop_apps is True
+        follow.setChecked(False)
+        assert not desktop.isEnabled()
+    finally:
+        _dispose(dlg)
+    caps = dict.fromkeys(PlatformServices().capabilities(), True)
+    caps["panes"] = False
+    monkeypatch.setattr(controller.platform, "capabilities", lambda: dict(caps))
+    dlg = SettingsDialog(controller)
+    try:
+        box = dlg.widget_for("panes.enabled")
         assert isinstance(box, QCheckBox)
         assert box.text().endswith("(not supported on this system)")
     finally:

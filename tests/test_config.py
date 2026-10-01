@@ -256,3 +256,29 @@ def test_camera_device_documentation_mentions_stable_links_and_offline() -> None
     assert "/dev/v4l/by-id" in doc
     assert "URLs" in doc
     assert "offline" in doc
+
+
+def test_split_panes_are_experimental_and_off_by_default() -> None:
+    panes = Settings().panes
+    assert panes.enabled is False
+    assert (panes.dwell_ms, panes.precision, panes.hysteresis, panes.min_pane_px) == (
+        400,
+        2.5,
+        0.5,
+        240,
+    )
+    assert (panes.tmux, panes.wezterm, panes.windows_terminal) == (True, True, True)
+    doc = next(row["doc"] for row in describe_settings() if row["key"] == "panes.enabled")
+    assert doc.startswith("Experimental")
+
+
+def test_split_pane_values_are_validated_like_the_others() -> None:
+    settings = Settings.from_dict(
+        {"panes": {"enabled": "yes", "precision": 99, "dwell_ms": 10, "tmux": False}}
+    )
+    assert settings.panes.enabled is False  # wrong type: the default
+    assert settings.panes.precision == 6.0  # clamped
+    assert settings.panes.dwell_ms == 100
+    assert settings.panes.tmux is False
+    # Files written before the section existed get the defaults.
+    assert Settings.from_dict({"switching": {"enabled": False}}).panes == Settings().panes

@@ -12,11 +12,27 @@ marked *any thread* may additionally be called from worker threads.
 from __future__ import annotations
 
 import logging
+import ntpath
 from typing import ClassVar
 
-from ..types import Rect, WindowRef
+from ..types import AppIdentity, Rect, WindowRef
 
 log = logging.getLogger(__name__)
+
+#: Process names remembered by :meth:`PlatformServices._app_process_name`.
+_APP_NAME_CACHE_SIZE = 64
+#: Executable extensions dropped from process names.
+_EXECUTABLE_SUFFIXES = (".exe", ".app", ".bin")
+
+
+def process_basename(name: str) -> str:
+    """``"WindowsTerminal.exe"`` → ``"windowsterminal"``, ``"/usr/bin/kitty"`` →
+    ``"kitty"``: the lower-cased file name without directory or executable extension."""
+    base = ntpath.basename(name.replace("/", "\\")).strip().lower()
+    for suffix in _EXECUTABLE_SUFFIXES:
+        if base.endswith(suffix):
+            return base[: -len(suffix)]
+    return base
 
 
 class PlatformServices:
@@ -38,7 +54,8 @@ class PlatformServices:
 
         Keys: ``lock``, ``display_off``, ``wake_display``, ``input_idle``,
         ``key_idle``, ``session_locked``, ``focus``, ``cursor``, ``camera_in_use``,
-        ``hotkeys``.
+        ``hotkeys``, ``panes`` (:meth:`window_app` and :meth:`window_client_rect`
+        work, so split panes of supported terminals can be followed).
         """
         return {
             "lock": False,
@@ -51,6 +68,7 @@ class PlatformServices:
             "cursor": True,
             "camera_in_use": False,
             "hotkeys": False,
+            "panes": False,
         }
 
     # ------------------------------------------------------------ session/power
@@ -121,6 +139,65 @@ class PlatformServices:
 
     def window_rect(self, ref: WindowRef) -> Rect | None:
         return None
+
+    def window_client_rect(self, ref: WindowRef) -> Rect | None:
+        """The window's content area (without frame and title bar), in the same
+        global coordinates as :meth:`window_rect`. *Any thread.*
+
+        Best effort: where the content area cannot be told apart it may be the
+        frame rectangle. Split panes are mapped onto it.
+        """
+        return None
+
+    def window_app(self, ref: WindowRef) -> AppIdentity | None:
+        """The application the window belongs to (process name and class / bundle id).
+        *Any thread.*
+
+        Never reads the window title. ``None`` when unknown.
+        """
+        return None
+
+    def _app_process_name(self, pid: int | None) -> str | None:
+        """Lower-cased executable name of ``pid`` without its extension.
+
+        Shared by the implementations of :meth:`window_app`. Names are cached by
+        ``(pid, process creation time)``: the operating system reuses the pid of
+        a process that quit, and a cache keyed by the pid alone would give a new
+        process (VS Code, a browser) the name of the old one (an app that may be
+        inspected). The creation time is read on every call; a process that has
+        gone, or whose creation time cannot be read, is not cached. The cache
+        is bounded.
+        """
+        if pid is None or pid <= 0:
+            return None
+        cache: dict[tuple[int, float], str] | None = getattr(self, "_app_names", None)
+        if cache is None:
+            cache = {}
+            self._app_names = cache
+        try:
+            import psutil
+
+            process = psutil.Process(pid)
+            created = float(process.create_time())
+        except Exception:
+            return None
+        key = (pid, created)
+        name = cache.get(key)
+        if name is not None:
+            return name
+        try:
+            raw = str(process.name() or "")
+        except Exception:
+            return None
+        name = process_basename(raw)
+        if not name:
+            return None
+        for old in [k for k in cache if k[0] == pid]:
+            del cache[old]  # an earlier process with this pid
+        if len(cache) >= _APP_NAME_CACHE_SIZE:
+            cache.pop(next(iter(cache)))
+        cache[key] = name
+        return name
 
     def same_window(self, a: WindowRef | None, b: WindowRef | None) -> bool:
         if a is None or b is None:

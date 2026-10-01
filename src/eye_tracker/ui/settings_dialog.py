@@ -1290,6 +1290,43 @@ class SettingsDialog(QDialog):
             [target, focus, dwell, cooldown, mouse, typing, reading, smoothing, hysteresis, margin],
         )
 
+        panes = self._group(layout, "Split panes (experimental)")
+        follow = self._check(
+            panes, "panes.enabled", "Also move keyboard focus to the split pane I look at"
+        )
+        if not self._caps.get("panes", True):
+            follow.setText(follow.text() + " (not supported on this system)")
+        move = self._check(
+            panes, "panes.move_cursor", "Also move the cursor into that pane, where I left it"
+        )
+        precision = self._float(
+            panes,
+            "panes.precision",
+            "Only panes at least",
+            decimals=1,
+            step=0.5,
+            suffix=" × my gaze error",
+        )
+        panes.addRow(
+            self._hint(
+                "Works with tmux, WezTerm and Windows Terminal panes on the monitor you are on. "
+                "Small panes are left alone: how small depends on how accurate your calibration "
+                "is."
+            )
+        )
+        desktop = self._check(
+            panes,
+            "panes.desktop_apps",
+            "Also switch between side-by-side sessions in the Claude and ChatGPT apps",
+        )
+        desktop_hint = self._hint(
+            "Two Claude chats, or a ChatGPT or Codex conversation and its side chat: the one you "
+            "look at gets the focus in its message box. Windows only. Asks the app for its "
+            "accessibility tree, which can cost the app some CPU and memory."
+        )
+        panes.addRow(desktop_hint)
+        self._depends(follow, [move, precision, desktop, desktop_hint])
+
         learn = self._group(layout, "Adaptive accuracy")
         adaptive = self._check(learn, "learning.adaptive", "Learn from how I use the mouse")
         max_samples = self._int(

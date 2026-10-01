@@ -506,6 +506,7 @@ def test_tray_menu_layout(controller: FakeController, cleanup: list[Any]) -> Non
         "Privacy mode",
         "Calibrate…",
         "Show gaze dot",
+        "Follow split panes",
         "Camera preview…",
         "Settings…",
         "Start at login",
@@ -515,7 +516,7 @@ def test_tray_menu_layout(controller: FakeController, cleanup: list[Any]) -> Non
     # macOS must not move "About"/"Quit"/"Settings" into an application menu.
     assert all(a.menuRole() == a.MenuRole.NoRole for a in actions)
     checkable = {_label(a) for a in actions if a.isCheckable()}
-    assert checkable == {"Privacy mode", "Show gaze dot", "Start at login"}
+    assert checkable == {"Privacy mode", "Show gaze dot", "Follow split panes", "Start at login"}
 
 
 def test_tray_pause_text_follows_the_paused_flag(
@@ -679,6 +680,27 @@ def test_tray_gaze_dot_keeps_other_settings(controller: FakeController, cleanup:
     tray.action_overlay.trigger()
     assert controller.settings.ui.show_gaze_overlay is True
     assert controller.settings.presence.action == "display_off"
+
+
+def test_tray_follow_split_panes_toggles_the_setting(
+    controller: FakeController, cleanup: list[Any]
+) -> None:
+    tray = _tray(controller, cleanup)
+    assert not tray.action_panes.isChecked()  # experimental: off by default
+    assert "Experimental" in tray.action_panes.toolTip()
+    controller.settings.presence.action = "display_off"  # changed elsewhere: kept
+    tray.action_panes.trigger()
+    assert controller.settings.panes.enabled is True
+    assert controller.settings.presence.action == "display_off"
+    assert tray.action_panes.isChecked()
+    tray.action_panes.trigger()
+    assert controller.settings.panes.enabled is False
+    assert not tray.action_panes.isChecked()
+    # Turned on in the settings dialog: the check mark follows.
+    changed = controller.settings.copy()
+    changed.panes.enabled = True
+    tray.set_settings(changed)
+    assert tray.action_panes.isChecked()
 
 
 def test_tray_survives_failing_controller(cleanup: list[Any]) -> None:

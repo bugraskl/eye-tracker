@@ -74,6 +74,10 @@ _PRIVACY_TIP = "Release the camera completely (its light turns off)"
 #: Appended while privacy mode is remembered across restarts (the default).
 _PRIVACY_REMEMBERED_TIP = "; it stays on after a restart"
 _CALIBRATE_TIP = "Look at a few dots so the tracker learns your monitors"
+_PANES_TIP = (
+    "Experimental: keyboard focus also follows your gaze between large split panes "
+    "of tmux, WezTerm and Windows Terminal"
+)
 
 
 class AutostartBackend(Protocol):
@@ -254,12 +258,13 @@ class TrayIcon(QObject):
         self._refresh_icon()
 
     def set_settings(self, settings: Settings) -> None:
-        """Reflect changed settings (hotkey labels, gaze-dot check, notifications)."""
+        """Reflect changed settings (hotkey labels, check marks, notifications)."""
         if self._disposed or not isinstance(settings, Settings):
             return
         self._settings = settings
         self._sync_hotkeys()
         self.action_overlay.setChecked(settings.ui.show_gaze_overlay)
+        self.action_panes.setChecked(settings.panes.enabled)
 
     def tooltip_text(self) -> str:
         """E.g. ``"Eye Tracker — Tracking · 4 fps · CPU 0.6 %"``."""
@@ -334,6 +339,8 @@ class TrayIcon(QObject):
         self.action_calibrate = self._add_action("Calibrate…", self._on_calibrate)
         self.action_overlay = self._add_action("Show gaze dot", self._on_overlay, checkable=True)
         self.action_overlay.setToolTip("Draw a dot where the tracker thinks you are looking")
+        self.action_panes = self._add_action("Follow split panes", self._on_panes, checkable=True)
+        self.action_panes.setToolTip(_PANES_TIP)
         self.action_preview = self._add_action("Camera preview…", self._on_preview)
         self.action_preview.setToolTip("See what the camera sees (never saved)")
         menu.addSeparator()
@@ -387,6 +394,7 @@ class TrayIcon(QObject):
         self.action_calibrate.setFont(font)
         self.action_calibrate.setEnabled(not busy)
         self.action_overlay.setChecked(self._settings.ui.show_gaze_overlay)
+        self.action_panes.setChecked(self._settings.panes.enabled)
         self.action_status.setIcon(icons.status_dot_icon(_STATUS_COLORS.get(state, _MUTED_GREY)))
         self._sync_texts()
         self._sync_tooltips()
@@ -588,6 +596,14 @@ class TrayIcon(QObject):
         if self._call("apply_settings", updated):
             self._settings = util.controller_settings(self._controller)
         self.action_overlay.setChecked(self._settings.ui.show_gaze_overlay)
+
+    def _on_panes(self, checked: bool) -> None:
+        # Like the gaze dot: start from the controller's settings.
+        updated = util.controller_settings(self._controller).copy()
+        updated.panes.enabled = bool(checked)
+        if self._call("apply_settings", updated):
+            self._settings = util.controller_settings(self._controller)
+        self.action_panes.setChecked(self._settings.panes.enabled)
 
     def _on_autostart(self, checked: bool) -> None:
         try:

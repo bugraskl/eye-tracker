@@ -15,7 +15,8 @@ Threading
 Worker and hotkey callbacks arrive on foreign threads. They are marshalled to
 the main thread through private queued signals; a callback that already runs on
 the main thread is handled directly. Locking the screen can block for seconds,
-so it runs on a short-lived thread whose result comes back the same way.
+so it runs on a short-lived thread whose result comes back the same way; so do
+the split-pane providers, on the pane worker's thread (:mod:`eye_tracker.panes`).
 Everything else runs on the main thread,
 so no locking is needed beyond the hand-off of preview frames and the record of
 the backend the worker built.
@@ -48,6 +49,18 @@ calibration becomes unusable ``calibration_required`` is emitted; if the user
 cannot be interrupted at that moment (away, locked, privacy mode, displays off)
 the announcement is delivered once they are back and the monitor layout has
 settled.
+
+Split panes (experimental)
+--------------------------
+With ``panes.enabled`` the focused window is followed as well: its application
+is identified, its panes are asked for (once when it gets focus, then about
+every :data:`PANE_REFRESH_S` while the gaze is inside it) and, while the monitor
+decider finds the gaze on the cursor's monitor, :class:`~eye_tracker.panes.decider.PaneDecider`
+decides when the keyboard focus moves to another pane. That asks the terminal
+to focus the pane; no window is activated. Once it reports success the cursor
+follows into the pane (``panes.move_cursor``), through the same announced warp
+as a monitor switch. Pane focus waits ``panes.after_monitor_switch_ms`` after a
+monitor switch.
 
 Unreliable pointer position
 ---------------------------
@@ -89,10 +102,22 @@ from ..config import Settings, atomic_write_text
 from ..gaze.filters import PointFilter
 from ..gaze.learning import DriftMonitor, ImplicitLearner, plausible_label, refit_model
 from ..gaze.model import gaze_feature_indices
-from ..gaze.store import CalibrationData, CalibrationLibrary
+from ..gaze.store import CalibrationData, CalibrationLibrary, axis_error
+from ..panes.decider import (
+    FALLBACK_GAZE_ERROR_PX,
+    PaneConfig,
+    PaneDecider,
+    PaneDecision,
+    eligible_panes,
+)
+from ..panes.providers.command import window_key
+from ..panes.registry import PaneRegistry, default_providers, is_denied
+from ..panes.types import Pane, PaneSnapshot
+from ..panes.worker import DetectResult, FocusResult, PaneWorker
 from ..platform.base import PlatformServices
 from ..trace import TraceWriter
 from ..types import (
+    AppIdentity,
     GazePoint,
     Monitor,
     Observation,
@@ -131,6 +156,10 @@ if TYPE_CHECKING:
     HotkeyManagerFactory = Callable[[], HotkeyManager]
     #: Runs a job off the GUI thread (see ``Controller(lock_runner=...)``).
     JobRunner = Callable[[Callable[[], None]], None]
+    #: Builds the pane providers for settings (see ``Controller(pane_registry_factory=...)``).
+    PaneRegistryFactory = Callable[[Settings], PaneRegistry]
+    #: Builds the pane worker for a registry.
+    PaneWorkerFactory = Callable[[PaneRegistry], PaneWorker]
 
 log = logging.getLogger(__name__)
 
@@ -216,6 +245,14 @@ CAMERA_ERROR_RECHECK_S = 8.0
 ACTIVATION_FAILURE_LIMIT = 3
 #: How long :meth:`Controller.shutdown` waits for a screen lock still in progress.
 LOCK_JOIN_TIMEOUT_S = 2.0
+#: While the gaze is inside the focused terminal window its panes are asked for
+#: again this often (at the next window poll), so the layout the pane decider
+#: sees is never much older than its freshness limit (1.5 s).
+PANE_REFRESH_S = 1.0
+#: How long :meth:`Controller.shutdown` waits for a pane provider call in progress.
+PANE_JOIN_TIMEOUT_S = 2.0
+#: Windows whose pane cursor positions are remembered (least recently used dropped).
+PANE_CURSOR_WINDOWS = 16
 #: Walk-away actions that lock the session or blank the displays. Until the
 #: first-run setup is finished they only notify: the owner of a PC who never
 #: saw the setup assistant must not be locked out by an app they just installed.
@@ -507,6 +544,28 @@ def _layout_key(monitors: list[Monitor]) -> tuple[tuple[int, int, int, int, int]
     return tuple((m.index, m.rect.x, m.rect.y, m.rect.w, m.rect.h) for m in monitors)
 
 
+def _pane_providers(settings: Settings) -> tuple[bool, bool, bool, bool]:
+    """The provider switches of the split-pane settings."""
+    p = settings.panes
+    return (p.tmux, p.wezterm, p.windows_terminal, p.desktop_apps)
+
+
+def _trace_id(value: Any) -> str | int | None:
+    """A pane id as the trace stores it."""
+    if value is None or isinstance(value, int):
+        return value
+    return str(value)
+
+
+def _same_handle(a: Any, b: Any) -> bool:
+    if a is b:
+        return True
+    try:
+        return bool(a == b)
+    except Exception:
+        return False
+
+
 def _finite(value: float, digits: int = 2) -> float | None:
     return round(float(value), digits) if math.isfinite(value) else None
 
@@ -540,6 +599,10 @@ class Controller(QObject):
         lock_runner: ``(job) -> None`` that runs ``job`` off the GUI thread, where
             the screen is locked (``lock_screen`` can block for seconds); defaults
             to a short-lived thread. Tests pass a synchronous runner.
+        pane_registry_factory: ``(settings) -> PaneRegistry`` with the split-pane
+            providers; defaults to ``panes.registry.default_providers``.
+        pane_worker_factory: ``(registry) -> PaneWorker``; defaults to a worker
+            with its own thread. Tests pass a synchronous one.
         parent: Qt parent.
 
     Call :meth:`start` once signals are connected and :meth:`shutdown` before exit.
@@ -605,11 +668,14 @@ class Controller(QObject):
         hotkey_manager_factory: HotkeyManagerFactory | None = None,
         trace_path: str | Path | None = None,
         lock_runner: JobRunner | None = None,
+        pane_registry_factory: PaneRegistryFactory | None = None,
+        pane_worker_factory: PaneWorkerFactory | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._trace = TraceWriter(trace_path) if trace_path else None
         self._last_decision: Decision | None = None
+        self._last_pane_decision: PaneDecision | None = None
         self._settings = settings.copy()
         self._platform = platform
         self._worker_factory: WorkerFactory = worker_factory or functools.partial(
@@ -654,6 +720,34 @@ class Controller(QObject):
         self._filter = PointFilter(s.switching.smoothing)
         self._learner = ImplicitLearner(max_samples=s.learning.max_samples)
         self._drift = DriftMonitor()
+
+        # Split-pane focus (experimental, see eye_tracker.panes). The worker and
+        # its thread exist only while the feature is on.
+        self._pane_decider = PaneDecider(PaneConfig.from_settings(s.panes, s.switching))
+        self._pane_registry_factory: PaneRegistryFactory = (
+            pane_registry_factory or self._default_pane_registry
+        )
+        self._pane_worker_factory: PaneWorkerFactory = pane_worker_factory or functools.partial(
+            PaneWorker, clock=clock
+        )
+        self._pane_worker: PaneWorker | None = None
+        self._pane_capable: bool | None = None  # the platform's "panes" capability
+        self._pane_window: WindowRef | None = None  # the focused window being followed
+        self._pane_app: AppIdentity | None = None
+        self._pane_snapshot: PaneSnapshot | None = None
+        self._pane_requested_at = -math.inf
+        # Detection results are accepted only for requests made after the last
+        # window change or provider swap (ids come from the current worker).
+        self._pane_last_request = 0
+        self._pane_valid_from = 0
+        self._pane_sigma_cache: tuple[CalibrationData, int, Rect, tuple[float, float] | None] | (
+            None
+        ) = None
+        self._pane_sigma_used: tuple[float, float] | None = None
+        self._pane_switches = 0
+        # Where the cursor was last seen in each pane (panes.move_cursor): window
+        # key -> (the window, pane id -> position), most recently used last.
+        self._pane_cursor: dict[object, tuple[WindowRef, dict[Any, tuple[int, int]]]] = {}
 
         # Calibration: every saved profile, and the one in use.
         self._library = CalibrationLibrary()
@@ -864,6 +958,7 @@ class Controller(QObject):
                 self._worker.stop()
             except Exception:
                 log.warning("Stopping the vision worker failed", exc_info=True)
+        self._stop_pane_worker(wait=True)
         lock_thread = self._lock_thread
         if lock_thread is not None and lock_thread.is_alive():
             # Let a lock in progress finish before this object may be deleted.
@@ -1151,6 +1246,9 @@ class Controller(QObject):
             self._notify("Settings not saved", str(exc), force=True)
 
         self._decider.set_config(SwitchConfig.from_settings(new.switching))
+        self._pane_decider.set_config(PaneConfig.from_settings(new.panes, new.switching))
+        if old.panes != new.panes or old.switching.enabled != new.switching.enabled:
+            self._reconfigure_panes(providers_changed=_pane_providers(old) != _pane_providers(new))
         self._filter.set_smoothing(new.switching.smoothing)
         self._presence.set_config(PresenceConfig.from_settings(new.presence))
         self._guard.set_config(GuardConfig.from_settings(new.privacy))
@@ -1284,6 +1382,27 @@ class Controller(QObject):
             "cpu_percent": stats.get("cpu_percent"),
             "switches": self._switch_count,
             "hotkeys": self._hotkey_status(),
+            "panes": self._pane_status(),
+        }
+
+    def _pane_status(self) -> dict[str, Any]:
+        """Split-pane focus at a glance: never titles, commands or paths."""
+        snapshot = self._pane_snapshot
+        window = self._pane_window
+        sigma = self._pane_sigma_used
+        if sigma is None and window is not None and window.rect is not None:
+            sigma = self._pane_sigma(window.rect)
+        worker = self._pane_worker
+        fallback = (FALLBACK_GAZE_ERROR_PX, FALLBACK_GAZE_ERROR_PX)
+        return {
+            "enabled": bool(self._settings.panes.enabled),
+            "supported": self._panes_supported(),
+            "provider": snapshot.provider if snapshot is not None else None,
+            "panes": len(snapshot.panes) if snapshot is not None else 0,
+            "eligible": eligible_panes(snapshot, sigma or fallback, self._pane_decider.config),
+            "switches": self._pane_switches,
+            "sigma_px": None if sigma is None else [round(sigma[0], 1), round(sigma[1], 1)],
+            "failed_providers": sorted(worker.disabled_providers) if worker is not None else [],
         }
 
     def _hotkey_status(self) -> dict[str, Any]:
@@ -1334,7 +1453,7 @@ class Controller(QObject):
         self._settle_last_switch(now)
         if now >= self._next_window_poll:
             self._next_window_poll = now + WINDOW_POLL_S
-            self._record_foreground_window()
+            self._record_foreground_window(now)
         if now >= self._next_lock_check:
             self._next_lock_check = now + LOCK_POLL_S
             self._check_session_lock(now)
@@ -1361,6 +1480,8 @@ class Controller(QObject):
         # pointer: no remembered positions, learning labels or undone switches.
         if self._input.manual_move and self._cursor_reliable:
             self._on_manual_move(pos, now)
+        if self._cursor_reliable:
+            self._remember_pane_cursor(pos)
 
     def _on_manual_move(self, pos: tuple[int, int], now: float) -> None:
         monitor = monitor_at(self._monitors, pos[0], pos[1])
@@ -1393,15 +1514,288 @@ class Controller(QObject):
             self._last_switch = None
             self._drift.record_switch(True)
 
-    def _record_foreground_window(self) -> None:
-        if self._state is not TrackingState.TRACKING or not self._settings.switching.focus_window:
+    def _record_foreground_window(self, now: float) -> None:
+        if self._state is not TrackingState.TRACKING:
+            return
+        remember = self._settings.switching.focus_window
+        panes = self._panes_wanted()
+        if not (remember or panes):
             return
         ref = self._platform_call("foreground_window")
         if not isinstance(ref, WindowRef) or ref.rect is None or not self._monitors:
+            if panes:
+                self._forget_pane_window()
             return
-        cx, cy = ref.rect.center
+        if remember:
+            cx, cy = ref.rect.center
+            monitor = (
+                monitor_at(self._monitors, cx, cy) or nearest_monitor(self._monitors, cx, cy)[0]
+            )
+            self._memory.record_window(monitor.index, ref)
+        if panes:
+            self._follow_pane_window(ref, now)
+
+    # ---------------------------------------------------------- split panes
+    def _panes_supported(self) -> bool:
+        """The platform's ``panes`` capability (asked once)."""
+        if self._pane_capable is None:
+            caps = self._platform_call("capabilities", default={})
+            self._pane_capable = bool(isinstance(caps, dict) and caps.get("panes", False))
+        return self._pane_capable
+
+    def _panes_wanted(self) -> bool:
+        s = self._settings
+        return bool(s.panes.enabled and s.switching.enabled and self._panes_supported())
+
+    def _default_pane_registry(self, settings: Settings) -> PaneRegistry:
+        return PaneRegistry(
+            default_providers(settings.panes, client_rect=self._pane_client_rect),
+            desktop_apps=settings.panes.desktop_apps,
+        )
+
+    def _pane_client_rect(self, ref: WindowRef) -> Rect | None:  # pane worker thread
+        rect = self._platform_call("window_client_rect", ref)
+        return rect if isinstance(rect, Rect) else None
+
+    def _ensure_pane_worker(self) -> PaneWorker | None:
+        if self._pane_worker is None and self._panes_wanted() and not self._closed:
+            try:
+                worker = self._pane_worker_factory(self._pane_registry_factory(self._settings))
+                worker.detected.connect(self._on_pane_detected)
+                worker.focused.connect(self._on_pane_focused)
+                worker.start()
+            except Exception:
+                log.warning("Split-pane focus could not start", exc_info=True)
+                return None
+            self._pane_worker = worker
+            # A new worker numbers its requests from 1 again.
+            self._pane_last_request = 0
+            self._pane_valid_from = 0
+            log.info("Split-pane focus is on (experimental)")
+        return self._pane_worker
+
+    def _stop_pane_worker(self, *, wait: bool) -> None:
+        """Stop the pane worker. Only :meth:`shutdown` waits for a provider call
+        in progress; a settings change must not block the GUI thread, and a
+        stopped worker delivers nothing more."""
+        worker, self._pane_worker = self._pane_worker, None
+        if worker is None:
+            return
+        try:
+            if wait:
+                worker.stop(PANE_JOIN_TIMEOUT_S)
+            else:
+                worker.request_stop()
+        except Exception:
+            log.debug("Stopping the pane worker failed", exc_info=True)
+
+    def _reconfigure_panes(self, *, providers_changed: bool) -> None:
+        """Split-pane settings changed: start, stop or re-provision the worker."""
+        if not self._panes_wanted():
+            if self._pane_worker is not None:
+                log.info("Split-pane focus is off")
+            self._stop_pane_worker(wait=False)
+            self._forget_pane_window()
+            self._pane_decider.reset()
+            return
+        worker = self._pane_worker
+        if worker is not None and providers_changed:
+            worker.set_registry(self._pane_registry_factory(self._settings))
+            self._pane_snapshot = None
+            self._pane_requested_at = -math.inf
+            self._pane_valid_from = self._pane_last_request + 1
+
+    def _forget_pane_window(self) -> None:
+        self._pane_window = None
+        self._pane_app = None
+        self._pane_snapshot = None
+        self._pane_requested_at = -math.inf
+        self._pane_valid_from = self._pane_last_request + 1
+
+    def _follow_pane_window(self, ref: WindowRef, now: float) -> None:
+        """Track the focused window and ask for its panes when useful.
+
+        A new window is asked about at once; the window being followed again
+        every :data:`PANE_REFRESH_S` while the gaze is inside it. Windows of
+        denied applications (see ``panes.registry``) are never asked about.
+        """
+        current = self._pane_window
+        if (
+            current is None
+            or current.pid != ref.pid  # a handle reused by another process's window
+            or not self._platform_call("same_window", current, ref, default=False)
+        ):
+            self._pane_window = ref
+            self._pane_snapshot = None
+            self._pane_requested_at = -math.inf
+            self._pane_valid_from = self._pane_last_request + 1
+            self._prune_pane_cursors()
+            app = self._platform_call("window_app", ref)
+            self._pane_app = app if isinstance(app, AppIdentity) else None
+            fresh = True
+        else:
+            # Keep the handle object the snapshot belongs to; only the frame moves.
+            if ref.rect != current.rect:
+                self._pane_window = dataclasses.replace(current, rect=ref.rect)
+            fresh = False
+        app = self._pane_app
+        if app is None or is_denied(app, desktop_apps=self._settings.panes.desktop_apps):
+            return
+        if not fresh:
+            gaze = self._last_gaze
+            rect = ref.rect
+            inside = gaze is not None and rect is not None and rect.contains(*gaze)
+            if not inside or now - self._pane_requested_at < PANE_REFRESH_S:
+                return
+        worker = self._ensure_pane_worker()
+        window = self._pane_window
+        if worker is None or window is None:
+            return
+        self._pane_requested_at = now
+        self._pane_last_request = worker.request_detect(window, app)
+
+    def _on_pane_detected(self, result: DetectResult) -> None:
+        window = self._pane_window
+        if self._closed or window is None or not _same_handle(result.window_handle, window.handle):
+            return  # the user moved on to another window meanwhile
+        if result.request_id < self._pane_valid_from:
+            return  # asked before a window change or with the providers since replaced
+        self._pane_snapshot = result.snapshot
+        if result.snapshot is not None:
+            # Panes that closed take their remembered cursor position with them.
+            entry = self._pane_cursor.get(window_key(window))
+            if entry is not None:
+                ids = {p.id for p in result.snapshot.panes}
+                for gone in [pid for pid in entry[1] if pid not in ids]:
+                    del entry[1][gone]
+
+    def _on_pane_focused(self, result: FocusResult) -> None:
+        if self._closed:
+            return
+        if not result.ok:
+            log.debug("Could not focus pane %s", result.pane_id)
+            return
+        self._pane_switches += 1
+        snapshot = self._pane_snapshot
+        if snapshot is not None and _same_handle(snapshot.window_handle, result.window_handle):
+            pane = snapshot.pane(result.pane_id)
+            self._pane_snapshot = snapshot.with_focus(result.pane_id)
+            if pane is not None and self._settings.panes.move_cursor:
+                self._move_cursor_into_pane(pane)
+        self._pane_requested_at = -math.inf  # confirm the new layout at the next poll
+
+    # ------------------------------------------------- cursor in split panes
+    def _move_cursor_into_pane(self, pane: Pane) -> None:
+        """After a pane got the keyboard focus: the cursor follows, to where the
+        user last left it in that pane (if still inside it), else its centre.
+
+        The same path as a monitor switch: the warp is announced to the input
+        tracker first (so it is not taken for mouse use) and refusals count
+        towards the warp backoff. Nothing happens if the cursor is already in
+        the pane.
+        """
+        window = self._pane_window
+        if window is None:
+            return
+        rect = pane.rect
+        cursor = self._cursor_pos()
+        if self._cursor_reliable and cursor is not None and rect.contains(*cursor):
+            return
+        entry = self._pane_cursor.get(window_key(window))
+        spot = entry[1].get(pane.id) if entry is not None else None
+        if spot is None or not rect.contains(*spot):
+            spot = rect.clamp(*rect.center)
+        now = self._clock()
+        self._input.note_programmatic_move(spot, now)
+        if self._move_cursor(spot[0], spot[1], now):
+            log.debug("Cursor moved into pane %s", pane.id)
+
+    def _remember_pane_cursor(self, pos: tuple[int, int]) -> None:
+        """Record ``pos`` for the pane of the followed window that contains it."""
+        window = self._pane_window
+        snapshot = self._pane_snapshot
+        if (
+            window is None
+            or snapshot is None
+            or not self._settings.panes.move_cursor
+            or not _same_handle(snapshot.window_handle, window.handle)
+        ):
+            return
+        pane = next((p for p in snapshot.panes if p.rect.contains(*pos)), None)
+        if pane is None:
+            return
+        key = window_key(window)
+        entry = self._pane_cursor.pop(key, None)  # re-inserted: most recently used last
+        spots = entry[1] if entry is not None else {}
+        spots[pane.id] = (int(pos[0]), int(pos[1]))
+        self._pane_cursor[key] = (window, spots)
+        while len(self._pane_cursor) > PANE_CURSOR_WINDOWS:
+            self._pane_cursor.pop(next(iter(self._pane_cursor)))
+
+    def _prune_pane_cursors(self) -> None:
+        """Forget the cursor positions of windows that are gone."""
+        for key, (ref, _spots) in list(self._pane_cursor.items()):
+            if not self._platform_call("is_window_valid", ref, default=False):
+                del self._pane_cursor[key]
+
+    def _pane_sigma(self, rect: Rect) -> tuple[float, float] | None:
+        """The calibration's gaze error on the monitor showing ``rect`` (cached)."""
+        cal = self._calibration
+        if cal is None or not self._monitors:
+            return None
+        cx, cy = rect.center
         monitor = monitor_at(self._monitors, cx, cy) or nearest_monitor(self._monitors, cx, cy)[0]
-        self._memory.record_window(monitor.index, ref)
+        cached = self._pane_sigma_cache
+        if (
+            cached is not None
+            and cached[0] is cal
+            and cached[1] == monitor.index
+            and cached[2] == monitor.rect
+        ):
+            return cached[3]
+        sigma = axis_error(cal, monitor)
+        self._pane_sigma_cache = (cal, monitor.index, monitor.rect, sigma)
+        return sigma
+
+    def _pane_step(
+        self,
+        now: float,
+        gaze: tuple[float, float] | None,
+        decision: Decision,
+        enabled: bool,
+    ) -> PaneDecision:
+        """Move the keyboard focus between split panes (only while the monitor
+        decider is content). Never activates a window; the cursor follows only once
+        the focus call succeeded (:meth:`_on_pane_focused`)."""
+        s = self._settings.panes
+        worker = self._pane_worker
+        window = self._pane_window
+        active = (
+            enabled
+            and s.enabled
+            and worker is not None
+            and window is not None
+            and decision.target is None
+            and decision.reason == "same"
+            and now - self._decider.last_switch_time >= s.after_monitor_switch_ms / 1000.0
+        )
+        rect = window.rect if window is not None else None
+        sigma = self._pane_sigma(rect) if active and rect is not None else None
+        if active:
+            self._pane_sigma_used = sigma
+        pane = self._pane_decider.update(
+            now,
+            gaze,
+            rect,
+            self._pane_snapshot,
+            sigma,
+            self._input.last_mouse_activity,
+            self._input.last_key_activity,
+            enabled=active,
+        )
+        if pane.target is not None and worker is not None and window is not None:
+            worker.request_focus(window, pane.target)
+        return pane
 
     def _check_session_lock(self, now: float) -> None:
         locked = self._platform_call("is_session_locked")
@@ -1647,6 +2041,7 @@ class Controller(QObject):
         self._update_presence(now)
         self._update_state()
         self._last_decision = None
+        self._last_pane_decision = None
         if self._state is TrackingState.TRACKING:
             self._track(obs, now)
             self._update_state()
@@ -1719,6 +2114,8 @@ class Controller(QObject):
             return
         cursor = self._cursor_pos()
         decision = self._last_decision
+        pane = self._last_pane_decision
+        snapshot = self._pane_snapshot
         gaze = self._last_gaze if self._last_gaze_time == now else None
         trace.write(
             {
@@ -1739,6 +2136,12 @@ class Controller(QObject):
                 "reason": decision.reason if decision else None,
                 "prog": trace.number(decision.progress, 2) if decision else None,
                 "target": decision.target if decision else None,
+                # Split panes: ids only (tmux "%3", WezTerm numbers), never titles.
+                "pane_cand": _trace_id(pane.candidate) if pane else None,
+                "pane_reason": pane.reason if pane else None,
+                "pane_prog": trace.number(pane.progress, 2) if pane else None,
+                "pane_target": _trace_id(pane.target.id) if pane and pane.target else None,
+                "n_panes": len(snapshot.panes) if snapshot is not None else 0,
             }
         )
 
@@ -1771,10 +2174,12 @@ class Controller(QObject):
             enabled=enabled,
             looking_away=self._looking_away,
         )
-        self._pending = decision.pending
         self._last_decision = decision
         if decision.target is not None:
             self._switch_to(decision.target, gaze, cursor, current, now)
+        pane = self._pane_step(now, gaze, decision, enabled)
+        self._last_pane_decision = pane
+        self._pending = decision.pending or pane.pending
 
     def _current_monitor(self, cursor: tuple[int, int] | None) -> int | None:
         """Index of the monitor the pointer is on (``None`` if unknown)."""
@@ -1882,6 +2287,7 @@ class Controller(QObject):
                 self._activate(monitor, window)
 
         self._decider.notify_switched(now, target)
+        self._pane_decider.reset()  # another monitor: another pane context
         self._assumed_monitor = target
         if self._last_switch is not None:
             self._drift.record_switch(True)  # the previous switch was kept until now
@@ -2356,6 +2762,7 @@ class Controller(QObject):
 
     def _reset_tracking(self) -> None:
         self._decider.reset()
+        self._pane_decider.reset()
         self._filter.reset()
         self._pending = False
         self._last_gaze = None
@@ -2972,6 +3379,8 @@ class Controller(QObject):
         assumed = next((m for m in before if m.index == self._assumed_monitor), None)
         self._monitors = list(monitors)
         self._decider.set_monitors(self._monitors)
+        self._pane_decider.reset()
+        self._pane_sigma_cache = None
         sides = [min(m.rect.w, m.rect.h) for m in self._monitors if m.rect.w > 0 and m.rect.h > 0]
         self._min_side = float(min(sides)) if sides else 1000.0
         if self._cursor_reliable:

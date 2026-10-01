@@ -60,6 +60,31 @@ still at an earlier version's defaults move to today's defaults once; hotkeys yo
 | `switching.focus_window` | `true` |  | Also give keyboard focus to the last-used window on the target monitor. |
 | `switching.smoothing` | `0.5` | 0 – 1 | Gaze smoothing strength (0 = raw, 1 = heavy). |
 
+## Split panes (experimental)
+
+Off by default. Pane focus follows only on the monitor the cursor is already on, at the earliest
+1500 ms after a monitor switch, and the mouse grace of the switching settings applies too. A pane
+takes part when it is at least `precision` times the calibration's gaze error and at least
+`min_pane_px` wide (panes side by side) or tall (stacked panes): with the defaults and a gaze error
+of 120 px that is 300 px. Supported terminals and the full rules: [split-pane focus](panes.md).
+
+| Key | Default | Allowed | Description |
+|---|---|---|---|
+| `panes.enabled` | `false` |  | Experimental: also move keyboard focus between split panes of supported terminals (tmux, WezTerm, Windows Terminal) on the monitor you are already on. Only panes large enough for your calibration's accuracy take part. |
+| `panes.dwell_ms` | `400` | 100 – 5000 | How long you must look at another pane before it gets focus. |
+| `panes.typing_grace_ms` | `3000` | 0 – 20000 | No pane switching for this long after you type, or after you switched panes yourself (a keyboard shortcut or a click in the terminal). |
+| `panes.reading_grace_ms` | `8000` | 0 – 60000 | After you typed while looking at another pane (e.g. reading its output), switching to that pane waits this long after your last keystroke instead of the typing grace. 0 turns this off. |
+| `panes.cooldown_ms` | `1000` | 0 – 10000 | Minimum time between two pane switches. |
+| `panes.after_monitor_switch_ms` | `1500` | 0 – 10000 | No pane switching for this long after the cursor moved to another monitor. |
+| `panes.precision` | `2.5` | 1 – 6 | A pane takes part only if it is at least this many times your gaze error (measured by the calibration) wide, for panes side by side, or tall, for stacked panes. Higher is safer, lower allows smaller panes. |
+| `panes.hysteresis` | `0.5` | 0 – 3 | How far past the divider the gaze must be, as a fraction of your gaze error. |
+| `panes.min_pane_px` | `240` | 0 – 4000 | Panes narrower (or lower) than this many pixels never take part. |
+| `panes.move_cursor` | `true` |  | Also move the mouse cursor into the pane that gets the keyboard focus, back to where you last left it in that pane. |
+| `panes.tmux` | `true` |  | Follow tmux panes (through the tmux command, also in WSL). |
+| `panes.wezterm` | `true` |  | Follow WezTerm panes (through the wezterm command). |
+| `panes.windows_terminal` | `true` |  | Follow Windows Terminal panes (Windows only, through UI Automation). |
+| `panes.desktop_apps` | `false` |  | Also follow sessions side by side in the Claude desktop app (two chats) and the ChatGPT desktop app, which hosts Codex (main conversation and side chat), on Windows only: the session you look at gets the keyboard focus in its message box. Reads the app's accessibility tree, which makes the app build that tree; this may cost the app some CPU and memory while it is on. |
+
 ## Walk-away (presence)
 
 The countdown is part of the away time: with the defaults it appears after 35 s without you, and the

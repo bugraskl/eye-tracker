@@ -48,7 +48,8 @@ really wants to work on the reading monitor gets there after a longer look
 (or at once by moving the mouse). The reading monitor is forgotten when the
 cursor changes monitor, when typing has paused for ``reading_grace_s`` or when
 the gaze has not been on it for :data:`READING_FORGET_S`. Switches to any other
-monitor are unaffected.
+monitor are unaffected. The rule itself is :class:`~.reading.ReadingTracker`,
+which the split-pane decider shares.
 
 The decider is pure logic: time is injected and it has no side effects, which
 makes it cheap to test exhaustively.
@@ -63,6 +64,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..types import Monitor
+from .reading import (
+    READING_EVIDENCE_S,
+    READING_FORGET_S,
+    READING_MAX_GAP_S,
+    READING_RETURN_S,
+    ReadingTracker,
+)
 
 if TYPE_CHECKING:
     from ..config import SwitchingSettings
@@ -78,23 +86,20 @@ PENDING_HORIZON_S = 0.5
 #: Default of :attr:`SwitchConfig.reading_grace_s`.
 DEFAULT_READING_GRACE_S = 6.0
 
-#: Typing must go on at least this long after a look at another monitor began
-#: for that monitor to become a reading monitor. Shorter overlaps are a user
-#: finishing a word while the eyes already move to where they want to work.
-READING_EVIDENCE_S = 1.0
-
-#: Typing that resumes within this time after a look at another monitor ended
-#: also makes it a reading monitor: the user glanced over, did not want to
-#: switch and carried on typing where they were.
-READING_RETURN_S = 2.0
-
-#: A reading monitor the gaze has not rested on for this long is forgotten.
-READING_FORGET_S = 60.0
-
-#: Updates further apart than this end a look for the reading rule. Longer than
-#: :attr:`SwitchConfig.max_gap_s` on purpose: while the user types the camera
-#: runs at 1-2 fps, and reading must be recognised at exactly that rate.
-READING_MAX_GAP_S = 1.5
+# The reading rule's constants (READING_*) live in .reading and are re-exported
+# here: they describe this decider's behaviour too.
+__all__ = [
+    "DEFAULT_READING_GRACE_S",
+    "PENDING_HORIZON_S",
+    "READING_EVIDENCE_S",
+    "READING_FORGET_S",
+    "READING_MAX_GAP_S",
+    "READING_RETURN_S",
+    "REASONS",
+    "Decision",
+    "SwitchConfig",
+    "SwitchDecider",
+]
 
 #: Absorbs float rounding in time differences (``10.3 - 10.0 < 0.3`` is possible).
 _EPS = 1e-6
@@ -178,20 +183,6 @@ class Decision:
         return self.target is not None
 
 
-@dataclass(slots=True)
-class _Look:
-    """A run of consecutive updates with the gaze clearly on one other monitor."""
-
-    monitor: int
-    start: float
-    last: float
-
-    @property
-    def repeated(self) -> bool:
-        """Seen on more than one update (a single noisy sample is no look)."""
-        return self.last > self.start
-
-
 class SwitchDecider:
     """Stateful filter from gaze points to monitor switches.
 
@@ -212,10 +203,7 @@ class SwitchDecider:
         # Reading-while-typing state; it belongs to the monitor the cursor was
         # on (``_context``) and is dropped whenever that changes.
         self._context: int | None = None
-        self._look: _Look | None = None
-        self._prev_look: _Look | None = None
-        self._reading: int | None = None
-        self._reading_seen = -math.inf
+        self._reading: ReadingTracker[int] = ReadingTracker()
         self.set_monitors(monitors)
 
     # ---------------------------------------------------------------- config
@@ -240,7 +228,7 @@ class SwitchDecider:
     @property
     def reading_monitor(self) -> int | None:
         """The monitor currently treated as the user's reading monitor, if any."""
-        return self._reading
+        return self._reading.reading
 
     def set_monitors(self, monitors: Sequence[Monitor]) -> None:
         """Replace the monitor layout. A dwell in progress is discarded."""
@@ -295,7 +283,7 @@ class SwitchDecider:
             if gap < 0:
                 self._clear_reading()
             elif gap > max(cfg.max_gap_s, READING_MAX_GAP_S) + _EPS:
-                self._end_look()
+                self._reading.end_look()
         self._last_update = now
 
         if not enabled or not self._monitors:
@@ -312,10 +300,17 @@ class SwitchDecider:
         current = self._by_index.get(current_monitor) if current_monitor is not None else None
         candidate, held = self._classify(gaze, current, looking_away)
         if candidate is not None and held is None:
-            self._observe_look(candidate.index, now)
+            self._reading.observe(candidate.index, now)
         else:
-            self._end_look()
-        self._update_reading(now, last_key_activity)
+            self._reading.end_look()
+        self._reading.update(
+            now,
+            last_key_activity,
+            typing_grace_s=cfg.typing_grace_s,
+            reading_grace_s=cfg.reading_grace_s,
+            context=self._context,
+            active=self._context in self._by_index,
+        )
 
         if held is not None or candidate is None:
             # (_classify always gives a reason when there is no candidate.)
@@ -426,7 +421,7 @@ class SwitchDecider:
         """First blocking guard (spec order) and the time until *all* guards expire."""
         cfg = self._config
         typing_grace = cfg.typing_grace_s
-        if candidate == self._reading:
+        if candidate == self._reading.reading:
             typing_grace = max(typing_grace, cfg.reading_grace_s)
         checks = (
             ("mouse", cfg.mouse_grace_s - (now - last_mouse)),
@@ -444,55 +439,4 @@ class SwitchDecider:
 
     # ------------------------------------------------------ reading monitor
     def _clear_reading(self) -> None:
-        self._look = None
-        self._prev_look = None
-        self._reading = None
-        self._reading_seen = -math.inf
-
-    def _observe_look(self, monitor: int, now: float) -> None:
-        """The gaze is clearly on ``monitor`` (not the current one) at ``now``."""
-        look = self._look
-        if look is None or look.monitor != monitor:
-            self._end_look()
-            self._look = _Look(monitor, now, now)
-        else:
-            look.last = now
-        if monitor == self._reading:
-            self._reading_seen = now
-
-    def _end_look(self) -> None:
-        look = self._look
-        self._look = None
-        # A single-sample "look" is kept out so that one noisy gaze sample cannot
-        # replace the evidence of a real look just before it.
-        if look is not None and look.repeated:
-            self._prev_look = look
-
-    def _update_reading(self, now: float, last_key: float) -> None:
-        """Recognise and expire the reading monitor (see the module documentation)."""
-        cfg = self._config
-        if cfg.reading_grace_s <= cfg.typing_grace_s:
-            self._reading = None
-            return
-        typing_recent = now - last_key < cfg.reading_grace_s - _EPS
-        if typing_recent and self._context in self._by_index:
-            for look in (self._look, self._prev_look):
-                if (
-                    look is not None
-                    and look.repeated
-                    and look.start + READING_EVIDENCE_S <= last_key + _EPS
-                    and last_key <= look.last + READING_RETURN_S + _EPS
-                ):
-                    if self._reading != look.monitor:
-                        log.debug(
-                            "Typing on monitor %s while reading monitor %d",
-                            self._context,
-                            look.monitor,
-                        )
-                        self._reading = look.monitor
-                    self._reading_seen = max(self._reading_seen, look.last)
-                    break
-        if self._reading is not None and (
-            not typing_recent or now - self._reading_seen > READING_FORGET_S
-        ):
-            self._reading = None
+        self._reading.clear()

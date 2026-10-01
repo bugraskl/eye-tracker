@@ -169,6 +169,76 @@ class SwitchingSettings:
 
 
 @dataclass
+class PaneSettings:
+    enabled: bool = _opt(
+        False,
+        doc="Experimental: also move keyboard focus between split panes of supported "
+        "terminals (tmux, WezTerm, Windows Terminal) on the monitor you are already on. "
+        "Only panes large enough for your calibration's accuracy take part.",
+    )
+    dwell_ms: int = _opt(
+        400, lo=100, hi=5000, doc="How long you must look at another pane before it gets focus."
+    )
+    typing_grace_ms: int = _opt(
+        3000,
+        lo=0,
+        hi=20000,
+        doc="No pane switching for this long after you type, or after you switched panes "
+        "yourself (a keyboard shortcut or a click in the terminal).",
+    )
+    reading_grace_ms: int = _opt(
+        8000,
+        lo=0,
+        hi=60000,
+        doc="After you typed while looking at another pane (e.g. reading its output), "
+        "switching to that pane waits this long after your last keystroke instead of the "
+        "typing grace. 0 turns this off.",
+    )
+    cooldown_ms: int = _opt(1000, lo=0, hi=10000, doc="Minimum time between two pane switches.")
+    after_monitor_switch_ms: int = _opt(
+        1500,
+        lo=0,
+        hi=10000,
+        doc="No pane switching for this long after the cursor moved to another monitor.",
+    )
+    precision: float = _opt(
+        2.5,
+        lo=1.0,
+        hi=6.0,
+        doc="A pane takes part only if it is at least this many times your gaze error "
+        "(measured by the calibration) wide, for panes side by side, or tall, for stacked "
+        "panes. Higher is safer, lower allows smaller panes.",
+    )
+    hysteresis: float = _opt(
+        0.5,
+        lo=0.0,
+        hi=3.0,
+        doc="How far past the divider the gaze must be, as a fraction of your gaze error.",
+    )
+    min_pane_px: int = _opt(
+        240, lo=0, hi=4000, doc="Panes narrower (or lower) than this many pixels never take part."
+    )
+    move_cursor: bool = _opt(
+        True,
+        doc="Also move the mouse cursor into the pane that gets the keyboard focus, back to "
+        "where you last left it in that pane.",
+    )
+    tmux: bool = _opt(True, doc="Follow tmux panes (through the tmux command, also in WSL).")
+    wezterm: bool = _opt(True, doc="Follow WezTerm panes (through the wezterm command).")
+    windows_terminal: bool = _opt(
+        True, doc="Follow Windows Terminal panes (Windows only, through UI Automation)."
+    )
+    desktop_apps: bool = _opt(
+        False,
+        doc="Also follow sessions side by side in the Claude desktop app (two chats) and the "
+        "ChatGPT desktop app, which hosts Codex (main conversation and side chat), on Windows "
+        "only: the session you look at gets the keyboard focus in its message box. Reads the "
+        "app's accessibility tree, which makes the app build that tree; this may cost the app "
+        "some CPU and memory while it is on.",
+    )
+
+
+@dataclass
 class PresenceSettings:
     enabled: bool = _opt(True, doc="React when you walk away from the computer.")
     action: str = _opt(
@@ -328,6 +398,7 @@ class Settings:
     camera: CameraSettings = field(default_factory=CameraSettings)
     performance: PerformanceSettings = field(default_factory=PerformanceSettings)
     switching: SwitchingSettings = field(default_factory=SwitchingSettings)
+    panes: PaneSettings = field(default_factory=PaneSettings)
     presence: PresenceSettings = field(default_factory=PresenceSettings)
     privacy: PrivacySettings = field(default_factory=PrivacySettings)
     hotkeys: HotkeySettings = field(default_factory=HotkeySettings)

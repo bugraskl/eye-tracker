@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import sys
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import pytest
@@ -31,8 +32,12 @@ from eye_tracker.gaze.store import (
     load_calibration,
     save_calibration,
 )
+from eye_tracker.panes.registry import PaneRegistry
+from eye_tracker.panes.types import Pane, PaneSnapshot
+from eye_tracker.panes.worker import DetectResult, PaneWorker
 from eye_tracker.platform.base import PlatformServices
 from eye_tracker.types import (
+    AppIdentity,
     Monitor,
     Observation,
     Rect,
@@ -166,9 +171,24 @@ class FakePlatform(PlatformServices):
         self.accessibility: str | None = None  # None: not applicable (not macOS)
         self.camera_permission: bool | None = None
         self.background: list[bool] = []
+        # Split panes: the application of each window handle, and the capability.
+        self.apps: dict[Any, AppIdentity] = {}
+        self.panes_capable = True
 
     def names(self) -> list[str]:
         return [c[0] for c in self.calls]
+
+    def capabilities(self) -> dict[str, bool]:
+        caps = super().capabilities()
+        caps["panes"] = self.panes_capable
+        return caps
+
+    def window_app(self, ref: WindowRef) -> AppIdentity | None:
+        self.calls.append(("window_app", ref.handle))
+        return self.apps.get(ref.handle)
+
+    def window_client_rect(self, ref: WindowRef) -> Rect | None:
+        return ref.rect
 
     def lock_screen(self) -> bool:
         self.calls.append(("lock_screen",))
@@ -380,6 +400,7 @@ def make_controller(qapp: Any, app_dirs: Any) -> Iterator[Callable[..., Harness]
         hotkeys: FakeHotkeys | None = None,
         start: bool = True,
         threaded_locks: bool = False,
+        **controller_kwargs: Any,
     ) -> Harness:
         if calibrated:
             save_calibration(paths.calibration_file(), make_calibration())
@@ -406,6 +427,7 @@ def make_controller(qapp: Any, app_dirs: Any) -> Iterator[Callable[..., Harness]
             # Screen locks run on a thread in the app; synchronously here unless
             # a test is about that thread.
             lock_runner=None if threaded_locks else run_now,
+            **controller_kwargs,
         )
         created.append(controller)
         h = Harness(controller, platform, cursor, clock, hotkeys, monitors, workers)
@@ -2783,3 +2805,485 @@ def test_successful_lock_and_display_off_does_not_wake_the_displays(
     assert h.platform.names() == ["display_off", "lock_screen"]
     h.push(gaze_obs((500, 500)))  # back before the lock was noticed
     assert "wake_display" not in h.platform.names()
+
+
+# ----------------------------------------------------------------- split panes
+TERMINAL = WindowRef(handle=0x7E, pid=777, rect=Rect(0, 0, 1920, 1080))
+TERMINAL_APP = AppIdentity("windowsterminal", "CASCADIA_HOSTING_WINDOW_CLASS")
+LEFT_PANE = (480, 540)
+RIGHT_PANE = (1440, 540)
+
+
+class PaneProviderFake:
+    """Two side-by-side panes on the left monitor; records every call."""
+
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+        self.focused = "%0"
+        self.focus_ok = True
+        #: The panes and where they are (changed by tests to re-split the window).
+        self.rects: dict[str, Rect] = {"%0": Rect(0, 0, 960, 1080), "%1": Rect(960, 0, 960, 1080)}
+
+    def applies(self, app: AppIdentity) -> bool:
+        self.calls.append(("applies", app.process))
+        return True
+
+    def detect(self, ref: WindowRef, app: AppIdentity) -> PaneSnapshot | None:
+        self.calls.append(("detect", ref.handle))
+        panes = tuple(
+            Pane(pane_id, rect, self.focused == pane_id, self.name)
+            for pane_id, rect in self.rects.items()
+        )
+        return PaneSnapshot(ref.handle, panes, 0.0)
+
+    def focus(self, ref: WindowRef, pane: Pane) -> bool:
+        self.calls.append(("focus", pane.id))
+        if self.focus_ok:
+            self.focused = str(pane.id)
+        return self.focus_ok
+
+    def names(self) -> list[str]:
+        return [c[0] for c in self.calls]
+
+
+def pane_settings() -> Settings:
+    s = make_settings()
+    s.panes.enabled = True
+    return s
+
+
+def make_pane_controller(
+    make_controller: Callable[..., Harness],
+    settings: Settings | None = None,
+    *,
+    app: AppIdentity = TERMINAL_APP,
+    worker_cls: type[PaneWorker] = PaneWorker,
+    **kwargs: Any,
+) -> tuple[Harness, PaneProviderFake]:
+    """A controller whose pane worker is synchronous and whose provider is a fake."""
+    provider = PaneProviderFake()
+    holder: dict[str, Harness] = {}
+    platform = FakePlatform()
+    platform.apps[TERMINAL.handle] = app
+    platform.foreground = TERMINAL
+
+    def worker(registry: PaneRegistry) -> PaneWorker:
+        # Created on the first window poll, once the harness (and its clock) exists.
+        return worker_cls(registry, clock=holder["h"].clock, synchronous=True)
+
+    h = make_controller(
+        settings or pane_settings(),
+        platform=platform,
+        start=False,
+        pane_registry_factory=lambda s: PaneRegistry([provider], desktop_apps=s.panes.desktop_apps),
+        pane_worker_factory=worker,
+        **kwargs,
+    )
+    holder["h"] = h
+    h.controller.start()
+    return h, provider
+
+
+def test_split_panes_are_off_by_default(make_controller: Callable[..., Harness]) -> None:
+    s = make_settings()
+    s.switching.focus_window = False
+    h, provider = make_pane_controller(make_controller, s)
+    settle_mouse(h)
+    h.feed(gaze_obs(RIGHT_PANE), 3.0)
+    assert provider.calls == []
+    assert "window_app" not in h.platform.names()
+    status = h.controller.status()["panes"]
+    assert status["enabled"] is False
+    assert status["switches"] == 0
+
+
+def test_gaze_on_another_pane_moves_only_the_keyboard_focus(
+    make_controller: Callable[..., Harness],
+) -> None:
+    s = pane_settings()
+    s.panes.move_cursor = False  # the cursor stays too (see the tests below for the default)
+    h, provider = make_pane_controller(make_controller, s)
+    settle_mouse(h)  # also the first window polls: the panes are known
+    assert ("detect", TERMINAL.handle) in provider.calls
+    h.feed(gaze_obs(LEFT_PANE), 1.0)
+    assert "focus" not in provider.names()
+    h.feed(gaze_obs(RIGHT_PANE), 1.0)
+    assert provider.names().count("focus") == 1
+    assert ("focus", "%1") in provider.calls
+    # No cursor warp, no window activation, no monitor switch.
+    assert h.cursor.moves == []
+    assert "activate_window" not in h.platform.names()
+    assert h.events["switched"] == []
+    status = h.controller.status()["panes"]
+    assert status["switches"] == 1
+    assert status["provider"] == "fake"
+    assert status["panes"] == 2
+    assert status["eligible"] == 1
+    assert status["sigma_px"] is not None
+    # The focus now is where the user looks: nothing more happens.
+    h.feed(gaze_obs(RIGHT_PANE), 2.0)
+    assert provider.names().count("focus") == 1
+
+
+RIGHT_PANE_CENTRE = (1440, 540)
+
+
+def look_at_the_right_pane(h: Harness) -> None:
+    """Work in the left (focused) pane, then look at the right one long enough."""
+    h.feed(gaze_obs(LEFT_PANE), 1.0)
+    h.feed(gaze_obs(RIGHT_PANE), 1.0)
+
+
+def test_the_cursor_follows_into_the_pane_centre(make_controller: Callable[..., Harness]) -> None:
+    h, provider = make_pane_controller(make_controller)
+    settle_mouse(h)  # the cursor rests at (500, 500): in the left pane
+    look_at_the_right_pane(h)
+    assert ("focus", "%1") in provider.calls
+    assert h.cursor.moves == [RIGHT_PANE_CENTRE]
+    assert "activate_window" not in h.platform.names()
+    assert h.events["switched"] == []  # no monitor switch
+
+
+def test_the_cursor_returns_to_where_it_was_left_in_the_pane(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h, _provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    h.cursor.position = (1700, 300)  # the user worked in the right pane ...
+    h.tick()
+    h.cursor.position = (500, 500)  # ... and went back to the left one
+    h.tick()
+    settle_mouse(h)
+    look_at_the_right_pane(h)
+    assert h.cursor.moves == [(1700, 300)]
+
+
+def test_a_remembered_spot_outside_the_pane_now_is_ignored(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h, provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    h.cursor.position = (1700, 300)
+    h.tick()
+    h.cursor.position = (500, 500)
+    h.tick()
+    # The right pane shrinks to the lower half: (1700, 300) is no longer in it.
+    provider.rects["%1"] = Rect(960, 540, 960, 540)
+    settle_mouse(h)  # the next refreshes see the new layout
+    h.feed(gaze_obs(LEFT_PANE), 1.5)
+    h.feed(gaze_obs((1440, 810)), 1.0)
+    assert ("focus", "%1") in provider.calls
+    assert h.cursor.moves == [(1440, 810)]  # the centre of the pane as it is now
+
+
+def test_no_cursor_move_when_the_focus_failed(make_controller: Callable[..., Harness]) -> None:
+    h, provider = make_pane_controller(make_controller)
+    provider.focus_ok = False
+    settle_mouse(h)
+    look_at_the_right_pane(h)
+    assert ("focus", "%1") in provider.calls
+    assert h.cursor.moves == []
+
+
+def test_no_cursor_move_when_it_is_already_in_the_pane(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h, provider = make_pane_controller(make_controller)
+    h.cursor.position = (1500, 900)  # resting in the right pane, focus in the left one
+    settle_mouse(h)
+    look_at_the_right_pane(h)
+    assert ("focus", "%1") in provider.calls
+    assert h.cursor.moves == []
+
+
+def test_our_own_cursor_move_is_not_mouse_use(make_controller: Callable[..., Harness]) -> None:
+    h, provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    look_at_the_right_pane(h)
+    assert h.cursor.moves == [RIGHT_PANE_CENTRE]
+    mouse_before = h.controller._input.last_mouse_activity
+    h.feed(gaze_obs(RIGHT_PANE), 1.0)  # polls see the cursor at its new place
+    assert h.controller._input.last_mouse_activity == mouse_before
+    # So the mouse grace does not hold the next pane switch: back to the left
+    # pane after the cooldown and the dwell, well within the mouse grace (1.5 s).
+    h.feed(gaze_obs(LEFT_PANE), 1.0)
+    assert [c for c in provider.calls if c[0] == "focus"] == [("focus", "%1"), ("focus", "%0")]
+
+
+def test_refused_cursor_moves_count_towards_the_warp_backoff(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h, provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    h.cursor.allow = False
+    look_at_the_right_pane(h)
+    assert ("focus", "%1") in provider.calls  # the focus moved anyway
+    assert h.cursor.moves == [RIGHT_PANE_CENTRE]
+    assert h.controller._warp_refusals == 1
+
+
+def test_remembered_spots_of_closed_panes_and_windows_are_forgotten(
+    make_controller: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h, provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    h.cursor.position = (1700, 300)
+    h.tick()
+    spots = h.controller._pane_cursor
+    [(window, remembered)] = spots.values()
+    assert remembered["%1"] == (1700, 300)
+    # The right pane closes (another one opens): its spot goes.
+    provider.rects = {"%0": Rect(0, 0, 960, 1080), "%2": Rect(960, 0, 960, 1080)}
+    h.feed(gaze_obs(LEFT_PANE), 1.5)
+    assert "%1" not in remembered
+    # The window closes while another one has the focus: its spots go.
+    monkeypatch.setattr(h.platform, "is_window_valid", lambda ref: ref.handle != window.handle)
+    h.platform.foreground = WindowRef(handle=0x99, pid=5, rect=Rect(0, 0, 800, 600))
+    h.tick(0.6)
+    assert h.controller._pane_cursor == {}
+
+
+def test_status_never_carries_titles_or_paths(make_controller: Callable[..., Harness]) -> None:
+    h, _provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    status = h.controller.status()["panes"]
+    assert set(status) == {
+        "enabled",
+        "supported",
+        "provider",
+        "panes",
+        "eligible",
+        "switches",
+        "sigma_px",
+        "failed_providers",
+    }
+    json.dumps(status)  # JSON-safe for `eye-tracker ctl status`
+
+
+def test_denied_apps_are_never_inspected(make_controller: Callable[..., Harness]) -> None:
+    h, provider = make_pane_controller(
+        make_controller, app=AppIdentity("code", "Chrome_WidgetWin_1")
+    )
+    settle_mouse(h)
+    h.feed(gaze_obs(RIGHT_PANE), 3.0)
+    assert provider.calls == []  # not even applies()
+    assert h.controller.status()["panes"]["panes"] == 0
+
+
+@pytest.mark.parametrize("process", ["claude", "chatgpt"])
+def test_desktop_apps_are_inspected_only_when_desktop_apps_is_on(
+    make_controller: Callable[..., Harness], process: str
+) -> None:
+    desktop_app = AppIdentity(process, "Chrome_WidgetWin_1")
+    h, provider = make_pane_controller(make_controller, app=desktop_app)
+    provider.name = "desktop_apps"
+    settle_mouse(h)
+    h.feed(gaze_obs(RIGHT_PANE), 3.0)
+    assert provider.calls == []  # denied: not even applies()
+    on = h.controller.settings.copy()
+    on.panes.desktop_apps = True
+    h.controller.apply_settings(on)
+    h.feed(gaze_obs(RIGHT_PANE), 3.0)
+    assert ("detect", TERMINAL.handle) in provider.calls
+    assert ("focus", "%1") in provider.calls
+
+
+def test_desktop_apps_never_opens_other_chromium_apps(
+    make_controller: Callable[..., Harness],
+) -> None:
+    s = pane_settings()
+    s.panes.desktop_apps = True
+    h, provider = make_pane_controller(
+        make_controller, s, app=AppIdentity("code", "Chrome_WidgetWin_1")
+    )
+    provider.name = "desktop_apps"
+    settle_mouse(h)
+    h.feed(gaze_obs(RIGHT_PANE), 3.0)
+    assert provider.calls == []
+
+
+def test_pane_dwell_raises_the_frame_rate(make_controller: Callable[..., Harness]) -> None:
+    s = pane_settings()
+    s.panes.dwell_ms = 2000
+    h, _provider = make_pane_controller(make_controller, s)
+    settle_mouse(h)
+    h.feed(gaze_obs(LEFT_PANE), 1.0)
+    assert h.controller._pending is False
+    h.feed(gaze_obs(RIGHT_PANE), 0.5)
+    assert h.controller._pending is True
+
+
+def test_no_pane_switching_right_after_a_monitor_switch(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h, provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    h.cursor.position = (2500, 500)  # the user works on the right monitor ...
+    h.tick()
+    settle_mouse(h)
+    h.feed(gaze_obs(RIGHT_PANE), 0.5)  # ... and looks back at the terminal on the left
+    assert h.events["switched"] == [0]
+    # The monitor switch armed the pause (1.5 s): the pane dwell (0.6 s) waits for it.
+    h.feed(gaze_obs(RIGHT_PANE), 1.0)
+    assert "focus" not in provider.names()
+    h.feed(gaze_obs(RIGHT_PANE), 1.5)
+    assert ("focus", "%1") in provider.calls
+
+
+def test_typing_holds_pane_switching(make_controller: Callable[..., Harness]) -> None:
+    h, provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    h.platform.key_idle = 0.0  # typing in the focused pane
+    h.feed(gaze_obs(LEFT_PANE), 1.0)
+    h.platform.key_idle = 1000.0
+    h.feed(gaze_obs(RIGHT_PANE), 2.0)
+    assert "focus" not in provider.names()  # the pane typing grace is 3 s
+    h.feed(gaze_obs(RIGHT_PANE), 1.5)
+    assert ("focus", "%1") in provider.calls
+
+
+def test_turning_split_panes_off_stops_the_worker(make_controller: Callable[..., Harness]) -> None:
+    h, provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    assert h.controller._pane_worker is not None
+    off = h.controller.settings.copy()
+    off.panes.enabled = False
+    h.controller.apply_settings(off)
+    assert h.controller._pane_worker is None
+    provider.calls.clear()
+    h.feed(gaze_obs(RIGHT_PANE), 3.0)
+    assert provider.calls == []
+    on = h.controller.settings.copy()
+    on.panes.enabled = True
+    h.controller.apply_settings(on)
+    h.feed(gaze_obs(RIGHT_PANE), 3.0)
+    assert ("focus", "%1") in provider.calls
+
+
+def test_default_pane_providers_follow_the_settings(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller(pane_settings())
+    registry = h.controller._default_pane_registry(h.controller.settings)
+    # Windows Terminal (UI Automation) is offered on Windows only.
+    expected = (
+        ["wezterm", "windows_terminal", "tmux"] if sys.platform == "win32" else ["wezterm", "tmux"]
+    )
+    assert [p.name for p in registry.providers] == expected
+    # Not started: nothing asked for a window yet, so no thread.
+    assert h.controller._pane_worker is None
+
+
+def test_unsupported_platform_never_starts_split_panes(
+    make_controller: Callable[..., Harness],
+) -> None:
+    platform = FakePlatform()
+    platform.panes_capable = False
+    platform.foreground = TERMINAL
+    platform.apps[TERMINAL.handle] = TERMINAL_APP
+    h = make_controller(pane_settings(), platform=platform)
+    settle_mouse(h)
+    h.feed(gaze_obs(RIGHT_PANE), 2.0)
+    assert h.controller._pane_worker is None
+    assert h.controller.status()["panes"]["supported"] is False
+
+
+def test_results_for_a_window_left_meanwhile_are_ignored(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h, _provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    assert h.controller.status()["panes"]["panes"] == 2
+    h.platform.foreground = WindowRef(handle=0x99, pid=5, rect=Rect(0, 0, 800, 600))
+    h.tick(0.6)  # another window (no known app): its panes are not asked for
+    assert h.controller.status()["panes"]["panes"] == 0
+    stale = DetectResult(TERMINAL.handle, None, 1)
+    h.controller._pane_snapshot = None
+    h.controller._on_pane_detected(stale)
+    assert h.controller._pane_snapshot is None
+
+
+class RecordingPaneWorker(PaneWorker):
+    """Records how it was stopped (``stop`` joins the thread, ``request_stop`` does not)."""
+
+    stops: ClassVar[list[str]] = []
+
+    def stop(self, timeout: float = 3.0) -> None:
+        RecordingPaneWorker.stops.append("stop")
+        super().stop(timeout)
+
+    def request_stop(self) -> None:
+        RecordingPaneWorker.stops.append("request_stop")
+        super().request_stop()
+
+
+def test_turning_split_panes_off_does_not_wait_for_the_worker(
+    make_controller: Callable[..., Harness],
+) -> None:
+    RecordingPaneWorker.stops.clear()
+    h, _provider = make_pane_controller(make_controller, worker_cls=RecordingPaneWorker)
+    settle_mouse(h)
+    off = h.controller.settings.copy()
+    off.panes.enabled = False
+    h.controller.apply_settings(off)  # on the GUI thread: no join
+    assert RecordingPaneWorker.stops == ["request_stop"]
+    on = off.copy()
+    on.panes.enabled = True
+    h.controller.apply_settings(on)
+    settle_mouse(h)
+    assert h.controller._pane_worker is not None
+    h.controller.shutdown()  # quitting waits for a provider call in progress
+    assert RecordingPaneWorker.stops[1:] == ["stop", "request_stop"]
+
+
+def test_a_reused_window_handle_of_another_process_is_another_window(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h, _provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    assert h.platform.names().count("window_app") == 1
+    h.platform.foreground = dataclasses.replace(TERMINAL, pid=31337)
+    h.tick(0.6)
+    # Identified again (and with it the deny-list checked again), panes asked again.
+    assert h.platform.names().count("window_app") == 2
+    assert h.controller._pane_window is not None
+    assert h.controller._pane_window.pid == 31337
+
+
+def test_detections_from_before_a_provider_swap_are_dropped(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h, _provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    snapshot = h.controller._pane_snapshot
+    assert snapshot is not None
+    before = h.controller._pane_last_request
+    swapped = h.controller.settings.copy()
+    swapped.panes.tmux = False  # another set of providers
+    h.controller.apply_settings(swapped)
+    assert h.controller._pane_snapshot is None
+    # An answer to a request made with the old providers arrives late: ignored.
+    h.controller._on_pane_detected(DetectResult(TERMINAL.handle, snapshot, before))
+    assert h.controller._pane_snapshot is None
+    # The next request's answer counts.
+    h.controller._on_pane_detected(DetectResult(TERMINAL.handle, snapshot, before + 1))
+    assert h.controller._pane_snapshot is snapshot
+
+
+def test_trace_records_pane_decisions(
+    make_controller: Callable[..., Harness], tmp_path: Any
+) -> None:
+    path = tmp_path / "trace.jsonl"
+    h, _provider = make_pane_controller(make_controller, trace_path=path)
+    settle_mouse(h)
+    h.feed(gaze_obs(RIGHT_PANE), 1.0)
+    h.controller.shutdown()
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    reasons = [r.get("pane_reason") for r in rows if "pane_reason" in r]
+    assert "dwell" in reasons
+    assert "switch" in reasons
+    fired = next(r for r in rows if r.get("pane_reason") == "switch")
+    assert fired["pane_target"] == "%1"
+    assert fired["n_panes"] == 2

@@ -54,7 +54,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from .. import __version__
-from ..types import Rect, WindowRef
+from ..types import AppIdentity, Rect, WindowRef
 from .base import PlatformServices
 
 log = logging.getLogger(__name__)
@@ -622,6 +622,7 @@ class MacPlatform(PlatformServices):
 
     def capabilities(self) -> dict[str, bool]:
         quartz = self._mod("Quartz") is not None
+        focus = self._mod("AppKit") is not None and self._mod("ApplicationServices") is not None
         return {
             "lock": _IS_MACOS,
             "display_off": _IS_MACOS and _tool("pmset") is not None,
@@ -629,11 +630,11 @@ class MacPlatform(PlatformServices):
             "input_idle": quartz,
             "key_idle": quartz,
             "session_locked": quartz,
-            "focus": self._mod("AppKit") is not None
-            and self._mod("ApplicationServices") is not None,
+            "focus": focus,
             "cursor": True,
             "camera_in_use": False,
             "hotkeys": _IS_MACOS,
+            "panes": focus,
         }
 
     # ---------------------------------------------------------- session/power
@@ -999,6 +1000,29 @@ class MacPlatform(PlatformServices):
         # Application-level handle, or a hung app: the window list still knows
         # where its front window is.
         return self._cg_front_rect(pid)
+
+    def window_client_rect(self, ref: WindowRef) -> Rect | None:
+        """The window frame: Accessibility has no portable content-area attribute,
+        and the title bar's height depends on the app (none in full screen)."""
+        return self.window_rect(ref)
+
+    def window_app(self, ref: WindowRef) -> AppIdentity | None:
+        pid, _window = _split_handle(ref.handle)
+        pid = pid if pid is not None else ref.pid
+        if pid is None or pid <= 0:
+            return None
+        name = self._app_process_name(pid)
+        if name is None:
+            return None
+        bundle = ""
+        appkit = self._mod("AppKit")
+        if appkit is not None:
+            try:
+                app = appkit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+                bundle = str(app.bundleIdentifier() or "") if app is not None else ""
+            except Exception as exc:
+                log.debug("bundleIdentifier failed: %s", exc)
+        return AppIdentity(process=name, app_id=bundle)
 
     def same_window(self, a: WindowRef | None, b: WindowRef | None) -> bool:
         if a is None or b is None:

@@ -80,7 +80,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar, NamedTuple, Protocol, TypeVar
 
-from ..types import Rect, WindowRef
+from ..types import AppIdentity, Rect, WindowRef
 from .base import PlatformServices
 
 log = logging.getLogger(__name__)
@@ -773,6 +773,20 @@ class _EwmhClient:
     def rect(self, wid: int) -> Rect | None:
         return self._call(lambda: self._frame_rect(self._window(wid)), None)
 
+    def client_rect(self, wid: int) -> Rect | None:
+        return self._call(lambda: self._client_rect(self._window(wid)), None)
+
+    def app_class(self, wid: int) -> tuple[int | None, str] | None:
+        """``(pid, WM_CLASS class)`` of a window; ``None`` when X is unreachable."""
+
+        def query() -> tuple[int | None, str]:
+            win = self._window(wid)
+            wm_class = win.get_wm_class()
+            name = str(wm_class[1]) if wm_class and len(wm_class) > 1 else ""
+            return self._pid(win), name
+
+        return self._call(query, None)
+
     def is_valid(self, wid: int) -> bool:
         return bool(self._call(lambda: self._eligible(self._window(wid)), False))
 
@@ -938,6 +952,20 @@ class _EwmhClient:
             left, right, top, bottom = frame[:4]
             x, y, w, h = x - left, y - top, w + left + right, h + top + bottom
         shadow = self._prop(win, "_GTK_FRAME_EXTENTS")  # invisible CSD shadow margins
+        if shadow and len(shadow) >= 4:
+            left, right, top, bottom = shadow[:4]
+            x, y, w, h = x + left, y + top, w - left - right, h - top - bottom
+        if w <= 0 or h <= 0:
+            return None
+        return Rect(x, y, w, h)
+
+    def _client_rect(self, win: Any) -> Rect | None:
+        """The client window without WM decorations and without CSD shadows."""
+        geometry = win.get_geometry()
+        origin = self._root.translate_coords(win, 0, 0)
+        x, y = int(origin.x), int(origin.y)
+        w, h = int(geometry.width), int(geometry.height)
+        shadow = self._prop(win, "_GTK_FRAME_EXTENTS")
         if shadow and len(shadow) >= 4:
             left, right, top, bottom = shadow[:4]
             x, y, w, h = x + left, y + top, w - left - right, h - top - bottom
@@ -1704,6 +1732,8 @@ class LinuxPlatform(PlatformServices):
                 "camera_in_use": self._proc_root.is_dir(),
                 # Same rule as platform.hotkeys: X11 key grabs (also through XWayland).
                 "hotkeys": has_display and xlib,
+                # Needs the focused window and its geometry, like "focus".
+                "panes": x11 and xlib,
             }
         except Exception:
             log.debug("capability probe failed", exc_info=True)
@@ -2359,6 +2389,28 @@ class LinuxPlatform(PlatformServices):
         if wid is None or not self._x11_session():
             return None
         return self._ewmh.rect(wid)
+
+    def window_client_rect(self, ref: WindowRef) -> Rect | None:
+        wid = _as_xid(ref.handle)
+        if wid is None or not self._x11_session():
+            return None
+        return self._ewmh.client_rect(wid)
+
+    def window_app(self, ref: WindowRef) -> AppIdentity | None:
+        wid = _as_xid(ref.handle)
+        if wid is None or not self._x11_session():
+            return None
+        found = self._ewmh.app_class(wid)
+        if found is None:
+            return None
+        pid, wm_class = found
+        pid = pid if pid is not None else ref.pid
+        if ref.pid is not None and pid != ref.pid:
+            return None  # the id now belongs to another client's window
+        name = self._app_process_name(pid)
+        if name is None:
+            return None
+        return AppIdentity(process=name, app_id=wm_class)
 
     # ----------------------------------------------------------------- camera
     def camera_in_use_by_other_app(self) -> bool | None:

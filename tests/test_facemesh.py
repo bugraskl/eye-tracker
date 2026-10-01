@@ -6,11 +6,12 @@ drawn cartoon faces (``face_drawing.py``), which the landmark network accepts.
 
 from __future__ import annotations
 
+import itertools
 import math
 import os
 import shutil
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import cv2
@@ -850,21 +851,51 @@ def test_a_background_face_is_not_tried_when_the_user_cannot_be_read(
 
 
 # ------------------------------------------------------- head roll (r2-vision-05)
-def test_a_strongly_rolled_face_is_acquired(
-    backend: FaceMeshBackend, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """YuNet's eye points barely follow head roll; a seed far off is retried rotated."""
-    frame = draw_face()
+def _misjudging_yunet(monkeypatch: pytest.MonkeyPatch, degrees: float) -> Callable[..., Roi]:
+    """Make YuNet's seeds ``degrees`` off in roll."""
 
     def misjudged(face: np.ndarray) -> Roi:
         seed = roi_from_detection(face)
-        return Roi(seed.cx, seed.cy, seed.side, seed.angle + 90.0)
+        return Roi(seed.cx, seed.cy, seed.side, seed.angle + degrees)
 
     monkeypatch.setattr(fm, "roi_from_detection", misjudged)
+    return misjudged
+
+
+@pytest.mark.parametrize("degrees", [50.0, -50.0, 85.0, -85.0])
+def test_a_strongly_rolled_face_is_acquired(
+    backend: FaceMeshBackend, monkeypatch: pytest.MonkeyPatch, degrees: float
+) -> None:
+    """YuNet's eye points barely follow head roll (a 55° roll reads as about 5°); a
+    seed that far off is retried rotated. Turned by 45°, a seed 85° off is still
+    40° off and reads doubtfully, but the crop its landmarks ask for is close."""
+    frame = draw_face()
+    truth = _features(frame)
+    misjudged = _misjudging_yunet(monkeypatch, degrees)
     assert backend._infer(frame, misjudged(backend._detect(frame, fm.DETECT_WIDTH)[0])) is None
-    got = [backend.process(frame, 1.0 + 0.25 * i).usable for i in range(3)]
-    assert got[0]
-    assert all(got)
+    rolls = []
+    for i in range(3):
+        obs = backend.process(frame, 1.0 + 0.25 * i)
+        assert obs.usable
+        assert obs.features is not None
+        rolls.append(obs.features[ROLL])
+    assert rolls[0] == pytest.approx(truth[ROLL], abs=8.0)
+    assert rolls[-1] == pytest.approx(truth[ROLL], abs=2.0)
+
+
+def test_a_seed_far_off_is_not_turned_into_an_upside_down_fit(
+    backend: FaceMeshBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A seed 90° off was retried turned by 45° either way: the crop 135° off passed
+    with a logit of 2.4, and the passes that followed converged on an upside-down
+    fit (roll -177° for an upright face) with quality 1.0."""
+    frame = draw_face()
+    _misjudging_yunet(monkeypatch, 90.0)
+    for i in range(3):
+        obs = backend.process(frame, 1.0 + 0.25 * i)
+        assert obs.face_count == 1
+        if obs.features is not None:
+            assert abs(obs.features[ROLL]) < 20.0
 
 
 def test_rotated_retries_are_rate_limited(
@@ -889,6 +920,172 @@ def test_rotated_retries_are_rate_limited(
     retries = [i for i, n in enumerate(per_frame) if n == 3]
     assert retries == [0, round(fm.ROLL_RETRY_PERIOD_S / 0.25)]
     assert all(n == 1 for i, n in enumerate(per_frame) if i not in retries)
+
+
+def test_rotated_retries_take_only_a_confident_fit(
+    backend: FaceMeshBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A face the network rejects upright can pass turned by 45° with a doubtful fit.
+
+    Measured on a photo with a hand over the mouth: a logit of 2-4 and a fit
+    30-45° off in roll and yaw, reported with quality 1.0. Since such a retry
+    "helped", it was not rate-limited either: five inferences on every frame.
+    The network rejects the crop such a fit asks for, unlike that of a face
+    turned further than the retry turned the crop.
+    """
+    frame = draw_face()
+    seed = roi_from_detection(backend._detect(frame, fm.DETECT_WIDTH)[0])
+    upright = backend._infer(frame, seed)
+    assert upright is not None
+    points = upright[0]
+    calls: list[Roi] = []
+
+    def hand_over_the_mouth(_frame: np.ndarray, roi: Roi) -> tuple[np.ndarray, float] | None:
+        calls.append(roi)
+        turned = abs(roi.angle - seed.angle) > 30.0
+        return (points, 3.0) if turned else None
+
+    monkeypatch.setattr(backend, "_infer", hand_over_the_mouth)
+    per_frame = []
+    t = 1.0
+    while t < 1.0 + fm.ROLL_RETRY_PERIOD_S - 0.1:
+        before = len(calls)
+        obs = backend.process(frame, t)
+        per_frame.append(len(calls) - before)
+        assert obs.face_count == 1  # someone is there ...
+        assert obs.features is None  # ... but nothing trustworthy for gaze
+        t += 0.25
+    # The seed, turned either way and the crop the doubtful fit asks for ...
+    assert per_frame[0] == 4
+    assert all(n == 1 for n in per_frame[1:])  # ... and not again before the back-off
+
+
+def test_a_doubtful_fit_does_not_count_as_settled(
+    backend: FaceMeshBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The motion gate repeated such a fit (a hand coming over the face, 5° off) for
+    seconds, although the next pass on the very same picture rejected it."""
+    frame = draw_face()
+    _run(backend, frame)
+    assert backend.settled
+    infer = backend._infer
+
+    def doubtful(frame: np.ndarray, roi: Roi) -> tuple[np.ndarray, float] | None:
+        result = infer(frame, roi)
+        return None if result is None else (result[0], fm.CONFIDENT_LOGIT - 5.0)
+
+    monkeypatch.setattr(backend, "_infer", doubtful)
+    for i in range(fm.MAX_UNSETTLED_FRAMES - 1):
+        assert backend.process(frame, 1.2 + 0.05 * i).usable
+        assert not backend.settled
+    # Bounded, so that a face that always reads doubtfully cannot defeat the gate.
+    backend.process(frame, 1.4)
+    assert backend.settled
+
+
+@pytest.mark.parametrize("max_faces", [1, 2])
+def test_a_stronger_face_read_doubtfully_does_not_take_over(
+    backend: FaceMeshBackend, monkeypatch: pytest.MonkeyPatch, max_faces: int
+) -> None:
+    """A larger face with a hand over its eyes (logit 3.3) or half out of the frame
+    (0.4-4.1) took the gaze control from a user tracked with a logit of 22, for
+    good: it kept clearing the presence threshold on every frame."""
+    backend.set_max_faces(max_faces)
+    user = draw_face(cx=180, scale=0.6)
+    assert _run(backend, user).usable
+    infer = backend._infer
+
+    def doubtful_to_the_right(frame: np.ndarray, roi: Roi) -> tuple[np.ndarray, float] | None:
+        result = infer(frame, roi)
+        if result is None or roi.cx < 320:
+            return result
+        return result[0], fm.CONFIDENT_LOGIT - 5.0
+
+    monkeypatch.setattr(backend, "_infer", doubtful_to_the_right)
+    both = draw_face(user, cx=460, scale=1.0)
+    for i in range(12):
+        obs = backend.process(both, 2.0 + 0.25 * i)
+        assert obs.usable
+        assert obs.face_box is not None
+        assert obs.face_box[0] < 0.5
+
+
+@pytest.mark.parametrize("max_faces", [1, 2])
+def test_a_rejected_stronger_face_is_not_retried_at_every_count(
+    backend: FaceMeshBackend, monkeypatch: pytest.MonkeyPatch, max_faces: int
+) -> None:
+    """With the guard on, every count (each GUARD_PERIOD_S) tried it again: an extra
+    inference on every other frame at 4 fps, on every frame at 2 fps."""
+    backend.set_max_faces(max_faces)
+    user = draw_face(cx=180, scale=0.6)
+    assert _run(backend, user).usable
+    infer = backend._infer
+    tries: list[float] = []
+
+    def blind_to_the_right(frame: np.ndarray, roi: Roi) -> tuple[np.ndarray, float] | None:
+        if roi.cx > 320:
+            tries.append(now)
+            return None
+        return infer(frame, roi)
+
+    monkeypatch.setattr(backend, "_infer", blind_to_the_right)
+    both = draw_face(user, cx=460, scale=1.0)
+    now = 2.0
+    while now < 2.0 + 3 * fm.PRIMARY_CHECK_S:
+        obs = backend.process(both, now)
+        assert obs.usable
+        now += 0.25
+    assert len(tries) == 3
+    assert all(b - a >= fm.PRIMARY_CHECK_S for a, b in itertools.pairwise(tries))
+
+
+def test_a_background_face_does_not_take_over_while_the_user_is_unreadable(
+    backend: FaceMeshBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user drinking, a hand over the face, turned away: a comparable face in the
+    background was tried and kept the gaze control until the next primary check."""
+    background = draw_face(cx=150, cy=200, scale=0.7)
+    scene = draw_face(background, cx=440, scale=1.0)
+    faces = backend._detect(scene, fm.DETECT_WIDTH)
+    assert len(faces) == 2
+    scores = sorted(fm._det_score(face, 640, 480) for face in faces)
+    assert scores[0] >= fm.SEED_CANDIDATE_MIN_RATIO * scores[1]  # a runner-up
+    for i in range(3):
+        obs = backend.process(scene, 1.0 + 0.25 * i)
+        assert obs.usable
+        assert obs.face_box is not None
+        assert obs.face_box[0] > 0.5
+    infer = backend._infer
+
+    def blind_to_the_user(frame: np.ndarray, roi: Roi) -> tuple[np.ndarray, float] | None:
+        return None if roi.cx > 320 else infer(frame, roi)
+
+    monkeypatch.setattr(backend, "_infer", blind_to_the_user)
+    for i in range(12):  # three seconds
+        obs = backend.process(scene, 2.0 + 0.25 * i)
+        assert obs.features is None
+        assert obs.face_count == 1  # the user is there, nothing usable for gaze
+        assert obs.face_box is not None
+        assert obs.face_box[0] > 0.5  # the user's box, not the background face's
+    monkeypatch.setattr(backend, "_infer", infer)
+    obs = backend.process(scene, 5.0)
+    assert obs.usable
+    assert obs.face_box is not None
+    assert obs.face_box[0] > 0.5
+
+
+def test_a_background_face_takes_over_when_the_user_has_gone(
+    backend: FaceMeshBackend,
+) -> None:
+    """Holding on to an unreadable user does not hold on to an empty chair."""
+    background = draw_face(cx=150, cy=200, scale=0.7)
+    scene = draw_face(background, cx=440, scale=1.0)
+    for i in range(3):
+        assert backend.process(scene, 1.0 + 0.25 * i).usable
+    obs = backend.process(background, 2.0)
+    assert obs.usable
+    assert obs.face_box is not None
+    assert obs.face_box[0] < 0.5
 
 
 def test_blink_threshold_is_exposed(backend: FaceMeshBackend) -> None:
@@ -967,6 +1164,48 @@ def test_real_face_after_a_posture_shift(face_image: Path) -> None:
     assert obs.features[YAW] == pytest.approx(truth[YAW], abs=2.0)
     assert obs.features[PITCH] == pytest.approx(truth[PITCH], abs=2.0)
     assert obs.features[IRIS_H] == pytest.approx(truth[IRIS_H], abs=0.02)
+
+
+def test_real_face_half_out_of_the_picture_does_not_take_over(face_image: Path) -> None:
+    """A larger face, half of it outside the picture, read with a presence logit of
+    0.4-4.1 on the maintainers' photo, took the gaze control from the user for good
+    (and cost two to three inferences per frame from then on)."""
+    photo = _photo_frame(face_image)
+    instance = FaceMeshBackend()
+    try:
+        faces = instance._detect(photo, fm.DETECT_WIDTH)
+        assert faces
+        x, y, w, h = (float(v) for v in max(faces, key=fm._det_side)[:4])
+
+        def paste(canvas: np.ndarray, cx: float, cy: float, side: float) -> None:
+            """The photo's face, ``side`` pixels high, centred at ``(cx, cy)``."""
+            s = side / max(w, h)
+            m = np.array([[s, 0.0, cx - s * (x + w / 2)], [0.0, s, cy - s * (y + h / 2)]])
+            warped = cv2.warpAffine(photo, m, (canvas.shape[1], canvas.shape[0]))
+            mask = np.zeros(canvas.shape[:2], np.uint8)
+            cv2.circle(mask, (round(cx), round(cy)), round(0.9 * side), 255, -1)
+            canvas[mask > 0] = warped[mask > 0]
+
+        user = np.full((480, 640, 3), 128, np.uint8)
+        paste(user, 190.0, 250.0, 120.0)
+        both = user.copy()
+        paste(both, 640.0, 240.0, 240.0)
+        others = [f for f in instance._detect(both, fm.DETECT_WIDTH) if f[0] + f[2] / 2 > 450]
+        if not others:
+            pytest.skip("YuNet does not find this photo's face half out of the picture")
+        seed = roi_from_detection(max(others, key=fm._det_side))
+        read = instance._infer(both, seed) if seed.valid(640, 480) else None
+        if read is not None and read[1] >= fm.CONFIDENT_LOGIT:
+            pytest.skip("the network reads this photo's half face confidently")
+        for i in range(3):
+            assert instance.process(user, 1.0 + 0.25 * i).usable
+        for i in range(12):
+            obs = instance.process(both, 2.0 + 0.25 * i)
+            assert obs.usable
+            assert obs.face_box is not None
+            assert obs.face_box[0] + obs.face_box[2] / 2 < 0.5
+    finally:
+        instance.close()
 
 
 @pytest.mark.parametrize("degrees", [55.0, 60.0, -60.0])

@@ -198,6 +198,15 @@ def _norm_path(path: str) -> str:
     return ntpath.normcase(ntpath.normpath(path))
 
 
+def _real_path(path: str) -> str | None:
+    """``path`` with links and packaged-app file redirection resolved; ``None`` on error."""
+    try:
+        real = os.path.realpath(path)
+    except (OSError, ValueError):
+        return None
+    return real.removeprefix("\\\\?\\")
+
+
 def _unix_to_filetime(seconds: float) -> int:
     """Unix time (seconds, as psutil reports it) as a ``FILETIME`` tick count."""
     return int((seconds + FILETIME_UNIX_OFFSET_S) * FILETIME_TICKS_PER_S)
@@ -1161,6 +1170,12 @@ class WindowsPlatform(PlatformServices):
                 candidates.append(self._api.process_image_path())
             except Exception:
                 log.debug("Could not read the process image path", exc_info=True)
+            # Started from a packaged (MSIX) app, such as a terminal inside
+            # another app, this process sees redirected paths (``AppData\Roaming``)
+            # while the consent store records the real file under
+            # ``AppData\Local\Packages\<family>\LocalCache``. Resolving the path
+            # through the file system gives that real location.
+            candidates += [_real_path(p) for p in candidates if p]
             self._own_paths = frozenset(_norm_path(p) for p in candidates if p)
         return self._own_paths
 

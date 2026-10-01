@@ -1060,6 +1060,35 @@ class TestCamera:
         assert windows._norm_path(r"D:\venv\Scripts\python.exe") in own
         assert windows._norm_path(r"C:\Base\Python312\python.exe") in own
 
+    def test_redirected_interpreter_of_a_packaged_parent_is_own(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Started from inside an MSIX app, the consent store records the real path."""
+        virtual = r"C:\Users\me\AppData\Roaming\uv\python\cpython-3.12\python.exe"
+        real = (
+            r"C:\Users\me\AppData\Local\Packages\Host_abc\LocalCache"
+            r"\Roaming\uv\python\cpython-3.12\python.exe"
+        )
+        monkeypatch.setattr(windows.sys, "executable", virtual)
+        monkeypatch.setattr(windows.sys, "_base_executable", virtual, raising=False)
+        monkeypatch.setattr(
+            windows.os.path, "realpath", lambda p: "\\\\?\\" + real if p == virtual else p
+        )
+        api = FakeWin32([])
+        api.image_path = virtual
+        plat = make_platform(api)
+        key = real.replace("\\", "#")
+        assert plat._is_own_camera_user(windows._CameraUser(key, packaged=False, start=1))
+
+    def test_unresolvable_path_is_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def broken(path: str) -> str:
+            raise OSError("gone")
+
+        monkeypatch.setattr(windows.sys, "executable", r"D:\venv\Scripts\python.exe")
+        monkeypatch.setattr(windows.os.path, "realpath", broken)
+        own = make_platform(FakeWin32([]))._own_executables()
+        assert windows._norm_path(r"D:\venv\Scripts\python.exe") in own
+
 
 class TestPermissions:
     @pytest.mark.parametrize(

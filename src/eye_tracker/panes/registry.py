@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import sys
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
@@ -105,11 +106,12 @@ class PaneRegistry:
         return next((p for p in self._providers if p.name == name), None)
 
 
-#: Optional providers implemented in their own module: (setting, module, class).
-#: A slot whose module does not exist yet is skipped. The class is created with
-#: ``client_rect=`` and ``runner=`` like the built-in ones.
-_OPTIONAL_PROVIDERS: tuple[tuple[str, str, str], ...] = (
-    ("windows_terminal", "windows_terminal", "WindowsTerminalProvider"),
+#: Optional providers implemented in their own module: (setting, module, class,
+#: platforms (``sys.platform`` values) it runs on). A slot whose module does not
+#: exist is skipped. The class is created with ``client_rect=`` and ``runner=``
+#: like the built-in ones, and must not touch the system before it is used.
+_OPTIONAL_PROVIDERS: tuple[tuple[str, str, str, frozenset[str]], ...] = (
+    ("windows_terminal", "windows_terminal", "WindowsTerminalProvider", frozenset({"win32"})),
 )
 
 
@@ -118,8 +120,9 @@ def default_providers(
     *,
     client_rect: Callable[[WindowRef], Rect | None],
     runner: CommandRunner | None = None,
+    system: str = sys.platform,
 ) -> list[PaneProvider]:
-    """The providers the settings enable, most specific first.
+    """The providers the settings enable for ``system``, most specific first.
 
     ``client_rect`` is ``PlatformServices.window_client_rect`` (panes are mapped
     onto the content area); ``runner`` runs the terminals' command-line tools
@@ -134,8 +137,10 @@ def default_providers(
     if settings.wezterm:
         # Before tmux: inside WezTerm its own panes are what the user sees split.
         providers.append(WezTermProvider(client_rect=client_rect, runner=run))
-    for setting, module_name, class_name in _OPTIONAL_PROVIDERS:
-        if not getattr(settings, setting, False):
+    # Before tmux too: with two or more Windows Terminal panes, those are the split
+    # the user sees; with one, tmux running in it gets its turn.
+    for setting, module_name, class_name, platforms in _OPTIONAL_PROVIDERS:
+        if not getattr(settings, setting, False) or system not in platforms:
             continue
         provider = _optional_provider(module_name, class_name, client_rect, run)
         if provider is not None:
@@ -154,7 +159,8 @@ def _optional_provider(
     try:
         module = importlib.import_module(f"{__package__}.providers.{module_name}")
     except ImportError:
-        return None  # not implemented yet
+        log.debug("Pane provider module %s not available", module_name, exc_info=True)
+        return None
     try:
         cls = getattr(module, class_name)
         provider: PaneProvider = cls(client_rect=client_rect, runner=runner)

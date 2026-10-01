@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import sys
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -3011,7 +3012,11 @@ def test_default_pane_providers_follow_the_settings(
 ) -> None:
     h = make_controller(pane_settings())
     registry = h.controller._default_pane_registry(h.controller.settings)
-    assert [p.name for p in registry.providers] == ["wezterm", "tmux"]
+    # Windows Terminal (UI Automation) is offered on Windows only.
+    expected = (
+        ["wezterm", "windows_terminal", "tmux"] if sys.platform == "win32" else ["wezterm", "tmux"]
+    )
+    assert [p.name for p in registry.providers] == expected
     # Not started: nothing asked for a window yet, so no thread.
     assert h.controller._pane_worker is None
 

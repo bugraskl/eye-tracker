@@ -103,13 +103,21 @@ def _area(ref: WindowRef) -> Rect | None:
 
 def test_default_providers_follow_the_settings() -> None:
     settings = PaneSettings()
-    names = [p.name for p in default_providers(settings, client_rect=_area, runner=FakeRunner())]
-    # Windows Terminal has a settings switch but no provider yet: its slot is skipped.
-    assert names == ["wezterm", "tmux"]
+
+    def names(system: str) -> list[str]:
+        found = default_providers(settings, client_rect=_area, runner=FakeRunner(), system=system)
+        return [p.name for p in found]
+
+    # Windows Terminal is asked through UI Automation: on Windows only.
+    assert names("win32") == ["wezterm", "windows_terminal", "tmux"]
+    assert names("linux") == ["wezterm", "tmux"]
+    assert names("darwin") == ["wezterm", "tmux"]
+    settings.windows_terminal = False
+    assert names("win32") == ["wezterm", "tmux"]
     settings.wezterm = False
-    assert [p.name for p in default_providers(settings, client_rect=_area)] == ["tmux"]
+    assert names("win32") == ["tmux"]
     settings.tmux = False
-    assert default_providers(settings, client_rect=_area) == []
+    assert names("win32") == []
 
 
 def test_an_available_optional_provider_takes_its_slot(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -126,11 +134,11 @@ def test_an_available_optional_provider_takes_its_slot(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(registry_module, "_optional_provider", fake_optional)
     settings = PaneSettings()
-    names = [p.name for p in default_providers(settings, client_rect=_area)]
+    names = [p.name for p in default_providers(settings, client_rect=_area, system="win32")]
     assert names == ["wezterm", "windows_terminal", "tmux"]
     settings.windows_terminal = False
     assert "windows_terminal" not in [
-        p.name for p in default_providers(settings, client_rect=_area)
+        p.name for p in default_providers(settings, client_rect=_area, system="win32")
     ]
 
 

@@ -65,7 +65,7 @@ class PaneProvider(Protocol):
     Providers run on the pane worker's thread (:mod:`.worker`), never on the GUI
     thread, and may block for at most their command timeout. They must never
     synthesise input: they talk to the terminal or multiplexer through its own
-    command-line interface (or, later, accessibility APIs).
+    command-line interface or an accessibility API (UI Automation).
     """
 
     #: Short name (``"tmux"``) used in logs, ``status`` and the trace.

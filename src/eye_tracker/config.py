@@ -177,7 +177,7 @@ class PaneSettings:
         "Only panes large enough for your calibration's accuracy take part.",
     )
     dwell_ms: int = _opt(
-        600, lo=100, hi=5000, doc="How long you must look at another pane before it gets focus."
+        400, lo=100, hi=5000, doc="How long you must look at another pane before it gets focus."
     )
     typing_grace_ms: int = _opt(
         3000, lo=0, hi=20000, doc="No pane switching for this long after you type."

@@ -262,7 +262,7 @@ def test_split_panes_are_experimental_and_off_by_default() -> None:
     panes = Settings().panes
     assert panes.enabled is False
     assert (panes.dwell_ms, panes.precision, panes.hysteresis, panes.min_pane_px) == (
-        600,
+        400,
         2.5,
         0.5,
         240,

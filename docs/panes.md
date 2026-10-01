@@ -51,7 +51,7 @@ from their saved samples the first time it is needed.
    for fewer surprises, lower it to include smaller panes.
 3. **Past the divider.** The gaze must be `panes.hysteresis` (half of your gaze error) past the
    divider between the two panes.
-4. **A steady look.** For `panes.dwell_ms` (0.6 s), at least 80 % of the gaze samples must be on the
+4. **A steady look.** For `panes.dwell_ms` (0.4 s), at least 80 % of the gaze samples must be on the
    new pane. A stray sample does not restart the wait.
 5. **Not while you work.** No pane switch for 3 s after you type (`panes.typing_grace_ms`), for the
    mouse grace of the switching settings after you use the mouse, for 1 s after the previous pane

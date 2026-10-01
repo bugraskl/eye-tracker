@@ -57,26 +57,58 @@ def test_process_basename(raw: str, name: str) -> None:
     assert process_basename(raw) == name
 
 
-def test_process_names_are_cached_per_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+class FakeProcessTable:
+    """``psutil.Process`` over a table ``pid -> (create_time, name)``; counts name reads."""
+
+    def __init__(self, table: dict[int, tuple[float, str]]) -> None:
+        self.table = table
+        self.name_reads: list[int] = []
+        owner = self
+
+        class FakeProcess:
+            def __init__(self, pid: int) -> None:
+                import psutil
+
+                if pid not in owner.table:
+                    raise psutil.NoSuchProcess(pid)
+                self.pid = pid
+
+            def create_time(self) -> float:
+                return owner.table[self.pid][0]
+
+            def name(self) -> str:
+                owner.name_reads.append(self.pid)
+                return owner.table[self.pid][1]
+
+        self.Process = FakeProcess
+
+
+def test_process_names_are_cached_per_process(monkeypatch: pytest.MonkeyPatch) -> None:
     import psutil
 
-    calls: list[int] = []
-
-    class FakeProcess:
-        def __init__(self, pid: int) -> None:
-            calls.append(pid)
-            if pid == 404:
-                raise psutil.NoSuchProcess(pid)
-
-        def name(self) -> str:
-            return "WezTerm-GUI.exe"
-
-    monkeypatch.setattr(psutil, "Process", FakeProcess)
+    procs = FakeProcessTable({7: (1000.0, "WezTerm-GUI.exe")})
+    monkeypatch.setattr(psutil, "Process", procs.Process)
     services = PlatformServices()
     assert services._app_process_name(7) == "wezterm-gui"
     assert services._app_process_name(7) == "wezterm-gui"
-    assert calls == [7]
+    assert procs.name_reads == [7]  # the second answer came from the cache
     assert services._app_process_name(404) is None
     assert services._app_process_name(None) is None
     assert services._app_process_name(0) is None
-    assert calls == [7, 404]
+
+
+def test_a_reused_pid_is_not_taken_for_the_process_that_quit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Claude app quit and its pid went to VS Code: VS Code must not pass as Claude."""
+    import psutil
+
+    procs = FakeProcessTable({4242: (1000.0, "claude.exe")})
+    monkeypatch.setattr(psutil, "Process", procs.Process)
+    services = PlatformServices()
+    assert services._app_process_name(4242) == "claude"
+    procs.table[4242] = (1500.0, "Code.exe")  # same pid, another process
+    assert services._app_process_name(4242) == "code"
+    del procs.table[4242]  # gone: nothing is answered from the cache
+    assert services._app_process_name(4242) is None
+    assert len(services._app_names) == 1  # the old entry was replaced, not kept

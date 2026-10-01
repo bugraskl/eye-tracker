@@ -158,32 +158,45 @@ class PlatformServices:
         return None
 
     def _app_process_name(self, pid: int | None) -> str | None:
-        """Lower-cased executable name of ``pid`` without its extension, cached per pid.
+        """Lower-cased executable name of ``pid`` without its extension.
 
-        Shared by the implementations of :meth:`window_app`. A pid whose process
-        has gone is not cached; the cache is bounded.
+        Shared by the implementations of :meth:`window_app`. Names are cached by
+        ``(pid, process creation time)``: the operating system reuses the pid of
+        a process that quit, and a cache keyed by the pid alone would give a new
+        process (VS Code, a browser) the name of the old one (an app that may be
+        inspected). The creation time is read on every call; a process that has
+        gone, or whose creation time cannot be read, is not cached. The cache
+        is bounded.
         """
         if pid is None or pid <= 0:
             return None
-        cache: dict[int, str] | None = getattr(self, "_app_names", None)
+        cache: dict[tuple[int, float], str] | None = getattr(self, "_app_names", None)
         if cache is None:
             cache = {}
             self._app_names = cache
-        name = cache.get(pid)
-        if name is not None:
-            return name
         try:
             import psutil
 
-            raw = str(psutil.Process(pid).name() or "")
+            process = psutil.Process(pid)
+            created = float(process.create_time())
+        except Exception:
+            return None
+        key = (pid, created)
+        name = cache.get(key)
+        if name is not None:
+            return name
+        try:
+            raw = str(process.name() or "")
         except Exception:
             return None
         name = process_basename(raw)
         if not name:
             return None
+        for old in [k for k in cache if k[0] == pid]:
+            del cache[old]  # an earlier process with this pid
         if len(cache) >= _APP_NAME_CACHE_SIZE:
             cache.pop(next(iter(cache)))
-        cache[pid] = name
+        cache[key] = name
         return name
 
     def same_window(self, a: WindowRef | None, b: WindowRef | None) -> bool:

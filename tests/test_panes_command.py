@@ -99,6 +99,8 @@ def test_process_tree_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_window_key() -> None:
-    assert window_key(WindowRef(handle=12)) == 12
+    assert window_key(WindowRef(handle=12, pid=3)) == (12, 3)
+    # A handle reused by another process's window is another window.
+    assert window_key(WindowRef(handle=12, pid=4)) != window_key(WindowRef(handle=12, pid=3))
     unhashable = WindowRef(handle=[1, 2])
-    assert window_key(unhashable) == id(unhashable.handle)
+    assert window_key(unhashable) == (id(unhashable.handle), None)

@@ -67,12 +67,13 @@ def run_command(argv: Sequence[str], timeout: float = COMMAND_TIMEOUT_S) -> Comm
 
 
 def window_key(ref: WindowRef) -> object:
-    """A dictionary key for the window of ``ref`` (its handle when hashable)."""
+    """A dictionary key for the window of ``ref``: its handle (when hashable) and
+    its process id, so a handle reused by another process's window is another key."""
     try:
         hash(ref.handle)
     except TypeError:
-        return id(ref.handle)
-    return ref.handle
+        return (id(ref.handle), ref.pid)
+    return (ref.handle, ref.pid)
 
 
 def executable_of(pid: int) -> str | None:

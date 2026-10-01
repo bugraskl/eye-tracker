@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
 ## [0.1.0] - 2026-10-01
 
 ### Added
@@ -52,4 +54,5 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - A privacy gate that fails CI on networking or frame-writing code and scans every bundled native
   library and Python module of the release builds.
 
+[Unreleased]: https://github.com/bugraskl/eye-tracker/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/bugraskl/eye-tracker/releases/tag/v0.1.0

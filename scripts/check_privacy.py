@@ -70,8 +70,9 @@ needed), and the bundle fails on:
 ``network-library``
     A binary that links a networking library (``WS2_32``, ``WININET``,
     ``WINHTTP``, ``DNSAPI``... on Windows; ``libcurl``, ``libssl``,
-    ``libresolv``, ``CFNetwork``... elsewhere) or Qt's own ``QtNetwork``, and
-    is not on the allow-list.
+    ``libresolv``, ``libkrb5``... elsewhere; the ``CFNetwork``, ``Network``,
+    ``GSS`` and ``Kerberos`` frameworks on macOS) or Qt's own ``QtNetwork``,
+    and is not on the allow-list.
 ``network-symbol``
     An ELF or Mach-O binary that imports host-name resolution or remote
     connection functions (``getaddrinfo``, ``gethostbyname``...; on Linux and
@@ -97,9 +98,12 @@ keeps the app's own code away from them.
 Some bundled libraries legitimately link networking code without ever using
 it for remote connections (Qt's QLocalSocket lives in QtNetwork, CPython's
 ``_socket`` module is needed by ``psutil``, OpenCV's FFmpeg can read URLs that
-the app refuses to open). They are listed in :data:`BUNDLE_ALLOWLIST`, each
-with the exact indicators it may have and the reason; anything else fails.
-Allow-listed findings are printed as notices so every release log shows them.
+the app refuses to open; on macOS, OpenCV's wheel also ships the protocol
+libraries of Homebrew's FFmpeg build). They are listed in
+:data:`BUNDLE_ALLOWLIST`, each with the exact indicators it may have and the
+reason; anything else fails. Allow-listed findings are printed as notices so
+every release log shows them. A library that is bundled but not needed is
+removed by the PyInstaller spec instead of being allowed here.
 
 Usage::
 
@@ -344,7 +348,10 @@ POSIX_NETWORK_LIBRARIES: tuple[str, ...] = (
     "libwebsockets",
     "libzmq",
 )
-MACOS_NETWORK_FRAMEWORKS: frozenset[str] = frozenset({"CFNetwork", "Network"})
+#: Apple's networking frameworks, and the counterparts of libgssapi, libkrb5 and libldap.
+MACOS_NETWORK_FRAMEWORKS: frozenset[str] = frozenset(
+    {"CFNetwork", "GSS", "Kerberos", "LDAP", "Network"}
+)
 
 #: Library names the source check refuses to load through ctypes.
 NATIVE_NETWORK_LIBS: frozenset[str] = WINDOWS_NETWORK_DLLS | {
@@ -1056,12 +1063,47 @@ _WHY_QT_NETWORK = (
     "'eye-tracker ctl' IPC; its TCP/TLS backends and plugins are removed by the spec"
 )
 _WHY_FFMPEG = (
-    "OpenCV's FFmpeg could read network URLs, but the app refuses URLs and protocols "
-    "for every video source and whitelists only file,crypto,data for video files"
+    "OpenCV's FFmpeg could read network URLs, but the app opens only local files (it "
+    "refuses URLs and protocols for every video source), and FFmpeg's whitelist lets a "
+    "local file refer only to file, crypto and data URLs"
+)
+# OpenCV's macOS wheel ships FFmpeg as Homebrew builds it, with every protocol and
+# filter library, in cv2/.dylibs (cv2/__dot__dylibs inside the .app). Measured on
+# the macos-14 runner (otool -L, nm -m): cv2's extension module links libavformat
+# and libavdevice, and through them all of these, so dyld needs every one of them
+# to import cv2. The spec leaves out the libraries that nothing binds a symbol to.
+_WHY_FFMPEG_PROTOCOL = (
+    "network protocol library of the FFmpeg in OpenCV's macOS wheel (rist://, srt://, "
+    "sftp:// and zmq:// URLs): the app opens only local files, and FFmpeg's whitelist "
+    "lets a local file refer only to file, crypto and data URLs, so it is never used"
+)
+_WHY_FFMPEG_LINKS = (
+    "Homebrew's FFmpeg links each of its libraries against the libraries of all its "
+    "components; libavdevice binds no symbol to these, libavfilter binds only its zmq "
+    "and azmq filters (commands over ZeroMQ), and OpenCV builds no filter graph"
+)
+_WHY_TESSERACT = (
+    "Tesseract OCR, linked by FFmpeg's libavfilter for its ocr filter, which OpenCV "
+    "never runs; Tesseract uses libcurl only to fetch images given as URLs and the "
+    "resolver only for its ScrollView debugging viewer"
+)
+_WHY_XCB_MACOS = (
+    "XCB client library for FFmpeg's X11 screen-grabbing device (libavdevice); OpenCV "
+    "captures the camera with AVFoundation and reads files with FFmpeg's demuxers, so "
+    "no X display is ever contacted"
+)
+_WHY_PYOBJC = (
+    "pyobjc-core converts struct sockaddr values to and from Python tuples for Cocoa "
+    "methods that take them (getaddrinfo resolves a host name only when Python code "
+    "passes one); the app's macOS code calls no such method"
+)
+_WHY_PYOBJC_NETSERVICE = (
+    "pyobjc's NSNetService.addresses() wrapper formats Bonjour addresses as numbers "
+    "(getnameinfo with NI_NUMERICHOST, no lookup); the app uses no NSNetService"
 )
 _WHY_CRYPTO = (
     "OpenSSL libcrypto backs hashlib; its socket BIOs are never used (ssl/_ssl are "
-    "excluded from the bundle and libssl is pruned unless FFmpeg links it)"
+    "excluded from the bundle and libssl is left out unless FFmpeg uses it)"
 )
 _WHY_KERBEROS = (
     "MIT Kerberos/GSSAPI, linked by QtNetwork for HTTP Negotiate authentication; the "
@@ -1114,7 +1156,7 @@ BUNDLE_ALLOWLIST: tuple[AllowRule, ...] = (
     ),
     _allow(
         "qtnetwork.framework/versions/*/qtnetwork",
-        {"cfnetwork", "libresolv", *_RESOLVER},
+        {"cfnetwork", "network", "gss", "libresolv", *_RESOLVER},
         _WHY_QT_NETWORK,
     ),
     _allow("libxcb.so*", _RESOLVER, _WHY_X11),
@@ -1140,6 +1182,9 @@ BUNDLE_ALLOWLIST: tuple[AllowRule, ...] = (
     ),
     _allow("libkrb5support.so*", _RESOLVER, _WHY_KERBEROS),
     _allow("libk5crypto.so*", {"libkrb5support"}, _WHY_KERBEROS),
+    # pyobjc (macOS).
+    _allow("objc/_objc.*.so", {"getaddrinfo", "getnameinfo"}, _WHY_PYOBJC),
+    _allow("foundation/_foundation.*.so", {"getnameinfo"}, _WHY_PYOBJC_NETSERVICE),
     # OpenCV.
     _allow("opencv_videoio_ffmpeg*.dll", {"ws2_32"}, _WHY_FFMPEG),
     _allow(
@@ -1147,6 +1192,26 @@ BUNDLE_ALLOWLIST: tuple[AllowRule, ...] = (
         {"libssl*", "libcrypto*", "libgnutls*", "libnghttp2*", *_RESOLVER},
         _WHY_FFMPEG,
     ),
+    # OpenCV's macOS wheel: what Homebrew's FFmpeg brings along (see _WHY_FFMPEG_PROTOCOL).
+    _allow("cv2/*dylibs/libavformat.*.dylib", {"libzmq"}, _WHY_FFMPEG_PROTOCOL),
+    _allow(
+        "cv2/*dylibs/libavdevice.*.dylib", {"libcurl", "libgnutls", "libzmq"}, _WHY_FFMPEG_LINKS
+    ),
+    _allow(
+        "cv2/*dylibs/libavfilter.*.dylib", {"libcurl", "libgnutls", "libzmq"}, _WHY_FFMPEG_LINKS
+    ),
+    _allow("cv2/*dylibs/librist.*.dylib", {"getaddrinfo"}, _WHY_FFMPEG_PROTOCOL),
+    _allow(
+        "cv2/*dylibs/libsrt.*.dylib", {"libssl", "getaddrinfo", "getnameinfo"}, _WHY_FFMPEG_PROTOCOL
+    ),
+    _allow(
+        "cv2/*dylibs/libssh.*.dylib",
+        {"kerberos", "getaddrinfo", "getnameinfo"},  # Kerberos: GSSAPI logins
+        _WHY_FFMPEG_PROTOCOL,
+    ),
+    _allow("cv2/*dylibs/libzmq.*.dylib", {"getaddrinfo", "getnameinfo"}, _WHY_FFMPEG_PROTOCOL),
+    _allow("cv2/*dylibs/libtesseract.*.dylib", {"libcurl", "getaddrinfo"}, _WHY_TESSERACT),
+    _allow("cv2/*dylibs/libxcb.*.dylib", {"getaddrinfo"}, _WHY_XCB_MACOS),
 )
 
 

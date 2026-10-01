@@ -19,10 +19,12 @@ import platform
 import posixpath
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tomllib
 import urllib.error
+from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -737,6 +739,23 @@ def test_linux_builds_check_that_gtk_and_gio_stay_out() -> None:
     assert check in _workflow("bundle.yml")
 
 
+def test_bundle_smoke_test_reads_videos_and_probes_cameras() -> None:
+    """The frozen app must still import OpenCV, decode video files with the bundled
+    FFmpeg and run the camera backends after the spec leaves libraries out."""
+    text = _workflow("bundle.yml")
+    smoke = text[text.index("- name: Smoke-test the frozen CLI") :]
+    for fragment in (
+        "bench --camera packaging/linux/eye-tracker.png",
+        '("clip.avi", cv2.CAP_OPENCV_MJPEG, "MJPG")',
+        '("clip.mp4", cv2.CAP_FFMPEG, "mp4v")',
+        'bench --camera "$clips/$clip"',
+        'assert video["modes"]["max"]["analysed"] > 0',
+        "doctor --probe-cameras --json > probe.json 2> probe.err",
+        '"OpenCV: camera failed to properly initialize!" in errors',
+    ):
+        assert fragment in smoke, fragment
+
+
 def test_bug_report_names_the_command_of_every_package() -> None:
     text = (REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml").read_text(encoding="utf-8")
     for fragment in (
@@ -991,7 +1010,34 @@ _SPEC_HELPERS = (
     "pinned_licences",
     "verify_licences",
     "_unwanted",
+    "_macho_string",
+    "_uleb128",
+    "_bind_opcodes",
+    "_macho_slice",
+    "macho_bindings",
+    "prune_unused_macos_libraries",
 )
+# Module-level constants that the helpers above use.
+_SPEC_CONSTANTS = (
+    "_MH_MAGIC_64",
+    "_MH_TWOLEVEL",
+    "_LC_SYMTAB",
+    "_LC_LOAD_DYLIB",
+    "_LC_LAZY_LOAD_DYLIB",
+    "_LC_DYLD_INFO",
+    "_LC_LOAD_WEAK_DYLIB",
+    "_LC_REEXPORT_DYLIB",
+    "_LC_DYLD_INFO_ONLY",
+    "_LC_LOAD_UPWARD_DYLIB",
+    "_LC_DYLD_CHAINED_FIXUPS",
+    "_DYLIB_LOAD_COMMANDS",
+)
+
+
+def _constant_names(node: ast.stmt) -> list[str]:
+    if not isinstance(node, ast.Assign):
+        return []
+    return [target.id for target in node.targets if isinstance(target, ast.Name)]
 
 
 @pytest.fixture(scope="module")
@@ -999,6 +1045,7 @@ def spec_helpers() -> dict[str, Any]:
     """The spec's helper functions, without running the PyInstaller build it describes."""
     tree = ast.parse(_spec_text())
     body: list[ast.stmt] = [n for n in tree.body if isinstance(n, ast.Import | ast.ImportFrom)]
+    body += [n for n in tree.body if set(_constant_names(n)) & set(_SPEC_CONSTANTS)]
     body += [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in _SPEC_HELPERS]
     namespace: dict[str, Any] = {
         "__name__": "eye_tracker_spec_helpers",
@@ -1008,7 +1055,7 @@ def spec_helpers() -> dict[str, Any]:
         "ROOT": REPO_ROOT,
     }
     exec(compile(ast.Module(body=body, type_ignores=[]), "eye-tracker.spec", "exec"), namespace)
-    missing = [name for name in _SPEC_HELPERS if name not in namespace]
+    missing = [name for name in (*_SPEC_HELPERS, *_SPEC_CONSTANTS) if name not in namespace]
     assert not missing, missing
     return namespace
 
@@ -1430,3 +1477,515 @@ def test_linux_system_library_falls_back_to_common_folders(
     monkeypatch.setattr(glob, "glob", fake_glob)
     found = spec_helpers["linux_system_library"]("libxcb-cursor.so.0")
     assert found == "/usr/lib64/libxcb-cursor.so.0"
+
+
+# ============================================== macOS: libraries that no bundled binary uses
+_LOAD_COMMANDS = {
+    "load": 0xC,  # LC_LOAD_DYLIB
+    "weak": 0x80000018,  # LC_LOAD_WEAK_DYLIB
+    "reexport": 0x8000001F,  # LC_REEXPORT_DYLIB
+    "upward": 0x80000023,  # LC_LOAD_UPWARD_DYLIB
+}
+_LC_LOAD_DYLIB, _LC_LOAD_WEAK_DYLIB = _LOAD_COMMANDS["load"], _LOAD_COMMANDS["weak"]
+_DYNAMIC_LOOKUP = 0xFE  # the symbol table's library ordinal for -undefined dynamic_lookup
+
+
+def _macho_image(
+    links: Sequence[tuple[str, str]] = (),
+    *,
+    imports: Sequence[tuple[str, int]] = (),
+    exports: Sequence[str] = (),
+    fixups: tuple[int, Sequence[tuple[int, str]]] | None = None,
+    compressed_fixup_names: bool = False,
+    binds: bytes = b"",
+    weak_binds: bytes = b"",
+    lazy_binds: bytes = b"",
+    twolevel: bool = True,
+) -> bytes:
+    """A 64-bit little-endian Mach-O dylib, as the spec's binding reader sees one.
+
+    ``links`` are ``(kind, install name)`` load commands (library ordinals 1, 2...),
+    ``imports`` symbol-table imports with their library ordinal, ``exports`` the
+    symbols the file defines, ``fixups`` ``(import format, [(ordinal, symbol)])``
+    for a chained-fixups import table; the bind streams hold dyld-info opcodes.
+    """
+    commands = b""
+    for kind, name in links:
+        raw = name.encode() + b"\0"
+        raw += b"\0" * (-(24 + len(raw)) % 8)
+        commands += struct.pack("<6I", _LOAD_COMMANDS[kind], 24 + len(raw), 24, 2, 0, 0) + raw
+    count, tail_size = len(links) + 1, 24  # + LC_SYMTAB
+    if fixups is not None:
+        count, tail_size = count + 1, tail_size + 16
+    if binds or weak_binds or lazy_binds:
+        count, tail_size = count + 1, tail_size + 48
+    start = 32 + len(commands) + tail_size  # where the data after the load commands begins
+
+    strings, symbols = b"\0", b""
+    for name, ordinal in imports:
+        symbols += struct.pack("<IBBHQ", len(strings), 0x01, 0, ordinal << 8, 0)  # N_UNDF
+        strings += name.encode() + b"\0"
+    for name in exports:
+        symbols += struct.pack("<IBBHQ", len(strings), 0x0F, 1, 0, 0)  # N_SECT
+        strings += name.encode() + b"\0"
+    blob = symbols + strings
+    tail = struct.pack(
+        "<6I", 0x2, 24, start, len(symbols) // 16, start + len(symbols), len(strings)
+    )
+    if fixups is not None:
+        import_format, entries = fixups
+        table = names = b""
+        for ordinal, symbol in entries:
+            if import_format == 3:
+                table += struct.pack("<QQ", (ordinal & 0xFFFF) | len(names) << 32, 0)
+            else:
+                table += struct.pack("<I", (ordinal & 0xFF) | len(names) << 9)
+                table += b"\0" * 4 if import_format == 2 else b""
+            names += symbol.encode() + b"\0"
+        header = struct.pack(
+            "<7I", 0, 28, 28, 28 + len(table), len(entries), import_format, compressed_fixup_names
+        )
+        tail += struct.pack("<4I", 0x80000034, 16, start + len(blob), len(header + table + names))
+        blob += header + table + names
+    if binds or weak_binds or lazy_binds:
+        streams: list[int] = []
+        for stream in (binds, weak_binds, lazy_binds):
+            streams += [start + len(blob), len(stream)]
+            blob += stream
+        tail += struct.pack("<12I", 0x80000022, 48, 0, 0, *streams, 0, 0)  # LC_DYLD_INFO_ONLY
+    flags = 0x80 if twolevel else 0  # MH_TWOLEVEL
+    header = struct.pack(
+        "<8I", 0xFEEDFACF, 0x0100000C, 0, 6, count, len(commands) + tail_size, flags, 0
+    )
+    return header + commands + tail + blob
+
+
+def _universal(*slices: bytes) -> bytes:
+    """A universal (fat) file with ``slices`` at page-aligned offsets."""
+    offsets, position = [], 0x1000
+    for thin in slices:
+        offsets.append(position)
+        position += -(-len(thin) // 0x1000) * 0x1000
+    data = bytearray(struct.pack(">II", 0xCAFEBABE, len(slices)))
+    for offset, thin in zip(offsets, slices, strict=True):
+        data += struct.pack(">iiIII", 0x0100000C, 0, offset, len(thin), 12)
+    for offset, thin in zip(offsets, slices, strict=True):
+        data += b"\0" * (offset - len(data)) + thin
+    return bytes(data)
+
+
+def _bind(ordinal: int, symbol: str) -> bytes:
+    """dyld-info opcodes binding ``symbol`` from library ``ordinal`` (<= 0: special)."""
+    if ordinal <= 0:
+        set_ordinal = bytes([0x30 | (ordinal & 0x0F)])  # SET_DYLIB_SPECIAL_IMM
+    elif ordinal < 16:
+        set_ordinal = bytes([0x10 | ordinal])  # SET_DYLIB_ORDINAL_IMM
+    else:
+        set_ordinal = bytes([0x20, ordinal])  # SET_DYLIB_ORDINAL_ULEB
+    # SET_SYMBOL_TRAILING_FLAGS_IMM, SET_TYPE_IMM, SET_SEGMENT_AND_OFFSET_ULEB, DO_BIND
+    return set_ordinal + b"\x40" + symbol.encode() + b"\0\x51\x72\x10\x90"
+
+
+def _bindings(spec_helpers: dict[str, Any], data: bytes) -> dict[str, Any]:
+    info = spec_helpers["macho_bindings"](data)
+    assert info is not None
+    return info
+
+
+def _commands(info: dict[str, Any]) -> list[tuple[int, str]]:
+    return [(command, name) for _offset, command, name in info["links"]]
+
+
+def test_macho_bindings_read_the_symbol_table(spec_helpers: dict[str, Any]) -> None:
+    """What ``nm -m`` shows: imports by library ordinal, dynamic lookups, definitions."""
+    image = _macho_image(
+        [
+            ("load", "@rpath/libused.1.dylib"),
+            ("load", "@rpath/libX11.6.dylib"),
+            ("weak", "/usr/lib/libz.1.dylib"),
+        ],
+        imports=[("_used", 1), ("_PyLong_FromLong", _DYNAMIC_LOOKUP), ("_hook", 0xFF), ("_z", 3)],
+        exports=["_exported"],
+    )
+    info = _bindings(spec_helpers, image)
+    assert _commands(info) == [
+        (_LC_LOAD_DYLIB, "@rpath/libused.1.dylib"),
+        (_LC_LOAD_DYLIB, "@rpath/libX11.6.dylib"),
+        (_LC_LOAD_WEAK_DYLIB, "/usr/lib/libz.1.dylib"),
+    ]
+    # The offsets are those of the load commands, which is what the spec patches.
+    for offset, command, _name in info["links"]:
+        assert struct.unpack_from("<I", image, offset) == (command,)
+    assert info["bound"] == {"@rpath/libused.1.dylib", "/usr/lib/libz.1.dylib"}
+    assert info["lookups"] == {"_PyLong_FromLong"}
+    assert info["exports"] == {"_exported"}
+
+
+@pytest.mark.parametrize("import_format", [1, 2, 3])
+def test_macho_bindings_read_chained_fixups(
+    spec_helpers: dict[str, Any], import_format: int
+) -> None:
+    """dyld's own import table, in images built for macOS 12 and later."""
+    image = _macho_image(
+        [
+            ("load", "@rpath/liba.dylib"),
+            ("load", "@rpath/libb.dylib"),
+            ("load", "@rpath/libc.dylib"),
+        ],
+        fixups=(
+            import_format,
+            [(2, "_b"), (-2, "_PyFloat_Type"), (-3, "__ZdlPv"), (0, "_self"), (-1, "_main")],
+        ),
+    )
+    info = _bindings(spec_helpers, image)
+    assert info["bound"] == {"@rpath/libb.dylib"}
+    assert info["lookups"] == {"_PyFloat_Type", "__ZdlPv"}
+
+
+def test_macho_bindings_read_classic_bind_opcodes(spec_helpers: dict[str, Any]) -> None:
+    binds = (
+        _bind(1, "_a")
+        + _bind(-2, "_flat")
+        # SET_DYLIB_ORDINAL_ULEB 3, SET_SYMBOL, SET_ADDEND_SLEB, ADD_ADDR_ULEB, the other
+        # three DO_BIND forms and the two THREADED opcodes.
+        + b"\x20\x03\x40_c\0\x60\x7f\x80\x88\x01\xa0\x08\xb1\xc0\x02\x08\xd0\x01\xd1"
+        + b"\x00"
+    )
+    lazy_binds = _bind(4, "_d") + b"\x00" + _bind(4, "_d2") + b"\x00"
+    weak_binds = b"\x40__ZdlPv\0\x51\x72\x10\x90\x00"
+    image = _macho_image(
+        [("load", f"lib{name}") for name in "abcde"],
+        binds=binds,
+        weak_binds=weak_binds,
+        lazy_binds=lazy_binds,
+    )
+    info = _bindings(spec_helpers, image)
+    assert info["bound"] == {"liba", "libc", "libd"}
+    # Flat lookups, and C++ weak definitions coalesced by name.
+    assert info["lookups"] == {"_flat", "__ZdlPv"}
+
+
+def test_macho_bindings_count_every_library_of_a_flat_namespace_image(
+    spec_helpers: dict[str, Any],
+) -> None:
+    image = _macho_image([("load", "liba"), ("load", "libb")], imports=[("_x", 0)], twolevel=False)
+    info = _bindings(spec_helpers, image)
+    assert info["bound"] == {"liba", "libb"}
+    assert info["lookups"] == {"_x"}
+
+
+def test_macho_bindings_read_every_slice_of_a_universal_file(spec_helpers: dict[str, Any]) -> None:
+    links = [("load", "@rpath/liba.dylib"), ("load", "@rpath/libb.dylib")]
+    fat = _universal(
+        _macho_image(links, imports=[("_a", 1)]), _macho_image(links, imports=[("_b", 2)])
+    )
+    info = _bindings(spec_helpers, fat)
+    assert info["bound"] == {"@rpath/liba.dylib", "@rpath/libb.dylib"}
+    assert [name for _offset, _command, name in info["links"]] == [
+        "@rpath/liba.dylib",
+        "@rpath/libb.dylib",
+    ] * 2
+    for offset, command, _name in info["links"]:
+        assert struct.unpack_from("<I", fat, offset) == (command,)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [b"", b"MZ\x90\0", b"\x7fELF\x02\x01\x01\0", b"\xca\xfe\xba\xbe\0\0\0\x34", b"#!/bin/sh\n"],
+)
+def test_macho_bindings_ignore_other_files(spec_helpers: dict[str, Any], data: bytes) -> None:
+    assert spec_helpers["macho_bindings"](data) is None
+
+
+_GOOD_IMAGE = _macho_image([("load", "liba")], imports=[("_a", 1)])
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        _GOOD_IMAGE[:40],  # truncated in its load commands
+        b"\xce\xfa\xed\xfe" + _GOOD_IMAGE[4:],  # 32-bit
+        b"\xfe\xed\xfa\xcf" + _GOOD_IMAGE[4:],  # big-endian
+        _macho_image([("load", "liba")], imports=[("_a", 2)]),  # no library 2
+        _macho_image([("load", "liba")], fixups=(4, [(1, "_a")])),  # unknown import format
+        _macho_image([("load", "liba")], fixups=(1, [(1, "_a")]), compressed_fixup_names=True),
+        _macho_image([("load", "liba")], binds=b"\xe0"),  # unknown bind opcode
+        _macho_image([("load", "liba")], binds=b"\x40_unterminated"),
+    ],
+)
+def test_macho_bindings_refuse_what_they_cannot_read(
+    spec_helpers: dict[str, Any], data: bytes
+) -> None:
+    with pytest.raises(ValueError):  # noqa: PT011 - every reason is a ValueError
+        spec_helpers["macho_bindings"](data)
+
+
+def _write_toc(tmp_path: Path, files: dict[str, tuple[bytes, str]]) -> list[tuple[str, str, str]]:
+    """TOC entries for ``{dest: (contents, kind)}``, the files written below ``tmp_path``."""
+    entries = []
+    for dest, (data, kind) in files.items():
+        path = tmp_path / "site" / dest
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        entries.append((dest, str(path), kind))
+    return entries
+
+
+_DYLIBS = "cv2/.dylibs/"
+
+
+def _opencv_like_wheel() -> dict[str, tuple[bytes, str]]:
+    """The shape of OpenCV 5.0's macOS wheel, as measured on the runner with ``nm -m``.
+
+    FFmpeg's libraries link libX11 but bind nothing to it (libavdevice binds libxcb
+    for its X11 grab device), libsrt links libssl but only uses libcrypto, and
+    libjxl links libhwy without using it.
+    """
+    here = "@loader_path/"
+    return {
+        "cv2/cv2.abi3.so": (
+            _macho_image(
+                [
+                    ("load", "@loader_path/.dylibs/libavformat.61.dylib"),
+                    ("load", "@loader_path/.dylibs/libavdevice.61.dylib"),
+                ],
+                imports=[
+                    ("_avformat_open_input", 1),
+                    ("_avdevice_register_all", 2),
+                    ("_PyLong_FromLong", _DYNAMIC_LOOKUP),
+                ],
+            ),
+            "EXTENSION",
+        ),
+        _DYLIBS + "libavformat.61.dylib": (
+            _macho_image(
+                [
+                    ("load", here + "libX11.6.dylib"),
+                    ("load", here + "libsrt.1.5.dylib"),
+                    ("load", here + "libjxl.0.11.dylib"),
+                ],
+                imports=[("_srt_startup", 2), ("_JxlDecoderCreate", 3)],
+                exports=["_avformat_open_input"],
+            ),
+            "BINARY",
+        ),
+        _DYLIBS + "libavdevice.61.dylib": (
+            _macho_image(
+                [
+                    ("load", here + "libavformat.61.dylib"),
+                    ("load", here + "libxcb.1.dylib"),
+                    ("load", here + "libX11.6.dylib"),
+                ],
+                imports=[("_avformat_open_input", 1), ("_xcb_connect", 2)],
+                exports=["_avdevice_register_all"],
+            ),
+            "BINARY",
+        ),
+        _DYLIBS + "libX11.6.dylib": (
+            _macho_image(
+                [("load", here + "libxcb.1.dylib")],
+                imports=[("_xcb_connect", 1)],
+                exports=["_XOpenDisplay"],
+            ),
+            "BINARY",
+        ),
+        _DYLIBS + "libxcb.1.dylib": (_macho_image(exports=["_xcb_connect"]), "BINARY"),
+        _DYLIBS + "libsrt.1.5.dylib": (
+            _macho_image(
+                [("load", here + "libssl.3.dylib"), ("load", here + "libcrypto.3.dylib")],
+                imports=[("_EVP_CIPHER_CTX_new", 2)],
+                exports=["_srt_startup"],
+            ),
+            "BINARY",
+        ),
+        _DYLIBS + "libssl.3.dylib": (
+            _macho_image(
+                [("load", here + "libcrypto.3.dylib")],
+                imports=[("_EVP_MD_CTX_new", 1)],
+                exports=["_SSL_new"],
+            ),
+            "BINARY",
+        ),
+        _DYLIBS + "libcrypto.3.dylib": (
+            _macho_image(exports=["_EVP_CIPHER_CTX_new", "_EVP_MD_CTX_new"]),
+            "BINARY",
+        ),
+        _DYLIBS + "libjxl.0.11.dylib": (
+            _macho_image([("load", here + "libhwy.1.dylib")], exports=["_JxlDecoderCreate"]),
+            "BINARY",
+        ),
+        _DYLIBS + "libhwy.1.dylib": (_macho_image(exports=["__ZN3hwy5AbortEv"]), "BINARY"),
+        # Loaded with dlopen(), so linked by nothing: it stays.
+        "PySide6/Qt/plugins/platforms/libqcocoa.dylib": (
+            _macho_image(
+                [("load", "@rpath/QtGui.framework/Versions/A/QtGui")], imports=[("_qt_gui", 1)]
+            ),
+            "BINARY",
+        ),
+        "PySide6/Qt/lib/QtGui.framework/Versions/A/QtGui": (
+            _macho_image(exports=["_qt_gui"]),
+            "BINARY",
+        ),
+        # Not a Mach-O file: ignored.
+        "numpy/odd.so": (b"\x7fELF\x02\x01\x01\0" + b"\0" * 56, "BINARY"),
+    }
+
+
+def test_prune_leaves_out_libraries_that_nothing_binds_to(
+    spec_helpers: dict[str, Any], tmp_path: Path
+) -> None:
+    """libX11, libssl and libhwy are linked by OpenCV's FFmpeg but used by nothing;
+    their links become weak in copies of the libraries that link them."""
+    files = _opencv_like_wheel()
+    entries = [
+        *_write_toc(tmp_path, files),
+        # PyInstaller's links from the top-level folder, and a data file.
+        ("libX11.6.dylib", _DYLIBS + "libX11.6.dylib", "SYMLINK"),
+        ("libxcb.1.dylib", _DYLIBS + "libxcb.1.dylib", "SYMLINK"),
+        ("cv2/config.py", str(tmp_path / "config.py"), "DATA"),
+    ]
+    scratch = tmp_path / "scratch"
+    pruned = spec_helpers["prune_unused_macos_libraries"](entries, scratch)
+
+    gone = {_DYLIBS + "libX11.6.dylib", _DYLIBS + "libssl.3.dylib", _DYLIBS + "libhwy.1.dylib"}
+    assert [dest for dest, _src, _kind in pruned] == [
+        dest for dest, _src, _kind in entries if dest not in gone and dest != "libX11.6.dylib"
+    ]
+    weakened = {
+        _DYLIBS + "libavformat.61.dylib": ["@loader_path/libX11.6.dylib"],
+        _DYLIBS + "libavdevice.61.dylib": ["@loader_path/libX11.6.dylib"],
+        _DYLIBS + "libsrt.1.5.dylib": ["@loader_path/libssl.3.dylib"],
+        _DYLIBS + "libjxl.0.11.dylib": ["@loader_path/libhwy.1.dylib"],
+    }
+    sources = {dest: Path(src) for dest, src, _kind in pruned}
+    for dest, (original, _kind) in files.items():
+        assert (tmp_path / "site" / dest).read_bytes() == original  # the wheel is untouched
+        if dest in gone:
+            continue
+        if dest not in weakened:
+            assert sources[dest] == tmp_path / "site" / dest, dest
+            continue
+        assert sources[dest] == scratch / dest
+        expected = bytearray(original)
+        for offset, _command, name in _bindings(spec_helpers, original)["links"]:
+            if name in weakened[dest]:
+                struct.pack_into("<I", expected, offset, _LC_LOAD_WEAK_DYLIB)
+        # Only the type of those load commands changes: library ordinals stay as they are.
+        assert sources[dest].read_bytes() == bytes(expected), dest
+
+
+def test_prune_keeps_libraries_whose_symbols_are_found_by_name(
+    spec_helpers: dict[str, Any], tmp_path: Path
+) -> None:
+    """Python extension modules find the Python API by name (-undefined dynamic_lookup)
+    and C++ weak definitions are coalesced by name, so a library that defines such a
+    symbol stays even when no link binds anything to it."""
+    entries = _write_toc(
+        tmp_path,
+        {
+            "ext.cpython-312-darwin.so": (
+                _macho_image(
+                    [("load", "@rpath/libpy.dylib"), ("load", "@rpath/libcxx.dylib")],
+                    imports=[("_PyLong_FromLong", _DYNAMIC_LOOKUP)],
+                    fixups=(1, [(-3, "__ZdlPv")]),
+                ),
+                "EXTENSION",
+            ),
+            "libpy.dylib": (_macho_image(exports=["_PyLong_FromLong"]), "BINARY"),
+            "libcxx.dylib": (_macho_image(exports=["__ZdlPv"]), "BINARY"),
+        },
+    )
+    assert spec_helpers["prune_unused_macos_libraries"](entries, tmp_path / "scratch") == entries
+
+
+@pytest.mark.parametrize("kind", ["reexport", "upward"])
+def test_prune_keeps_reexported_and_upward_linked_libraries(
+    spec_helpers: dict[str, Any], tmp_path: Path, kind: str
+) -> None:
+    entries = _write_toc(
+        tmp_path,
+        {
+            "ext.so": (
+                _macho_image([("load", "@rpath/libumbrella.dylib")], imports=[("_inner", 1)]),
+                "EXTENSION",
+            ),
+            "libumbrella.dylib": (_macho_image([(kind, "@rpath/libinner.dylib")]), "BINARY"),
+            "libinner.dylib": (_macho_image(exports=["_inner"]), "BINARY"),
+        },
+    )
+    assert spec_helpers["prune_unused_macos_libraries"](entries, tmp_path / "scratch") == entries
+
+
+def test_prune_also_drops_what_only_unused_libraries_link(
+    spec_helpers: dict[str, Any], tmp_path: Path
+) -> None:
+    entries = _write_toc(
+        tmp_path,
+        {
+            "ext.so": (
+                _macho_image([("load", "@rpath/liba.dylib"), ("weak", "@rpath/libw.dylib")]),
+                "EXTENSION",
+            ),
+            "liba.dylib": (
+                _macho_image([("load", "@rpath/libb.dylib")], imports=[("_b", 1)]),
+                "BINARY",
+            ),
+            "libb.dylib": (_macho_image(exports=["_b"]), "BINARY"),
+            "libw.dylib": (_macho_image(exports=["_w"]), "BINARY"),
+        },
+    )
+    pruned = spec_helpers["prune_unused_macos_libraries"](entries, tmp_path / "scratch")
+    # Extension modules always stay; libb was only needed by liba.
+    assert [dest for dest, _src, _kind in pruned] == ["ext.so"]
+    info = _bindings(spec_helpers, Path(pruned[0][1]).read_bytes())
+    assert _commands(info) == [
+        (_LC_LOAD_WEAK_DYLIB, "@rpath/liba.dylib"),
+        (_LC_LOAD_WEAK_DYLIB, "@rpath/libw.dylib"),
+    ]
+
+
+def test_prune_weakens_the_links_of_every_slice(
+    spec_helpers: dict[str, Any], tmp_path: Path
+) -> None:
+    thin = _macho_image(
+        [("load", "@rpath/libX11.6.dylib"), ("load", "@rpath/libxcb.1.dylib")],
+        imports=[("_xcb_connect", 2)],
+    )
+    entries = _write_toc(
+        tmp_path,
+        {
+            "ext.so": (_universal(thin, thin), "EXTENSION"),
+            "libX11.6.dylib": (_macho_image(exports=["_XOpenDisplay"]), "BINARY"),
+            "libxcb.1.dylib": (_macho_image(exports=["_xcb_connect"]), "BINARY"),
+        },
+    )
+    pruned = spec_helpers["prune_unused_macos_libraries"](entries, tmp_path / "scratch")
+    assert [dest for dest, _src, _kind in pruned] == ["ext.so", "libxcb.1.dylib"]
+    info = _bindings(spec_helpers, Path(pruned[0][1]).read_bytes())
+    assert (
+        _commands(info)
+        == [
+            (_LC_LOAD_WEAK_DYLIB, "@rpath/libX11.6.dylib"),
+            (_LC_LOAD_DYLIB, "@rpath/libxcb.1.dylib"),
+        ]
+        * 2
+    )
+
+
+def test_prune_keeps_everything_when_a_binary_cannot_be_read(
+    spec_helpers: dict[str, Any], tmp_path: Path
+) -> None:
+    files = _opencv_like_wheel()
+    files["broken.dylib"] = (_GOOD_IMAGE[:40], "BINARY")
+    entries = _write_toc(tmp_path, files)
+    scratch = tmp_path / "scratch"
+    assert spec_helpers["prune_unused_macos_libraries"](entries, scratch) == entries
+    assert not scratch.exists()
+
+
+def test_spec_leaves_out_unused_libraries_on_macos_only() -> None:
+    source = _spec_text()
+    call = source.index("a.binaries = prune_unused_macos_libraries(")
+    assert source.rindex("\nif IS_MACOS:\n", 0, call) > source.index(
+        "a.binaries = prune_unreferenced_openssl("
+    )

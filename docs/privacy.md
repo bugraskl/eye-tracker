@@ -27,6 +27,27 @@ runtime is not installed, imported or shipped.
 [`src/eye_tracker/vision/models/NOTICE.md`](../src/eye_tracker/vision/models/NOTICE.md) lists the
 exact model files, their licences and checksums; the licence texts ship next to the models.
 
+## Networking code inside the libraries it ships
+
+Eye Tracker's own code contains no networking code, but some libraries it ships do, because they can
+do more than Eye Tracker asks of them:
+
+- Qt's network module provides the local IPC channel; its TCP, TLS and HTTP parts are never used, and
+  Qt's network plugins are not shipped.
+- OpenCV reads video files with FFmpeg, which can also open network streams. Eye Tracker opens only
+  local files: it refuses URLs and protocol prefixes for every video source, and FFmpeg lets a local
+  file (a playlist, for example) refer only to local data. On macOS, OpenCV's package contains FFmpeg
+  as Homebrew builds it, with libraries for SRT, RIST, SFTP, ZeroMQ and TLS streams and an OCR
+  library that can download images; none of them is ever used. Libraries that nothing in the app
+  uses at all, such as the X11 client library and OpenSSL's TLS library, are left out of the macOS
+  app.
+- Python's socket module is there because the standard library and psutil use it, and pyobjc can
+  convert network addresses for macOS APIs that Eye Tracker does not call.
+
+The privacy gate lists every such file, with what it links and why that is acceptable, in the log
+of every release build, and fails the build when a library gains networking code that has not been
+reviewed.
+
 ## What is stored, and where
 
 | File | Contents | Location |

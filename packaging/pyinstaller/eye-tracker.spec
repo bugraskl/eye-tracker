@@ -31,6 +31,7 @@ The Windows installer additionally installs eye-tracker-cli.exe as eye-tracker.e
 """
 
 import ast
+import collections
 import glob
 import hashlib
 import importlib.metadata
@@ -40,6 +41,7 @@ import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -378,6 +380,327 @@ def prune_orphaned_libraries(kept: list, removed: list) -> list:
     return _without(kept, {e[0] for name in orphans for e in libraries[name]})
 
 
+# --------------------------------------------- macOS: libraries that no bundled binary uses
+# From <mach-o/loader.h>. A binary's dylib load commands are its library ordinals 1, 2, ...
+_MH_MAGIC_64 = 0xFEEDFACF
+_MH_TWOLEVEL = 0x80
+_LC_SYMTAB = 0x2
+_LC_LOAD_DYLIB = 0xC
+_LC_LAZY_LOAD_DYLIB = 0x20
+_LC_DYLD_INFO = 0x22
+_LC_LOAD_WEAK_DYLIB = 0x80000018
+_LC_REEXPORT_DYLIB = 0x8000001F
+_LC_DYLD_INFO_ONLY = 0x80000022
+_LC_LOAD_UPWARD_DYLIB = 0x80000023
+_LC_DYLD_CHAINED_FIXUPS = 0x80000034
+_DYLIB_LOAD_COMMANDS = (
+    _LC_LOAD_DYLIB,
+    _LC_LAZY_LOAD_DYLIB,
+    _LC_LOAD_WEAK_DYLIB,
+    _LC_REEXPORT_DYLIB,
+    _LC_LOAD_UPWARD_DYLIB,
+)
+
+
+def _macho_string(data: bytes, offset: int) -> tuple:
+    """The NUL-terminated string at ``offset`` and the offset after it."""
+    end = data.index(b"\0", offset)  # ValueError when it is not terminated
+    return data[offset:end].decode("utf-8", "replace"), end + 1
+
+
+def _uleb128(data: bytes, position: int) -> tuple:
+    """An unsigned LEB128 number at ``position`` and the position after it."""
+    value = shift = 0
+    while True:
+        byte = data[position]
+        position += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if byte < 0x80:
+            return value, position
+
+
+def _bind_opcodes(data: bytes, start: int, size: int) -> list:
+    """``(library ordinal, symbol)`` of every bind in a classic dyld-info bind stream."""
+    binds = []
+    ordinal, symbol = 0, ""
+    position, end = start, start + size
+    while position < end:
+        byte = data[position]
+        position += 1
+        opcode, immediate = byte & 0xF0, byte & 0x0F
+        if opcode == 0x00:  # DONE: lazy bind streams separate their entries with it
+            continue
+        if opcode == 0x10:  # SET_DYLIB_ORDINAL_IMM
+            ordinal = immediate
+        elif opcode == 0x20:  # SET_DYLIB_ORDINAL_ULEB
+            ordinal, position = _uleb128(data, position)
+        elif opcode == 0x30:  # SET_DYLIB_SPECIAL_IMM: 0 (self), -1, -2 or -3
+            ordinal = immediate - 16 if immediate else 0
+        elif opcode == 0x40:  # SET_SYMBOL_TRAILING_FLAGS_IMM
+            symbol, position = _macho_string(data, position)
+        elif opcode == 0x50:  # SET_TYPE_IMM
+            pass
+        elif opcode in (0x60, 0x70, 0x80):  # addend (SLEB), segment offset, address step
+            _value, position = _uleb128(data, position)  # an SLEB128 is skipped the same way
+        elif opcode in (0x90, 0xB0):  # DO_BIND, DO_BIND_ADD_ADDR_IMM_SCALED
+            binds.append((ordinal, symbol))
+        elif opcode == 0xA0:  # DO_BIND_ADD_ADDR_ULEB
+            _value, position = _uleb128(data, position)
+            binds.append((ordinal, symbol))
+        elif opcode == 0xC0:  # DO_BIND_ULEB_TIMES_SKIPPING_ULEB
+            _value, position = _uleb128(data, position)
+            _value, position = _uleb128(data, position)
+            binds.append((ordinal, symbol))
+        elif byte == 0xD0:  # THREADED: SET_BIND_ORDINAL_TABLE_SIZE_ULEB
+            _value, position = _uleb128(data, position)
+        elif byte != 0xD1:  # THREADED: APPLY
+            raise ValueError(f"unknown bind opcode {byte:#04x}")
+    return binds
+
+
+def _macho_slice(data: bytes, base: int, info: dict) -> None:
+    """Add what the 64-bit Mach-O image at ``base`` links, binds, looks up and defines."""
+    magic, _cpu, _subtype, _filetype, count, _size, flags = struct.unpack_from("<7I", data, base)
+    if magic != _MH_MAGIC_64:
+        raise ValueError("not a 64-bit little-endian Mach-O image")
+    names = []  # install names, by library ordinal - 1
+    symtab = fixups = dyld_info = None
+    position = base + 32
+    for _ in range(count):
+        command, size = struct.unpack_from("<II", data, position)
+        if size < 8:
+            raise ValueError("corrupt Mach-O load command")
+        if command in _DYLIB_LOAD_COMMANDS:
+            (name_offset,) = struct.unpack_from("<I", data, position + 8)
+            name, _end = _macho_string(data, position + name_offset)
+            names.append(name)
+            info["links"].append((position, command, name))
+        elif command == _LC_SYMTAB:
+            symtab = struct.unpack_from("<4I", data, position + 8)
+        elif command == _LC_DYLD_CHAINED_FIXUPS:
+            fixups = struct.unpack_from("<2I", data, position + 8)
+        elif command in (_LC_DYLD_INFO, _LC_DYLD_INFO_ONLY):
+            dyld_info = struct.unpack_from("<8I", data, position + 8)
+        position += size
+
+    twolevel = bool(flags & _MH_TWOLEVEL)
+    if not twolevel:
+        # Flat namespace: every symbol is looked up in every image, so any
+        # linked library may be the one that provides it.
+        info["bound"].update(names)
+
+    def bind(ordinal: int, symbol: str) -> None:
+        if not twolevel or ordinal in (-2, -3):  # flat namespace, flat or weak lookup
+            info["lookups"].add(symbol)
+        elif 0 < ordinal <= len(names):
+            info["bound"].add(names[ordinal - 1])
+        elif ordinal not in (0, -1):  # 0 is this image, -1 the main executable
+            raise ValueError(f"unknown library ordinal {ordinal}")
+
+    if symtab:  # what `nm -m` shows
+        symbols, symbol_count, strings, _strings_size = symtab
+        for index in range(symbol_count):
+            name_at, kind, _section, desc, _value = struct.unpack_from(
+                "<IBBHQ", data, base + symbols + 16 * index
+            )
+            if kind & 0xE0 or not kind & 0x01 or not name_at:  # debugging entry, not external
+                continue
+            symbol, _end = _macho_string(data, base + strings + name_at)
+            if (kind & 0x0E) in (0x02, 0x0A, 0x0E):  # N_ABS, N_INDR, N_SECT: defined here
+                info["exports"].add(symbol)
+            elif (kind & 0x0E) in (0x00, 0x0C):  # N_UNDF, N_PBUD: imported
+                ordinal = desc >> 8  # 0xFE: dynamic lookup, 0xFF: the main executable
+                bind(ordinal - 0x100 if ordinal >= 0xFE else ordinal, symbol)
+    if fixups:  # what dyld binds in images with chained fixups
+        start = base + fixups[0]
+        header = struct.unpack_from("<7I", data, start)
+        _version, _starts, imports, symbol_names, import_count, import_format, compressed = header
+        if compressed:
+            raise ValueError("compressed chained-fixup symbol names")
+        # DYLD_CHAINED_IMPORT, _ADDEND (8-bit ordinals) and _ADDEND64 (16-bit ordinals).
+        stride = {1: 4, 2: 8, 3: 16}.get(import_format)
+        if stride is None:
+            raise ValueError(f"unknown chained-fixup import format {import_format}")
+        for index in range(import_count):
+            if import_format == 3:
+                (value,) = struct.unpack_from("<Q", data, start + imports + stride * index)
+                ordinal, name_at = value & 0xFFFF, value >> 32
+                ordinal -= 0x10000 if ordinal >= 0xFFF0 else 0
+            else:
+                (value,) = struct.unpack_from("<I", data, start + imports + stride * index)
+                ordinal, name_at = value & 0xFF, value >> 9
+                ordinal -= 0x100 if ordinal >= 0xF0 else 0
+            symbol, _end = _macho_string(data, start + symbol_names + name_at)
+            bind(ordinal, symbol)
+    if dyld_info:  # what dyld binds in images with classic bind opcodes
+        _rebase, _rebase_size, binds, binds_size, weak, weak_size, lazy, lazy_size = dyld_info
+        for offset, size in ((binds, binds_size), (lazy, lazy_size)):
+            for ordinal, symbol in _bind_opcodes(data, base + offset, size):
+                bind(ordinal, symbol)
+        # Weak binds coalesce C++ weak definitions across all loaded images.
+        for _ordinal, symbol in _bind_opcodes(data, base + weak, weak_size):
+            info["lookups"].add(symbol)
+
+
+def macho_bindings(data: bytes):
+    """What a Mach-O file links, and what it binds to those libraries; ``None`` for other files.
+
+    The result has:
+
+    ``links``
+        ``(file offset, command, install name)`` of every dylib load command.
+    ``bound``
+        The install names that at least one symbol is bound to.
+    ``lookups``
+        Symbols that dyld finds by searching every loaded image (flat namespace,
+        ``-undefined dynamic_lookup`` as in Python extension modules, C++ weak
+        definitions); any library that defines one of them may be needed.
+    ``exports``
+        The external symbols the file defines.
+
+    The bindings come from the symbol table (what ``nm -m`` shows), the chained
+    fixups and the classic bind opcodes together, every slice of a universal
+    file included. Raises ``ValueError`` for a Mach-O file that cannot be read
+    completely (32-bit, big-endian, truncated or unknown formats).
+    """
+    info = {"links": [], "bound": set(), "lookups": set(), "exports": set()}
+    magic = data[:4]
+    thin = (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf")
+    try:
+        if magic in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
+            (count,) = struct.unpack_from(">I", data, 4)
+            if not 0 < count < 20:
+                return None  # a Java class file has its version number there
+            wide = magic == b"\xca\xfe\xba\xbf"
+            for index in range(count):
+                if wide:
+                    (offset,) = struct.unpack_from(">Q", data, 8 + 32 * index + 8)
+                else:
+                    (offset,) = struct.unpack_from(">I", data, 8 + 20 * index + 8)
+                _macho_slice(data, offset, info)
+        elif magic in thin:  # only 64-bit little-endian images can be read (_macho_slice)
+            _macho_slice(data, 0, info)
+        else:
+            return None
+    except (struct.error, IndexError) as exc:
+        raise ValueError(f"truncated Mach-O file: {exc}") from exc
+    return info
+
+
+def prune_unused_macos_libraries(entries: list, scratch: Path) -> list:
+    """macOS: leave out the libraries that no bundled binary binds a symbol to.
+
+    OpenCV's macOS wheel ships FFmpeg as Homebrew builds it, and FFmpeg links
+    each of its libraries against the libraries of all its components: libX11
+    is linked by eight FFmpeg libraries and used by none, and libsrt links
+    libssl without using it. dyld loads every linked library and refuses to
+    load a binary when one is missing, so such a link is made weak in a copy of
+    the linking binary (only the load command's type changes; library ordinals
+    stay as they are) and the library is not bundled, which is what
+    ``ld -dead_strip_dylibs`` would have done when the libraries were built.
+
+    A library goes only when at least one bundled binary links it (libraries
+    loaded with dlopen(), such as Qt plugins, are linked by nothing and stay),
+    and every bundled binary that still links it does so with a plain or weak
+    load command (not a re-export or upward link) and binds no symbol to it.
+    It also stays when any remaining binary looks up by name a symbol it
+    defines (see ``macho_bindings``). Python extension modules always stay. A
+    library that only removed libraries linked goes too. If any Mach-O file
+    cannot be read, nothing is removed.
+
+    The PyInstaller build then rewrites and re-signs the copies like any other
+    collected binary. Returns the new TOC list.
+    """
+    infos = {}
+    for dest, src, kind in entries:
+        if kind not in {"BINARY", "EXTENSION"}:
+            continue
+        try:
+            info = macho_bindings(Path(src).read_bytes())
+        except (OSError, ValueError) as exc:
+            log.warning(
+                "Keeping every linked library; cannot read the bindings of %s: %s", src, exc
+            )
+            return entries
+        if info is not None:
+            infos[dest] = (kind, info)
+
+    by_name: dict = {}
+    for dest in infos:
+        by_name.setdefault(_file_name(dest), []).append(dest)
+
+    def targets(name: str) -> list:
+        return by_name.get(_file_name(name), [])
+
+    users: dict = {}  # bundled library -> the bundled binaries that link it
+    for dest, (_kind, info) in infos.items():
+        for _offset, _command, name in info["links"]:
+            for target in targets(name):
+                if target != dest:
+                    users.setdefault(target, set()).add(dest)
+
+    def binds_nothing(user: str, target: str) -> bool:
+        info = infos[user][1]
+        return all(
+            command in (_LC_LOAD_DYLIB, _LC_LOAD_WEAK_DYLIB) and name not in info["bound"]
+            for _offset, command, name in info["links"]
+            if target in targets(name)
+        )
+
+    unused: set = set()
+    while True:
+        lookups = collections.Counter(
+            symbol
+            for dest, (_kind, info) in infos.items()
+            if dest not in unused
+            for symbol in info["lookups"]
+        )
+        newly = set()
+        for target, linked_by in users.items():
+            kind, info = infos[target]
+            if target in unused or kind != "BINARY":
+                continue
+            if any(lookups[symbol] > (symbol in info["lookups"]) for symbol in info["exports"]):
+                continue  # another binary may find one of its symbols by name
+            if all(binds_nothing(user, target) for user in linked_by - unused):
+                newly.add(target)
+        if not newly:
+            break
+        unused |= newly
+    if not unused:
+        return entries
+
+    weakened = {}
+    for dest, (_kind, info) in infos.items():
+        if dest in unused:
+            continue
+        offsets = [
+            offset
+            for offset, command, name in info["links"]
+            if command == _LC_LOAD_DYLIB and any(target in unused for target in targets(name))
+        ]
+        if offsets:
+            weakened[dest] = offsets
+    result = []
+    for dest, src, kind in entries:
+        if dest in weakened:
+            data = bytearray(Path(src).read_bytes())
+            for offset in weakened[dest]:
+                struct.pack_into("<I", data, offset, _LC_LOAD_WEAK_DYLIB)
+            copy = scratch / dest
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            copy.write_bytes(data)
+            src = str(copy)
+        result.append((dest, src, kind))
+    log.info(
+        "Not bundling libraries that no bundled binary uses: %s (now weakly linked by %s)",
+        ", ".join(sorted(_file_name(dest) for dest in unused)),
+        ", ".join(sorted(_file_name(dest) for dest in weakened)),
+    )
+    return _without(result, unused)
+
+
 def macos_minimum_version(distributions, floor=(12, 0)) -> str:
     """The oldest macOS every bundled wheel supports (never below ``floor``).
 
@@ -644,6 +967,11 @@ a.binaries = prune_unreferenced_openssl(
         [entry for entry in a.binaries if not _unwanted(entry[0])], _removed_binaries
     )
 )
+if IS_MACOS:
+    # libX11, libssl and libhwy, which OpenCV's wheel links but never uses (see the function).
+    a.binaries = prune_unused_macos_libraries(
+        a.binaries, Path(workpath) / "unused-libraries"  # noqa: F821 - injected by PyInstaller
+    )
 a.datas = [entry for entry in a.datas if not _unwanted(entry[0])]
 
 pyz = PYZ(a.pure)  # noqa: F821 - injected by PyInstaller

@@ -136,12 +136,44 @@ jobs:
         run: |
           set -euo pipefail
           cfg="$RUNNER_TEMP/eye-tracker-smoke"
+          clips="$RUNNER_TEMP/eye-tracker-clips"
           "$CLI" --version
           "$CLI" --config-dir "$cfg" doctor --json > doctor.json
           "$CLI" --config-dir "$cfg" bench --camera packaging/linux/eye-tracker.png \
             --seconds 1 --json > bench.json
+          # Video files are read by the bundled FFmpeg. The test clips are written with
+          # the build environment's OpenCV: an AVI by OpenCV's own MJPEG encoder and an
+          # MP4 (MPEG-4 Part 2) by FFmpeg.
+          uv run --no-sync python - "$clips" <<'PY'
+          import sys
+          from pathlib import Path
+
+          import cv2
+          import numpy as np
+
+          clips = Path(sys.argv[1])
+          clips.mkdir(parents=True, exist_ok=True)
+          for name, api, codec in (
+              ("clip.avi", cv2.CAP_OPENCV_MJPEG, "MJPG"),
+              ("clip.mp4", cv2.CAP_FFMPEG, "mp4v"),
+          ):
+              fourcc = cv2.VideoWriter.fourcc(*codec)
+              writer = cv2.VideoWriter(str(clips / name), api, fourcc, 10.0, (160, 120))
+              assert writer.isOpened(), name
+              for level in range(0, 250, 25):
+                  writer.write(np.full((120, 160, 3), level, np.uint8))
+              writer.release()
+          PY
+          for clip in clip.avi clip.mp4; do
+            "$CLI" --config-dir "$cfg" bench --camera "$clips/$clip" --seconds 1 --json \
+              > "bench-$clip.json"
+          done
+          # The runners have no camera, but probing runs each platform's capture backend
+          # (AVFoundation on macOS) inside the bundle.
+          "$CLI" --config-dir "$cfg" doctor --probe-cameras --json > probe.json 2> probe.err
           uv run --no-sync python - <<'PY'
           import json
+          import sys
 
           report = json.load(open("doctor.json", encoding="utf-8"))
           assert report["app"]["frozen"] is True, report["app"]
@@ -149,5 +181,17 @@ jobs:
               assert model.get("present") and model.get("sha256_ok"), (name, model)
           bench = json.load(open("bench.json", encoding="utf-8"))
           assert bench["modes"]["max"]["analysed"] > 0, bench["modes"]
+          for clip in ("clip.avi", "clip.mp4"):
+              video = json.load(open(f"bench-{clip}.json", encoding="utf-8"))
+              assert video["device"] == f"file {clip}", video
+              assert video["frame_size"] == [160, 120], video
+              assert video["modes"]["max"]["analysed"] > 0, video["modes"]
+          cameras = json.load(open("probe.json", encoding="utf-8"))["cameras"]
+          assert cameras["probed"] is True, cameras
+          assert isinstance(cameras["devices"], list), cameras
+          if sys.platform == "darwin" and not cameras["devices"]:
+              # Printed by OpenCV's AVFoundation backend for each camera it cannot open.
+              errors = open("probe.err", encoding="utf-8").read()
+              assert "OpenCV: camera failed to properly initialize!" in errors, errors
           print("smoke test passed")
           PY

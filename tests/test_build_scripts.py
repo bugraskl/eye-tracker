@@ -739,6 +739,23 @@ def test_linux_builds_check_that_gtk_and_gio_stay_out() -> None:
     assert check in _workflow("bundle.yml")
 
 
+def test_bundle_smoke_test_reads_videos_and_probes_cameras() -> None:
+    """The frozen app must still import OpenCV, decode video files with the bundled
+    FFmpeg and run the camera backends after the spec leaves libraries out."""
+    text = _workflow("bundle.yml")
+    smoke = text[text.index("- name: Smoke-test the frozen CLI") :]
+    for fragment in (
+        "bench --camera packaging/linux/eye-tracker.png",
+        '("clip.avi", cv2.CAP_OPENCV_MJPEG, "MJPG")',
+        '("clip.mp4", cv2.CAP_FFMPEG, "mp4v")',
+        'bench --camera "$clips/$clip"',
+        'assert video["modes"]["max"]["analysed"] > 0',
+        "doctor --probe-cameras --json > probe.json 2> probe.err",
+        '"OpenCV: camera failed to properly initialize!" in errors',
+    ):
+        assert fragment in smoke, fragment
+
+
 def test_bug_report_names_the_command_of_every_package() -> None:
     text = (REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml").read_text(encoding="utf-8")
     for fragment in (

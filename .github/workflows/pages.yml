@@ -3,7 +3,9 @@ name: Website
 # Publishes the project website (site/) to GitHub Pages:
 # https://bugraskl.github.io/eye-tracker/
 # The download buttons are filled in from the latest GitHub release at build
-# time, so the site is rebuilt whenever a release is published.
+# time, so the site is rebuilt for every release: release.yml starts this
+# workflow after publishing (a release created with the workflow token triggers
+# nothing by itself), and "release: published" covers releases made by hand.
 on:
   push:
     branches:

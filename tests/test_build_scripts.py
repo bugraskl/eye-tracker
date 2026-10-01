@@ -772,6 +772,14 @@ def test_the_bundle_check_keeps_and_publishes_nothing() -> None:
     assert "action-gh-release" not in _workflow("build.yml")
 
 
+def test_release_rebuilds_the_website() -> None:
+    """A release made with GITHUB_TOKEN triggers no workflow; release.yml starts pages.yml."""
+    text = _workflow("release.yml")
+    assert "gh workflow run pages.yml" in text
+    assert "actions: write" in text
+    assert "workflow_dispatch:" in _workflow("pages.yml")
+
+
 def test_workflow_runs_are_grouped() -> None:
     """A newer push cancels an older check; release runs never cancel each other. The
     called build workflow runs in its caller's group (it may not define its own)."""

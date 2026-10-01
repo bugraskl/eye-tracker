@@ -45,6 +45,8 @@ jobs:
       # Build provenance attestations (Sigstore), verifiable with `gh attestation verify`.
       id-token: write
       attestations: write
+      # Start the website build (pages.yml) once the release exists.
+      actions: write
     env:
       VERSION: ${{ needs.build.outputs.version }}
     steps:
@@ -99,3 +101,12 @@ jobs:
             artifacts/EyeTracker-${{ env.VERSION }}-linux-x86_64.AppImage
             artifacts/EyeTracker-${{ env.VERSION }}-linux-x86_64.tar.gz
             artifacts/SHA256SUMS.txt
+
+      - name: Rebuild the website with this release
+        # A release published with the workflow's own token starts no other
+        # workflow, so pages.yml's "release published" trigger never fires for
+        # it; start the website build explicitly. Pre-releases are not shown.
+        if: ${{ needs.build.outputs.prerelease != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref main

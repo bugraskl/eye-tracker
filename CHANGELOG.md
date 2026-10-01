@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Fixed
+
+- The website now rebuilds with the new download links as soon as a release is published.
+
 ## [0.2.0] - 2026-10-01
 
 ### Added

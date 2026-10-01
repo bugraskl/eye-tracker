@@ -60,6 +60,11 @@ def calibration_file() -> Path:
     return data_dir() / "calibration.json"
 
 
+def state_file() -> Path:
+    """What the app remembers between runs that is no setting (privacy mode)."""
+    return data_dir() / "state.json"
+
+
 def log_file() -> Path:
     return log_dir() / f"{APP_SLUG}.log"
 

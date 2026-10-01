@@ -272,6 +272,7 @@ def _non_default_settings() -> Settings:
     s.presence.warning_s = 15
     s.presence.require_input_idle = False
     s.presence.wake_on_return = False
+    s.privacy.remember_privacy_mode = False
     s.privacy.pause_when_locked = False
     s.privacy.yield_camera = False
     s.privacy.pause_for_apps = ["zoom.exe", "obs64.exe"]
@@ -317,6 +318,22 @@ def test_tooltips_come_from_the_settings_documentation(dialog: SettingsDialog) -
         if not row["doc"] or row["key"] in UNBOUND:
             continue
         assert row["doc"] in dialog.widget_for(row["key"]).toolTip(), row["key"]
+
+
+def test_input_that_the_system_does_not_report_is_marked(
+    controller: FakeController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r3-ux-docs-08: on Wayland outside GNOME input cannot cancel the countdown."""
+    caps = dict.fromkeys(PlatformServices().capabilities(), True)
+    caps["input_idle"] = False
+    monkeypatch.setattr(controller.platform, "capabilities", lambda: dict(caps))
+    dlg = SettingsDialog(controller)
+    try:
+        box = dlg.widget_for("presence.require_input_idle")
+        assert isinstance(box, QCheckBox)
+        assert box.text().endswith("(not supported on this system)")
+    finally:
+        _dispose(dlg)
 
 
 def test_pages_cover_the_six_sections(dialog: SettingsDialog) -> None:
@@ -1116,6 +1133,55 @@ def test_wizard_flow_applies_choices(
     assert fake_autostart.calls == ["enable"]
     assert wizard.wants_calibration
     assert requested == [True]
+
+
+def test_wizard_recommends_no_calibration_for_one_monitor(fake_autostart: FakeAutostart) -> None:
+    """r3-ux-docs-03: with one monitor a calibration changes nothing."""
+    single = FirstRunWizard(FakeController(monitors=(LEFT,)), show_permissions=False)
+    double = FirstRunWizard(FakeController(), show_permissions=False)
+    try:
+        assert not single.finish_page.calibrate.isChecked()
+        assert not single.finish_page.one_monitor.isHidden()
+        assert double.finish_page.calibrate.isChecked()
+        assert double.finish_page.one_monitor.isHidden()
+    finally:
+        _dispose(single)
+        _dispose(double)
+
+
+def test_wizard_countdown_names_only_what_cancels_it(
+    fake_autostart: FakeAutostart, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r3-ux-docs-08: where input is not counted, moving the mouse cancels nothing."""
+    texts: list[str] = []
+    for require_input, observable in ((True, True), (False, True), (True, False)):
+        settings = Settings()
+        settings.presence.require_input_idle = require_input
+        controller = FakeController(settings)
+        caps = dict.fromkeys(PlatformServices().capabilities(), True)
+        caps["input_idle"] = observable
+        monkeypatch.setattr(controller.platform, "capabilities", lambda caps=caps: dict(caps))
+        wizard = FirstRunWizard(controller, show_permissions=False)
+        try:
+            texts.append(wizard.presence_page.countdown.text())
+        finally:
+            _dispose(wizard)
+    assert "move the mouse or look at the camera to cancel it" in texts[0]
+    for text in texts[1:]:
+        assert "look at the camera to cancel it" in text
+        assert "mouse" not in text
+
+
+def test_wizard_finish_page_says_how_to_reach_the_tray_icon(
+    fake_autostart: FakeAutostart, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r3-ux-docs-04: on Windows 11 the icon starts in the hidden overflow area."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert "click ^ on the taskbar" in wz._finish_subtitle()
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert "right-click the eye icon" in wz._finish_subtitle()
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert "menu bar" in wz._finish_subtitle()
 
 
 def test_wizard_walk_away_off_and_no_calibration(

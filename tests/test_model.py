@@ -10,9 +10,12 @@ from typing import Any
 import numpy as np
 import pytest
 
+from eye_tracker.gaze.calibration import evaluate
 from eye_tracker.gaze.model import (
     DEFAULT_ALPHAS,
     LOOK_AWAY_EXCESS,
+    LOOK_AWAY_MARGIN,
+    AwayRegion,
     GazeModel,
     gaze_feature_indices,
     lopo_predictions,
@@ -23,10 +26,15 @@ from eye_tracker.types import Monitor, Rect, nearest_monitor, virtual_bounds
 from gaze_synth import (
     FEATURE_NAMES,
     GAZE,
+    MIXED,
+    MIXED_PANELS,
     STACKED,
     THREE,
     TWO,
+    below_panels_cm,
     below_points,
+    calibration_samples,
+    features_at_cm,
     grid_dataset,
     pixel_errors,
     random_points,
@@ -659,7 +667,9 @@ def fitted_on_synthetic_calibration(
     X, P, groups = grid_dataset(monitors, rng, noise=1.0, camera_x=camera_x)
     bounds = virtual_bounds(monitors)
     selection = select_model(X, P, groups, bounds=bounds, nonlinear=GAZE)
-    return GazeModel(selection.degree, selection.alpha, nonlinear=GAZE).fit(X, P, bounds=bounds)
+    model = GazeModel(selection.degree, selection.alpha, nonlinear=GAZE)
+    # As calibration.evaluate fits it: with the look-away regions of the monitors.
+    return model.fit(X, P, bounds=bounds, regions=[m.rect for m in monitors])
 
 
 @pytest.mark.parametrize(
@@ -684,6 +694,7 @@ def test_combined_look_away_test_keeps_every_screen_reachable(
         for region in (taskbar_points, edge_points):
             rate = away_rate(region(monitors, rng, 500), **change)
             assert rate <= 0.01, (name, region.__name__, rate)
+    assert away_rate(below_points(monitors, rng, 300, 30)) >= 0.9
     for cm in (40, 60, 80):
         assert away_rate(below_points(monitors, rng, 300, cm)) >= 0.95, cm
 
@@ -697,3 +708,135 @@ def test_per_feature_test_loses_the_taskbar_when_the_head_eye_split_changes() ->
     feats = synth_features(taskbar_points(TWO, rng, 500), rng, 1.0, **change)
     assert np.mean([model.looks_away(f) for f in feats]) > 0.05
     assert np.mean([model.looks_away(f, monitors=TWO) for f in feats]) <= 0.01
+
+
+# ------------------------------------------------- looking away: mixed pixel densities
+def outer_strip(rect: Rect, rng: np.random.Generator, n: int, fraction: float) -> np.ndarray:
+    """Points in the outer (left) ``fraction`` of ``rect``, top to bottom."""
+    xs = rng.uniform(rect.x, rect.x + fraction * rect.w, n)
+    return np.column_stack([xs, rng.uniform(rect.y, rect.bottom, n)])
+
+
+def without_regions(model: GazeModel) -> GazeModel:
+    """The same fit as the previous version made it (no look-away regions)."""
+    data = model.to_dict()
+    del data["away_regions"]
+    return GazeModel.from_dict(data)
+
+
+@pytest.mark.parametrize("seed", [140, 141, 142])
+def test_mixed_density_desk_keeps_the_coarse_monitors_edge_on_screen(seed: int) -> None:
+    """r3-logic-02: a 1080p panel next to a 4K one at 100 %. One linear map for the
+    whole desk overshoots on the coarse monitor, and its outer edge read as
+    "looking away", most of all while the user leans in (the per-feature rule
+    used before flagged none of it)."""
+    rng = np.random.default_rng(seed)
+    samples = calibration_samples(MIXED, rng, 1.0, per_point=15, panels=MIXED_PANELS)
+    model, _ = evaluate(samples, MIXED, nonlinear=GAZE)
+    coarse, dense = model.away_regions
+    assert coarse.rect == MIXED[0].rect
+    assert coarse.diagonal > 1.2 * MIXED[0].rect.diagonal  # placed larger than it is
+    assert dense == AwayRegion.of(MIXED[1].rect)  # placed smaller: the monitor itself
+    previous = without_regions(model)
+
+    def away_rate(m: GazeModel, points: np.ndarray, **change: Any) -> float:
+        feats = synth_features(points, rng, 1.0, panels=MIXED_PANELS, **change)
+        return float(np.mean([m.looks_away(f, monitors=MIXED) for f in feats]))
+
+    leaning_in = {"head_offset": (0.0, 0.0, -10.0)}
+    strip = outer_strip(MIXED[0].rect, rng, 500, 0.10)
+    assert away_rate(model, strip, **leaning_in) <= 0.01
+    assert away_rate(previous, strip, **leaning_in) >= 0.1  # the regression
+    for name, change in {**ON_SCREEN_CHANGES, "leans in": leaning_in}.items():
+        for region in (taskbar_points, edge_points):
+            rate = away_rate(model, region(MIXED, rng, 400), **change)
+            assert rate <= 0.01, (name, region.__name__, rate)
+    # Glances at the desk are caught as well as before.
+    for cm, minimum in ((40, 0.3), (60, 0.75)):
+        x, y = below_panels_cm(MIXED_PANELS, rng, 300, cm)
+        feats = features_at_cm(x, y, rng, 1.0)
+        rate = float(np.mean([model.looks_away(f, monitors=MIXED) for f in feats]))
+        before = float(np.mean([previous.looks_away(f, monitors=MIXED) for f in feats]))
+        assert rate >= minimum, cm
+        assert rate >= before - 0.02, cm
+
+
+@pytest.mark.parametrize(
+    ("monitors", "camera_x", "seed"),
+    [(TWO, 1920.0, 50), (THREE, 960.0, 52), (STACKED, 960.0, 53)],
+    ids=["two", "three", "stacked"],
+)
+def test_regions_never_make_the_look_away_test_stricter(
+    monitors: list[Monitor], camera_x: float, seed: int
+) -> None:
+    rng = np.random.default_rng(seed)
+    model = fitted_on_synthetic_calibration(monitors, camera_x, rng)
+    assert [r.rect for r in model.away_regions] == [m.rect for m in monitors]
+    for region, monitor in zip(model.away_regions, monitors, strict=True):
+        rect = monitor.rect
+        assert region.x0 <= rect.x
+        assert region.y0 <= rect.y
+        assert region.x1 >= rect.right
+        assert region.y1 >= rect.bottom
+        assert region.diagonal >= rect.diagonal
+    previous = without_regions(model)
+    points = np.concatenate(
+        [random_points(monitors, rng, 300, margin=0.0), below_points(monitors, rng, 300, 25)]
+    )
+    feats = synth_features(points, rng, 1.0, camera_x, head_offset=(0.0, 0.0, -8.0))
+    for f in feats:
+        if not previous.looks_away(f, monitors=monitors):
+            assert not model.looks_away(f, monitors=monitors)
+
+
+def test_away_regions_round_trip_and_validation() -> None:
+    rng = np.random.default_rng(144)
+    samples = calibration_samples(MIXED, rng, 1.0, per_point=10, panels=MIXED_PANELS)
+    model, _ = evaluate(samples, MIXED, nonlinear=GAZE)
+    data = json.loads(json.dumps(model.to_dict()))
+    restored = GazeModel.from_dict(data)
+    assert restored.away_regions == model.away_regions
+    # Malformed regions make the model invalid, like every other field.
+    for broken in (
+        "not a list",
+        [{"rect": [0, 0, 10, 10], "box": [0, 0, 10], "diagonal": 14.0}],
+        [{"rect": [0, 0, 10, 10], "box": [5, 0, 0, 10], "diagonal": 14.0}],
+        [{"rect": [0, 0, 10, 10], "box": [0, 0, 10, 10], "diagonal": float("nan")}],
+        [{"rect": [0, 0, 0, 10], "box": [0, 0, 10, 10], "diagonal": 14.0}],
+        [["rect"]],
+    ):
+        with pytest.raises(ValueError, match=r"model data|away region"):
+            GazeModel.from_dict(dict(data, away_regions=broken))
+    # Older files have none and still load.
+    legacy = dict(data)
+    del legacy["away_regions"]
+    assert GazeModel.from_dict(legacy).away_regions == ()
+
+
+def test_away_regions_widen_the_test_only_for_their_own_monitor() -> None:
+    model, _ = simple_gaze_model()  # its linear estimate is the gaze point itself
+    data = model.to_dict()
+    # Where a coarser monitor would be placed: 400 px further left, and larger.
+    data["away_regions"] = [
+        {"rect": [0, 0, 1000, 500], "box": [-400, 0, 1000, 500], "diagonal": 2000}
+    ]
+    widened = GazeModel.from_dict(data)
+    beside = gaze_at(-500, 250)  # 0.45 of the screen's diagonal to its left
+    assert model.looks_away(beside, monitors=SCREEN)
+    assert not widened.looks_away(beside, monitors=SCREEN)
+    assert widened.looks_away(gaze_at(-1300, 250), monitors=SCREEN)  # beyond its margin too
+    # The region of another layout (a profile of another desk) does not apply.
+    taller = [Monitor(0, "screen", Rect(0, 0, 1000, 600))]
+    assert widened.looks_away(beside, monitors=taller)
+    assert LOOK_AWAY_MARGIN * Rect(0, 0, 1000, 600).diagonal < 500
+
+
+def test_away_regions_need_targets_spread_over_the_monitor() -> None:
+    rng = np.random.default_rng(145)
+    samples = calibration_samples(TWO, rng, 1.0, per_point=10, points_per_monitor=1)
+    X = np.array([s.features for s in samples])
+    Y = np.array([(s.x, s.y) for s in samples])
+    rects = [m.rect for m in TWO]
+    model = GazeModel(1, 1.0, nonlinear=GAZE).fit(X, Y, bounds=virtual_bounds(TWO), regions=rects)
+    # One dot per monitor cannot place its corners: the monitors themselves.
+    assert model.away_regions == tuple(AwayRegion.of(r) for r in rects)

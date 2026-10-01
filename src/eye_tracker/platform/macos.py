@@ -1023,13 +1023,12 @@ class MacPlatform(PlatformServices):
     def permissions(self) -> dict[str, bool | None]:
         """Camera and Accessibility permission (``None``: unknown or not decided).
 
-        In ``eye-tracker-cli`` an untrusted process reports Accessibility as
-        ``None``: macOS judged whatever started it (see :meth:`_is_helper`),
-        not the app, so ``doctor`` must not call the app's grant missing.
+        In ``eye-tracker-cli`` Accessibility is ``None`` whatever macOS says: it
+        judged whatever started the command (see :meth:`_is_helper`), usually the
+        terminal, not the app, so ``doctor`` must neither call the app's grant
+        missing nor report a trusted terminal's grant as the app's.
         """
-        accessibility = self._accessibility_permission()
-        if accessibility is False and self._is_helper():
-            accessibility = None
+        accessibility = None if self._is_helper() else self._accessibility_permission()
         return {"camera": self._camera_permission(), "accessibility": accessibility}
 
     def accessibility_status(self) -> str:
@@ -1043,20 +1042,20 @@ class MacPlatform(PlatformServices):
           it no longer applies. The fix: remove Eye Tracker from Privacy &
           Security › Accessibility with "−", then add the app again.
         * ``"unknown"``: the Accessibility API is unavailable, or this is
-          ``eye-tracker-cli`` without the permission (it may be the terminal,
-          not the app, that lacks it; see :meth:`_is_helper`).
+          ``eye-tracker-cli``, whose answer from macOS belongs to whatever
+          started it (usually the terminal), not to the app; see :meth:`_is_helper`.
 
         Only packaged builds can be told apart this way; a source checkout
         (whose permission belongs to the terminal or Python) reports "missing".
         """
+        if self._is_helper():
+            return "unknown"
         trusted = self._accessibility_permission()
         if trusted is None:
             return "unknown"
         self._trust_cache = (self._clock(), trusted)
         if trusted:
             return "granted"
-        if self._is_helper():
-            return "unknown"
         current = self._fingerprint()
         if current is None:
             return "missing"

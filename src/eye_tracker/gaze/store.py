@@ -563,6 +563,8 @@ def _round_model(d: dict[str, Any]) -> dict[str, Any]:
             return float(f"{v:.{_MODEL_DIGITS}g}")
         if isinstance(v, list):
             return [rnd(x) for x in v]
+        if isinstance(v, dict):  # the look-away regions
+            return {k: rnd(x) for k, x in v.items()}
         return v
 
     return {k: rnd(v) for k, v in d.items()}

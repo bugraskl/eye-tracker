@@ -96,7 +96,9 @@ GitHub Actions are pinned to full commit SHAs; Dependabot proposes updates.
 1. Open an issue first for anything larger than a bug fix, so we can agree on the approach.
 2. Keep pull requests focused; one behaviour change per PR.
 3. Add or update tests. Logic changes in `engine/` or `gaze/` need unit tests.
-4. Update `CHANGELOG.md` under **Unreleased**.
+4. Update `CHANGELOG.md` under **Unreleased** (start that section if there is none). Until a
+   version has been released, its own section describes it as it is, so describe changes to it
+   there.
 5. Platform-specific changes: say which OS and desktop environment you tested on.
 
 ## Reporting bugs

@@ -203,6 +203,11 @@ class PresenceSettings:
 
 @dataclass
 class PrivacySettings:
+    remember_privacy_mode: bool = _opt(
+        True,
+        doc="Privacy mode stays on when Eye Tracker or the computer restarts (also after an "
+        "update), so the camera never comes back on by itself.",
+    )
     pause_when_locked: bool = _opt(True, doc="Release the camera while the session is locked.")
     yield_camera: bool = _opt(
         True,
@@ -221,7 +226,8 @@ class PrivacySettings:
         "curtain",
         choices=("notify", "curtain", "lock"),
         doc="Shoulder guard reaction. After you unlock a lock it caused, 'lock' covers the "
-        "screens instead of locking again for 5 minutes.",
+        "screens instead of locking again until nobody has looked over your shoulder for "
+        "5 minutes.",
     )
     guard_delay_s: float = _opt(
         2.0, lo=0.5, hi=30.0, doc="Seconds a second face must be visible before reacting."
@@ -256,9 +262,12 @@ class PrivacySettings:
 #:   Introduce Functional Parameter (Ctrl+Alt+Shift+T/C/P), VS Code for Copy Path
 #:   (Ctrl+Alt+Shift+C). Neither binds Ctrl+Alt+Super. The other usual switches
 #:   (Super+Space, Caps Lock, Shift+Caps Lock) leave the defaults alone; the rare
-#:   ones that do (grp:ctrl_alt_toggle, the Win-key switches) are detected by the
-#:   hotkey manager, which then reports the hotkey as unavailable instead of
-#:   grabbing a chord that cannot be pressed.
+#:   options that do (grp:ctrl_alt_toggle, the Win-key switches and selectors,
+#:   altwin:ctrl_win, ...) are detected by the hotkey manager, which then reports
+#:   the hotkey as unavailable instead of grabbing a chord that cannot be pressed.
+#:   One limit remains where a desktop binds Super on its own (Xubuntu's menu):
+#:   its grab takes the keyboard while Super is held, so the chord works only
+#:   with Ctrl or Alt pressed first. The hotkey manager detects that and says so.
 #: * macOS: Control+Option+Command+letter types nothing. Rectangle and Magnet, the
 #:   window managers multi-monitor Mac users run most, take ⌃⌥ with arrows and
 #:   letters by default (⌃⌥T Last Two Thirds, ⌃⌥C Center) and ⌃⌥⌘ only with ←/→

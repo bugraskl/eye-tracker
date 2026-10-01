@@ -293,6 +293,36 @@ def test_user_returning_next_to_the_onlooker_is_not_owner_missing() -> None:
     assert not g.owner_missing
 
 
+def test_new_onlooker_is_noticed_while_the_user_is_wrongly_judged_gone() -> None:
+    """r3-logic-03: after a misjudged "the user left", every later onlooker was
+    ignored until the next keyboard or mouse input."""
+    g = guard(delay_s=2.0, clear_s=1.5)
+    feed_boxes(g, 0, 3, faces=1, box=SEATED_USER)
+    # A colleague leans in (the primary face) while the user makes room.
+    assert feed_boxes(g, 3.25, 6, faces=2, box=LEANING_COLLEAGUE) == [(5.25, "trigger")]
+    # The colleague leaves; the user now sits further back and aside, reading.
+    leaned_back = (0.55, 0.36, 0.13, 0.18)
+    assert feed_boxes(g, 6.25, 126, faces=1, box=leaned_back) == []
+    assert g.owner_missing
+    # A stranger looks over the user's shoulder: the guard reacts again, once.
+    assert feed_boxes(g, 126.25, 136, faces=2, box=leaned_back) == [(128.25, "trigger")]
+    assert g.active
+    # The stranger leaves: still judged by boxes, the guard stays up as before.
+    assert feed_boxes(g, 136.25, 140, faces=1, box=leaned_back) == []
+    assert g.owner_missing
+
+
+def test_user_back_next_to_the_onlooker_does_not_trigger_again() -> None:
+    g = guard(delay_s=1.0, clear_s=1.5)
+    assert feed_boxes(g, 0, 1, faces=2, box=OWNER) == [(1.0, "trigger")]
+    feed_boxes(g, 1.25, 5, faces=1, box=ONLOOKER)
+    assert g.owner_missing
+    # The user sits down at their old place next to the onlooker: same visit.
+    assert feed_boxes(g, 5.25, 15, faces=2, box=OWNER_MOVED) == []
+    assert g.active
+    assert not g.owner_missing
+
+
 def test_without_face_boxes_the_guard_clears_as_before() -> None:
     g = guard(delay_s=1.0, clear_s=1.5)
     feed_boxes(g, 0, 1, faces=2, box=None)

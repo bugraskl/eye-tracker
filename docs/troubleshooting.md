@@ -31,7 +31,9 @@ lights may flash).
 **The webcam light stays off.** That is expected while tracking is paused, in privacy mode, while
 the screen is locked, while another app uses the camera, and while an app from **Pause while these
 apps run** is running. The tray tooltip shows the state. Walk-away detection and the shoulder guard
-pause in these states too.
+pause in these states too. Privacy mode stays on after a restart until you turn it off (a
+notification says so when Eye Tracker starts in it); to have it forgotten at every restart, untick
+**Keep privacy mode on after a restart** under Settings → Presence & privacy.
 
 **"Camera appears covered".** Frames were almost completely dark. Open the shutter, or improve the
 lighting. If you cover the camera while you are at the computer, walk-away detection pauses, but
@@ -120,9 +122,9 @@ is yours again, or when someone uses the keyboard or mouse a little after you we
 **Esc** or **Dismiss** takes it down at any time, and so do pause and privacy mode.
 
 **"Lock the computer" covered the screens instead.** After you unlock a lock that the guard caused,
-it covers the screens instead of locking again, for 5 minutes or until the second face has left;
-otherwise a colleague next to you would lock you out two seconds after every unlock. If locking
-fails, the guard covers the screens as well.
+it covers the screens instead of locking again until nobody has looked over your shoulder for 5
+minutes; otherwise a colleague next to you would lock you out again every time they turn back to
+the screen. If locking fails, the guard covers the screens as well.
 
 ## Hotkeys
 
@@ -134,7 +136,8 @@ hotkey (Alt+Shift, Ctrl+Alt, the Win key, …). While Eye Tracker runs, `eye-tra
 each hotkey under *registration* ("registered", or "not registered:" and the reason) and flags
 combinations that are invalid or type a character. Pick another in **Settings → Hotkeys**. On Linux
 Wayland, global hotkeys are not available; bind `eye-tracker ctl` commands instead
-([details](platform-support.md#wayland)).
+([details](platform-support.md#wayland)). On Xubuntu (and other desktops that open a menu with the
+Super key alone), press Ctrl and Alt before Super: Super pressed first goes to the menu.
 
 **My hotkeys changed after an update.** Hotkeys that were still at an earlier version's defaults
 (Ctrl+Alt+T/P/C, or Ctrl+Alt+Shift+T/P/C on Linux) move to today's defaults once. Hotkeys you chose

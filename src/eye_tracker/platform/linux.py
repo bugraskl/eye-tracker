@@ -182,6 +182,12 @@ _LOGIND_LOCK_DESKTOPS = (
     "deepin",
 )
 
+#: Distributions that brand GNOME Shell sessions with their own name in front
+#: (``ubuntu:GNOME``, ``pop:GNOME``). Other desktops that list GNOME second do so
+#: for compatibility only: Budgie (``Budgie:GNOME``) locks with budgie-screensaver,
+#: a gnome-screensaver 3.6 fork that never reports to logind's ``LockedHint``.
+_GNOME_SHELL_VENDORS = ("ubuntu", "pop", "zorin", "endless")
+
 #: Variables set by tiling window managers / compositors for their IPC (sway
 #: also sets ``I3SOCK``). See ``_standalone_compositor``.
 _COMPOSITOR_SOCKET_VARS = (
@@ -323,9 +329,33 @@ def _desktop_handles_logind_lock(env: Mapping[str, str]) -> bool:
     return any(name in token for token in _desktop_tokens(env) for name in _LOGIND_LOCK_DESKTOPS)
 
 
+def _session_desktop(env: Mapping[str, str]) -> str:
+    """The session's own desktop: the first ``XDG_CURRENT_DESKTOP`` entry (later
+    ones are compatibility fallbacks), else the session name; lower-cased."""
+    for key in ("XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP", "DESKTOP_SESSION"):
+        for token in re.split(r"[:;]", env.get(key, "")):
+            if token.strip():
+                return token.strip().lower()
+    return ""
+
+
+def _runs_gnome_shell(env: Mapping[str, str]) -> bool:
+    """Whether GNOME Shell (or GNOME Flashback) runs the session, as opposed to a
+    desktop that merely lists GNOME as a fallback (see :data:`_GNOME_SHELL_VENDORS`)."""
+    own = _session_desktop(env)
+    return "gnome" in own or own in _GNOME_SHELL_VENDORS
+
+
 def _locked_hint_authoritative(env: Mapping[str, str]) -> bool:
-    """Desktops whose lock screen always reports itself through logind's ``LockedHint``."""
-    return (_is_gnome_env(env) or _is_kde_env(env)) and not _standalone_compositor(env)
+    """Desktops whose lock screen always reports itself through logind's ``LockedHint``.
+
+    Only these may have a locker's claimed success checked against the hint;
+    elsewhere a lock that the hint never shows would be taken for a failure,
+    and the next locker would lock the user a second time.
+    """
+    if _standalone_compositor(env):
+        return False
+    return _is_kde_env(env) or _runs_gnome_shell(env)
 
 
 def _lock_commands(session_id: str | None) -> list[list[str]]:
@@ -1776,12 +1806,21 @@ class LinuxPlatform(PlatformServices):
         session = self._session_id()
         # Where LockedHint is authoritative, any locker's "success" can be checked.
         verify_all = session is not None and _locked_hint_authoritative(os.environ)
+        # A desktop with a lock screen of its own: the display manager's lock
+        # (dm-tool switches to the greeter) would come on top of it.
+        own_locker = _desktop_handles_logind_lock(os.environ)
         unconfirmed: str | None = None  # a locker ran, but the screen did not lock in time
         for argv in _lock_commands(session):
             if shutil.which(argv[0]) is None:
                 continue
             if unconfirmed is not None and self._lock_evident(session):
                 return unconfirmed  # a slow locker reacted after all: do not stack another
+            if unconfirmed is not None and own_locker and argv[0] == "dm-tool":
+                # The desktop's locker said it locked but nothing shows it (or it
+                # refused by policy): a greeter on top would make the user unlock
+                # twice, or lock them again right after they unlocked.
+                log.debug("Not stacking dm-tool lock on the desktop's own lock screen")
+                continue
             result = self._run(argv, _ACTION_TIMEOUT_S)
             if result is None:
                 continue

@@ -1540,7 +1540,9 @@ def test_mac_carbon_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
 # ================================================================================ X11
 KEYSYMS = {
     name: index + 1
-    for index, name in enumerate(sorted(set(hotkeys._X_KEYSYM_NAMES.values()) | {"Num_Lock"}))
+    for index, name in enumerate(
+        sorted(set(hotkeys._X_KEYSYM_NAMES.values()) | {"Num_Lock", "Super_L", "Super_R"})
+    )
 }
 NUMLOCK_KEYCODE = KEYSYMS["Num_Lock"] + 8
 
@@ -1980,6 +1982,54 @@ def test_x11_parse_xkb_options(value: Any, expected: tuple[str, ...]) -> None:
             ["lv3:lwin_switch"],
             "Ctrl+Alt+Super+T includes Super, which acts as AltGr (XKB option lv3:lwin_switch)",
         ),
+        # r3-platform-hotkeys-03: options that leave no Super (or no Ctrl) at all.
+        (
+            "ctrl+alt+meta+t",
+            ["grp:win_menu_switch"],
+            f"Ctrl+Alt+Super+T includes Super, {SWITCHES_LAYOUT} (XKB option grp:win_menu_switch)",
+        ),
+        (
+            "ctrl+alt+meta+t",
+            ["grp:win_menu_select"],
+            f"Ctrl+Alt+Super+T includes Super, {SWITCHES_LAYOUT} (XKB option grp:win_menu_select)",
+        ),
+        (
+            "ctrl+alt+meta+p",
+            ["grp:ctrl_select"],
+            f"Ctrl+Alt+Super+P includes Ctrl, {SWITCHES_LAYOUT} (XKB option grp:ctrl_select)",
+        ),
+        (
+            "ctrl+alt+meta+p",
+            ["grp:lctrl_rctrl_switch"],
+            f"Ctrl+Alt+Super+P includes Ctrl, {SWITCHES_LAYOUT} "
+            "(XKB option grp:lctrl_rctrl_switch)",
+        ),
+        (
+            "ctrl+alt+meta+c",
+            ["altwin:ctrl_win"],
+            "Ctrl+Alt+Super+C includes Super, which turns the Win keys into Ctrl "
+            "(XKB option altwin:ctrl_win)",
+        ),
+        (
+            "ctrl+alt+meta+c",
+            ["altwin:alt_win"],
+            "Ctrl+Alt+Super+C includes Super, which turns the Win keys into Alt "
+            "(XKB option altwin:alt_win)",
+        ),
+        (
+            "ctrl+alt+meta+t",
+            ["lv5:lwin_switch_lock"],
+            "Ctrl+Alt+Super+T includes Super, which acts as a level-5 key "
+            "(XKB option lv5:lwin_switch_lock)",
+        ),
+        (
+            "ctrl+alt+meta+t",
+            ["lv5:lwin_switch_lock_cancel"],
+            "Ctrl+Alt+Super+T includes Super, which acts as a level-5 key "
+            "(XKB option lv5:lwin_switch_lock_cancel)",
+        ),
+        # Swapping keys keeps every modifier available.
+        ("ctrl+alt+meta+t", ["altwin:swap_alt_win", "altwin:ctrl_alt_win"], None),
         # Key toggles only concern their key.
         (
             "ctrl+alt+space",
@@ -2052,7 +2102,7 @@ def test_x11_default_hotkeys_survive_the_usual_layout_switches(
 
 def test_x11_layout_switch_table_is_consistent() -> None:
     for option, taken in hotkeys._X_KEY_OPTIONS.items():
-        assert option.startswith(("grp:", "lv3:")), option
+        assert option.startswith(("grp:", "lv3:", "lv5:", "altwin:")), option
         assert taken.modifiers, option
         assert taken.modifiers <= set(MODIFIERS), option
         assert taken.key is None or taken.key in KEYS, option
@@ -2118,6 +2168,85 @@ def test_x11_follows_layout_switch_changes(
     assert manager.last_error("t") is None
     manager._handle_event(key_event(hotkeys._X_KEY_PRESS, code, mods, 10))
     assert fired == [1]
+
+
+def test_x11_hotkey_refused_at_registration_comes_back_with_the_option(
+    x11: tuple[X11HotkeyManager, FakeDisplay],
+    x11_labels: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3-platform-hotkeys-04: a hotkey refused when it was registered was never
+    tried again, and its error kept naming an option that was gone."""
+    manager, display = x11
+    atom = display.set_xkb_options("grp:ctrl_alt_toggle")
+    manager._follow_xkb_options()
+    # register() as the app calls it, run synchronously on this thread.
+    monkeypatch.setattr(manager, "_backend_start", lambda: True)
+    monkeypatch.setattr(manager, "_call_on_thread", lambda fn, default: fn())
+    fired: list[int] = []
+    assert not manager.register("t", "ctrl+alt+meta+t", lambda: fired.append(1))
+    assert manager.registered == {}
+    error = manager.last_error("t")
+    assert error is not None
+    assert "grp:ctrl_alt_toggle" in error
+    # The user moves the layout switch to Super+Space, as the message suggests.
+    display.set_xkb_options("grp:win_space_toggle")
+    manager._handle_event(property_event(atom))
+    code, mods = keycode_of("t"), 4 | 8 | 64
+    assert (code, mods) in display.root.grabs
+    assert manager.registered == {"t": hk("ctrl+alt+meta+t")}
+    assert manager.last_error("t") is None
+    manager._handle_event(key_event(hotkeys._X_KEY_PRESS, code, mods, 10))
+    assert fired == [1]
+    # Unregistering forgets it; nothing comes back with the next change.
+    assert manager.unregister("t")
+    assert display.root.grabs == set()
+    display.set_xkb_options("grp:alt_space_toggle")
+    manager._handle_event(property_event(atom))
+    assert display.root.grabs == set()
+    # Other refusals (another program holds the chord) are not kept.
+    display.root.foreign.add((code, mods))
+    assert not manager.register("t", "ctrl+alt+meta+t", lambda: None)
+    assert "t" not in manager._bindings
+
+
+def test_x11_super_key_taken_by_another_program_is_explained(
+    x11: tuple[X11HotkeyManager, FakeDisplay],
+) -> None:
+    """r3-platform-hotkeys-02: Xubuntu's menu grabs Super alone, which hides a
+    chord pressed Super first from our grab although XGrabKey succeeded."""
+    manager, display = x11
+    manager._check_super_alone()
+    assert manager.note is None
+    assert display.root.grabs == set()  # the probe released what it got
+    super_l = KEYSYMS["Super_L"] + 8
+    for variant in hotkeys._x11_lock_variants(manager._numlock_mask):
+        display.root.foreign.add((super_l, variant))  # xfsettingsd's grab
+    manager._check_super_alone()
+    assert manager.note == hotkeys._SUPER_TAKEN_NOTE
+    assert "Ctrl or Alt is pressed before Super" in manager.note
+    assert display.root.grabs == set()
+    # Re-checked after a keyboard mapping change: the menu was unbound.
+    display.root.foreign.clear()
+    manager._handle_event(types.SimpleNamespace(type=hotkeys._X_MAPPING_NOTIFY, request=1))
+    assert manager.note is None
+    assert display.root.grabs == set()
+
+
+def test_x11_super_key_note_keeps_the_managers_own_note(
+    fake_keysyms: None,
+) -> None:
+    display = FakeDisplay()
+    manager = X11HotkeyManager(note="Running under Wayland.", display_factory=lambda n: display)
+    manager._display = display
+    manager._root = display.root
+    super_r = KEYSYMS["Super_R"] + 8
+    display.root.foreign.add((super_r, 0))
+    manager._check_super_alone()
+    assert manager.note == f"Running under Wayland. {hotkeys._SUPER_TAKEN_NOTE}"
+    manager._super_taken = True
+    manager._thread_teardown()
+    assert manager.note == "Running under Wayland."
 
 
 def test_x11_mapping_change_rereads_the_layout_switches(

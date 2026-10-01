@@ -195,7 +195,7 @@ def settle(qapp: QApplication, rounds: int = 3) -> None:
 def test_build_app_creates_and_wires_everything(
     build: Callable[..., Harness], qapp: QApplication
 ) -> None:
-    h = build()
+    h = build(monitors=TWO_MONITORS)
     ctx = h.ctx
     assert ctx.exit_code is None
     assert ctx.server is not None
@@ -274,7 +274,7 @@ def test_ui_requests_open_single_windows(
 
 
 def test_calibration_opens_once(build: Callable[..., Harness], qapp: QApplication) -> None:
-    h = build()
+    h = build(monitors=TWO_MONITORS)
     h.controller.calibration_required.emit("hotkey")
     window = h.app.calibration_window
     assert window is not None
@@ -373,7 +373,7 @@ def test_helpers_follow_the_controller(build: Callable[..., Harness]) -> None:
 def test_first_run_wizard_then_calibration(
     build: Callable[..., Harness], qapp: QApplication, fake_autostart: list[str]
 ) -> None:
-    h = build(settings=Settings(), background=False)
+    h = build(settings=Settings(), monitors=TWO_MONITORS, background=False)
     settle(qapp)
     wizard = h.app.wizard
     assert wizard is not None
@@ -392,6 +392,32 @@ def test_first_run_wizard_then_calibration(
     assert window is not None
     assert window.is_active
     assert fake_autostart == ["refresh"]  # "Start at login" was left unticked
+
+
+def test_putting_off_the_offered_calibration_says_what_that_means(
+    build: Callable[..., Harness], qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r3-ux-docs-01: Esc on the calibration the setup assistant opened left no hint."""
+    h = build(settings=Settings(), monitors=TWO_MONITORS, background=False)
+    titles = _tray_messages(h, monkeypatch)
+    settle(qapp)
+    wizard = h.app.wizard
+    assert wizard is not None
+    wizard.accept()  # "Calibrate now" is ticked with two monitors
+    settle(qapp)
+    window = h.app.calibration_window
+    assert window is not None
+    window.cancel()
+    settle(qapp)
+    assert titles == ["Calibration needed"]
+    # One the user asked for and cancelled needs no such hint (even unannounced).
+    h.app._announced.clear()
+    h.tray.open_calibration.emit()
+    window = h.app.calibration_window
+    assert window is not None
+    window.cancel()
+    settle(qapp)
+    assert titles == ["Calibration needed"]
 
 
 def test_background_start_skips_the_wizard(
@@ -780,6 +806,50 @@ def test_a_prompt_muted_after_a_login_start_is_shown_later(
     window = h.app.calibration_window
     assert window is not None
     assert window.is_active
+
+
+def test_an_uncalibrated_login_start_still_says_why_nothing_switches(
+    build: Callable[..., Harness], qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r3-ux-docs-01: a --background start dropped the calibration prompt for good."""
+    monkeypatch.setattr(app_module, "STARTUP_QUIET_S", 0.3)
+    h = build(monitors=TWO_MONITORS)  # --background, set up, never calibrated
+    titles = _tray_messages(h, monkeypatch)
+    settle(qapp)
+    assert titles == []  # a login start stays quiet at first
+    assert _wait_for(qapp, lambda: bool(titles))
+    assert titles == ["Calibration needed"]
+
+
+def test_no_calibration_prompt_where_it_changes_nothing(
+    build: Callable[..., Harness], qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r3-ux-docs-03: with switching turned off a calibration achieves nothing."""
+    settings = Settings()
+    settings.general.first_run_done = True
+    settings.switching.enabled = False
+    h = build(settings=settings, monitors=TWO_MONITORS, background=False)
+    titles = _tray_messages(h, monkeypatch)
+    settle(qapp)
+    h.controller.calibration_required.emit("not calibrated yet")
+    assert titles == []
+    assert h.controller.state is TrackingState.TRACKING
+
+
+def test_privacy_mode_kept_from_the_last_run_is_announced(
+    build: Callable[..., Harness], qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r3-ux-docs-02: privacy mode survives a restart; the user is told once."""
+    monkeypatch.setattr(app_module, "STARTUP_QUIET_S", 0.3)
+    paths.state_file().write_text('{"privacy_mode": true}\n', encoding="utf-8")
+    h = build(monitors=TWO_MONITORS)  # a login start, e.g. after an overnight update
+    titles = _tray_messages(h, monkeypatch)
+    assert h.controller.privacy
+    assert h.controller.state is TrackingState.PRIVACY
+    assert True not in h.worker.active  # the camera never came on
+    assert _wait_for(qapp, lambda: bool(titles))
+    # No calibration prompt while the camera is off on purpose.
+    assert titles == ["Privacy mode is still on"]
 
 
 def test_window_requests_during_a_calibration_raise_it_instead(

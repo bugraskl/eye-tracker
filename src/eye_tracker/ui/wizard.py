@@ -460,8 +460,7 @@ class _FinishPage(QWizardPage):
         super().__init__()
         s = wizard.scale
         self.setTitle("You're all set")
-        tray = "menu bar" if sys.platform == "darwin" else "system tray"
-        self.setSubTitle(f"{APP_NAME} keeps running in the {tray}.")
+        self.setSubTitle(_finish_subtitle())
         layout = QVBoxLayout(self)
         layout.setSpacing(round(10 * s))
         self.calibrate = QCheckBox("Calibrate now (recommended, about 30 seconds)")
@@ -470,6 +469,14 @@ class _FinishPage(QWizardPage):
             "Switching needs a short calibration: you look at a few dots on each screen."
         )
         layout.addWidget(self.calibrate)
+        #: Shown instead of a recommendation when there is nothing to switch between.
+        self.one_monitor = _muted(
+            "With one monitor there is nothing to switch between, so no calibration is "
+            "needed: walk-away detection, privacy mode and the shoulder guard work as they "
+            "are. Connect a second monitor and calibrate from the tray menu."
+        )
+        self.one_monitor.setVisible(False)
+        layout.addWidget(self.one_monitor)
         self.autostart = QCheckBox(f"Start {APP_NAME} when I log in")
         layout.addWidget(self.autostart)
         layout.addSpacing(round(10 * s))
@@ -479,6 +486,22 @@ class _FinishPage(QWizardPage):
         layout.addWidget(self.shortcuts)
         layout.addStretch(1)
         layout.addWidget(_muted("Everything can be changed later under Settings."))
+
+
+def _finish_subtitle() -> str:
+    """Where the app lives from now on, and how its icon is used there."""
+    if sys.platform == "darwin":
+        return f"{APP_NAME} keeps running in the menu bar: click the eye icon for its menu."
+    if sys.platform == "win32":
+        # Windows 11 puts new tray icons in the hidden overflow area.
+        return (
+            f"{APP_NAME} keeps running in the system tray: click the eye icon for its menu. "
+            "If you don't see it, click ^ on the taskbar."
+        )
+    return (
+        f"{APP_NAME} keeps running in the system tray: right-click the eye icon for its "
+        "menu, double-click it for the settings."
+    )
 
 
 # ====================================================================== wizard
@@ -683,6 +706,15 @@ class FirstRunWizard(QWizard):
         super().reject()
 
     # ============================================================== pages
+    def _monitor_count(self) -> int | None:
+        """How many monitors the controller sees (``None`` if it cannot say)."""
+        monitors = getattr(self._controller, "monitors", None)
+        try:
+            return len(monitors()) if callable(monitors) else None
+        except Exception:
+            log.debug("monitors() failed", exc_info=True)
+            return None
+
     def _load_presence(self, settings: Settings) -> None:
         page = self.presence_page
         choice = settings.presence.action if settings.presence.enabled else "off"
@@ -691,9 +723,14 @@ class FirstRunWizard(QWizard):
         (page.buttons.get(choice) or page.buttons["lock"]).setChecked(True)
         page.timeout.setValue(int(settings.presence.away_timeout_s))
         warning = int(settings.presence.warning_s)
+        # Like CountdownToast.hint_text: input cancels the countdown only where the
+        # settings count it and the system reports it (not on Wayland outside GNOME).
+        if settings.presence.require_input_idle and self.capabilities.get("input_idle", True):
+            cancel = "move the mouse or look at the camera"
+        else:
+            cancel = "look at the camera"
         page.countdown.setText(
-            f"A {warning}-second countdown comes first: move the mouse or look at the camera "
-            "to cancel it."
+            f"A {warning}-second countdown comes first: {cancel} to cancel it."
             if warning
             else "The action happens without a countdown."
         )
@@ -707,6 +744,11 @@ class FirstRunWizard(QWizard):
             supported, enabled = False, False
         page.autostart.setChecked(enabled)
         page.autostart.setEnabled(supported)
+        # A calibration only serves switching: with one monitor it would change
+        # nothing, so it is neither ticked nor recommended there.
+        single = self._monitor_count() == 1
+        page.calibrate.setChecked(not single and settings.switching.enabled)
+        page.one_monitor.setVisible(single)
         rows = []
         labels = {
             "toggle_tracking": "Pause / resume",

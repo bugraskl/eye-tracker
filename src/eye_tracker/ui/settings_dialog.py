@@ -1329,12 +1329,20 @@ class SettingsDialog(QDialog):
         idle = self._check(
             form, "presence.require_input_idle", "Keyboard or mouse use counts as being here"
         )
+        if not self._caps.get("input_idle", True):
+            # Wayland outside GNOME: only the camera can cancel the countdown.
+            idle.setText(idle.text() + " (not supported on this system)")
         wake = self._check(
             form, "presence.wake_on_return", "Turn the displays back on when I return"
         )
         self._depends(enabled, [action, timeout, warning, idle, wake])
 
         form = self._group(layout, "Camera privacy")
+        self._check(
+            form,
+            "privacy.remember_privacy_mode",
+            "Keep privacy mode on after a restart (the camera stays off)",
+        )
         self._check(
             form, "privacy.pause_when_locked", "Release the camera while the screen is locked"
         )

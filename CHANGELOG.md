@@ -4,19 +4,6 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
-
-### Fixed
-
-- Face tracking: the first analysis after a large posture shift, an upward one especially, could
-  stop on a region still far off the face and report the head 12-20° off. Whether it did depended
-  on pixel-level details and even on the CPU. Such regions are now followed up until the face is
-  found.
-- Linux: on a desktop without a system tray (GNOME without an AppIndicator extension) Qt drops tray
-  notifications silently, yet they counted as shown, so a calibration hint was never repeated.
-- `eye-tracker doctor` on Linux and macOS: commands with the home directory shortened to `~` were
-  quoted so that a shell could not expand the `~` when they were pasted.
-
 ## [0.1.0] - 2026-10-01
 
 ### Added
@@ -28,36 +15,41 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   window on that screen gets keyboard focus, without synthetic clicks.
 - Guards against accidental switches: dwell time, hysteresis at the bezel, typing, mouse and
   reading grace periods, and a cooldown. Glances at your phone or desk are recognised from the
-  calibration's estimate of where your head and eyes point, and ignored.
-- Robust face tracking: posture shifts are caught up within the same frame, strongly tilted heads
-  are found, and a poster or a colleague picked up while you were away gives way to you once you
-  are back.
+  calibration's estimate of where your head and eyes point, and ignored, also on desks that mix
+  monitors of different pixel density (a 4K panel next to a 1080p one).
+- Robust face tracking: posture shifts, large upward ones included, are caught up within the same
+  frame, strongly tilted heads are found, and a poster or a colleague picked up while you were away
+  gives way to you once you are back.
 - Guided calibration for any number of monitors in any arrangement, with a quality grade and
-  cross-validated accuracy, and one profile per monitor layout, camera and backend.
+  cross-validated accuracy, and one profile per monitor layout, camera and backend. A setup that
+  is not calibrated yet is reminded of it, also when Eye Tracker starts at login; one monitor, or
+  switching turned off, needs no calibration and gets no prompts.
 - Adaptive learning from natural mouse use and drift alerts that suggest recalibration.
 - Walk-away detection: lock the session and/or switch the displays off after a cancellable
   countdown, and wake the displays when you return. Until the setup assistant is finished, walking
   away only shows a notification.
-- Privacy mode that fully releases the camera (hotkey and tray); automatic pause while the session
-  is locked, while another app uses the camera (Windows and Linux) and while apps from a list run.
+- Privacy mode that fully releases the camera (hotkey and tray) and stays on across restarts and
+  updates until you turn it off; automatic pause while the session is locked, while another app
+  uses the camera (Windows and Linux) and while apps from a list run.
 - An opt-in shoulder-surfer guard that covers the screens, notifies or locks when a second face
   appears behind you. Faces are counted, never recognised, and the guard never decides whether you
-  are at the computer.
+  are at the computer. After you unlock a lock it caused, it covers the screens instead of locking
+  you out again while the colleague next to you is still around.
 - Adaptive frame rate and a motion gate for very low CPU use; Eco, Balanced and Responsive profiles.
 - Global hotkeys on Windows (Ctrl+Alt+Win+T/P/C), macOS (⌃⌥⌘T/P/C) and X11 (Ctrl+Alt+Super+T/P/C).
   A combination that would type a character, that a keyboard-layout option makes impossible to
-  press, or that another app owns is reported instead of failing silently. On Wayland,
-  `eye-tracker ctl` commands can be bound to desktop shortcuts.
+  press, or that another app owns is reported instead of failing silently. The pause and privacy
+  hotkeys confirm with a notification which way they switched. On Wayland, `eye-tracker ctl`
+  commands can be bound to desktop shortcuts.
 - Start at login on Windows, macOS and Linux.
 - `eye-tracker doctor` diagnostics that are safe to paste into a public issue (the home folder is
   shown as `~`), including hotkey registration, the installed Linux lock tools and the command of
   your copy; `eye-tracker bench` performance measurement.
-- Windows installer (per user; optionally puts an `eye-tracker` command on the PATH, and restarts
-  the app after a silent upgrade) and portable ZIP, macOS DMG (macOS 14 or later, Apple silicon),
-  Linux AppImage and tarball (without Qt's GTK theme and its VNC, WebGL and framebuffer platform
-  plugins).
+- Windows installer (per user; optionally puts an `eye-tracker` command on the PATH, which starts
+  the app on its own rather than inside the terminal, and restarts the app after a silent upgrade)
+  and portable ZIP, macOS DMG (macOS 14 or later, Apple silicon), Linux AppImage and tarball
+  (without Qt's GTK theme and its VNC, WebGL and framebuffer platform plugins).
 - A privacy gate that fails CI on networking or frame-writing code and scans every bundled native
   library and Python module of the release builds.
 
-[Unreleased]: https://github.com/bugraskl/eye-tracker/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/bugraskl/eye-tracker/releases/tag/v0.1.0

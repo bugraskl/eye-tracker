@@ -460,6 +460,10 @@ class _Binding:
     name: str
     hotkey: Hotkey
     callback: HotkeyCallback
+    #: Set by a native hook that refused the binding only because of the current
+    #: keyboard layout or its options: the binding is kept (inactive) and tried
+    #: again when the layout changes, like one whose key vanished later.
+    retry_on_layout_change: bool = False
 
 
 class _NativeHotkeyManager(HotkeyManager):
@@ -473,7 +477,9 @@ class _NativeHotkeyManager(HotkeyManager):
     A binding whose OS registration is lost later (an X11 or macOS keyboard layout
     change removed its key) stays in ``_bindings`` so that the next layout change
     can restore it, but it is marked inactive: :attr:`registered` leaves it out and
-    :meth:`last_error` explains why.
+    :meth:`last_error` explains why. So does a binding that a native hook refused
+    only because of the current layout (``_Binding.retry_on_layout_change``):
+    :meth:`register` still returns ``False`` for it.
     """
 
     supported: ClassVar[bool] = True
@@ -540,6 +546,11 @@ class _NativeHotkeyManager(HotkeyManager):
                 if ok:
                     self._bindings[name] = binding
                     self._errors.pop(name, None)
+                elif binding.retry_on_layout_change:
+                    # Kept, inactive, for the layout change that makes it work.
+                    self._bindings[name] = binding
+                    self._inactive.add(binding.id)
+                    self._errors.setdefault(name, f"{label} could not be registered")
                 else:
                     self._by_id.pop(binding.id, None)
                     self._errors.setdefault(name, f"{label} could not be registered")
@@ -2010,6 +2021,13 @@ _X_ANY_PROPERTY_TYPE = 0
 # they applied: "rules\0model\0layout\0variant\0options" (options comma-separated).
 _XKB_RULES_NAMES = "_XKB_RULES_NAMES"
 
+#: :attr:`X11HotkeyManager.note` while another program grabs a Super key on its
+#: own (see ``X11HotkeyManager._check_super_alone``).
+_SUPER_TAKEN_NOTE = (
+    "Another program uses the Super key on its own (Xfce opens its menu with it), so "
+    "shortcuts with Super work only when Ctrl or Alt is pressed before Super."
+)
+
 
 class _XkbKeyOption(NamedTuple):
     """How an XKB option repurposes keys of a hotkey (see :data:`_X_KEY_OPTIONS`)."""
@@ -2024,6 +2042,9 @@ class _XkbKeyOption(NamedTuple):
 
 _SWITCHES_LAYOUT = "switches the keyboard layout"
 _ACTS_AS_ALTGR = "acts as AltGr"
+_ACTS_AS_LEVEL5 = "acts as a level-5 key"
+_WIN_AS_CTRL = "turns the Win keys into Ctrl"
+_WIN_AS_ALT = "turns the Win keys into Alt"
 
 
 def _xkb_option(effect: str, *modifiers: str, key: str | None = None) -> _XkbKeyOption:
@@ -2045,7 +2066,11 @@ def _xkb_option(effect: str, *modifiers: str, key: str | None = None) -> _XkbKey
 #:   applications (Ctrl+Alt+Shift+T arrives as Ctrl+Alt+T, which opens a terminal).
 #: * Single-key switches (``grp:lalt_toggle``, ``grp:lwin_switch``, the Win and Alt
 #:   ``lv3`` switches, …) turn the (left) key into a layout or AltGr key, so it no
-#:   longer adds its modifier at all.
+#:   longer adds its modifier at all. So do the layout *selectors*
+#:   (``grp:win_menu_select``, ``grp:ctrl_select``; ``grp:win_menu_switch`` and
+#:   ``grp:lctrl_rctrl_switch`` are their older names, still accepted), the
+#:   level-5 Win keys (``lv5:lwin_switch_lock``) and ``altwin:ctrl_win`` /
+#:   ``altwin:alt_win``, which make both Win keys Ctrl or Alt: no Super is left.
 #: * Space toggles: the hotkey would fire, but every press also switches the layout.
 #:
 #: Right-hand-only variants (``grp:ralt_rshift_toggle``, ``grp:rctrl_rshift_toggle``,
@@ -2074,10 +2099,18 @@ _X_KEY_OPTIONS: dict[str, _XkbKeyOption] = {
     "grp:lwin_toggle": _xkb_option(_SWITCHES_LAYOUT, "meta"),
     "grp:lwin_switch": _xkb_option(_SWITCHES_LAYOUT, "meta"),
     "grp:win_switch": _xkb_option(_SWITCHES_LAYOUT, "meta"),
+    "grp:win_menu_select": _xkb_option(_SWITCHES_LAYOUT, "meta"),
+    "grp:win_menu_switch": _xkb_option(_SWITCHES_LAYOUT, "meta"),
+    "grp:ctrl_select": _xkb_option(_SWITCHES_LAYOUT, "ctrl"),
+    "grp:lctrl_rctrl_switch": _xkb_option(_SWITCHES_LAYOUT, "ctrl"),
     "lv3:lalt_switch": _xkb_option(_ACTS_AS_ALTGR, "alt"),
     "lv3:alt_switch": _xkb_option(_ACTS_AS_ALTGR, "alt"),
     "lv3:lwin_switch": _xkb_option(_ACTS_AS_ALTGR, "meta"),
     "lv3:win_switch": _xkb_option(_ACTS_AS_ALTGR, "meta"),
+    "lv5:lwin_switch_lock": _xkb_option(_ACTS_AS_LEVEL5, "meta"),
+    "lv5:lwin_switch_lock_cancel": _xkb_option(_ACTS_AS_LEVEL5, "meta"),
+    "altwin:ctrl_win": _xkb_option(_WIN_AS_CTRL, "meta"),
+    "altwin:alt_win": _xkb_option(_WIN_AS_ALT, "meta"),
     # Space toggles: every press of the hotkey would also switch the layout.
     "grp:alt_space_toggle": _xkb_option(_SWITCHES_LAYOUT, "alt", key="space"),
     "grp:ctrl_space_toggle": _xkb_option(_SWITCHES_LAYOUT, "ctrl", key="space"),
@@ -2233,6 +2266,13 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
     After a keyboard mapping change every binding is grabbed again at its new
     keycode; one whose key vanished (``setxkbmap ru``) stays known, is reported
     as inactive and is grabbed again by the next mapping change that restores it.
+    A hotkey refused when it was registered, because its key was missing or a
+    layout switch took its keys, is kept and retried the same way.
+
+    A Super key that another client grabs on its own (Xubuntu opens its menu
+    with it) takes the whole keyboard while it is held, so a chord pressed
+    Super first never reaches these grabs. That cannot be fixed from here; it
+    is detected and explained in :attr:`note`.
 
     A hotkey that contains a configured keyboard-layout switch (Alt+Shift with
     ``grp:alt_shift_toggle``, see :data:`_X_KEY_OPTIONS`) is refused, because
@@ -2253,6 +2293,8 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
         display_factory: Callable[[str | None], Any] | None = None,
     ) -> None:
         super().__init__(note)
+        # The note this manager was created with; the Super-key remark is added to it.
+        self._base_note = note
         self._display_name = display_name
         self._display_factory = display_factory or _x11_open_display
         self._display: Any = None
@@ -2266,6 +2308,7 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
         self._xkb_options: tuple[str, ...] | None = None
         # Only touched on the hotkey thread:
         self._rules_atom = 0  # the _XKB_RULES_NAMES atom (0: options not followed)
+        self._super_taken = False  # another client grabs Super alone (_check_super_alone)
         self._grabs: dict[int, tuple[int, int]] = {}  # binding id → (keycode, modifier mask)
         self._lookup: dict[tuple[int, int], int] = {}  # (keycode, modifier mask) → binding id
         self._held: set[int] = set()
@@ -2303,6 +2346,7 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
         self._root = display.screen().root
         self._numlock_mask = self._find_numlock_mask()
         self._follow_xkb_options()
+        self._check_super_alone()
         return True
 
     def _thread_loop(self) -> None:
@@ -2342,6 +2386,9 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
         self._root = None
         self._rules_atom = 0
         self._xkb_options = None
+        if self._super_taken:  # checked again when the thread starts again
+            self._super_taken = False
+            self.note = self._base_note
         self._grabs.clear()
         self._lookup.clear()
         self._held.clear()
@@ -2456,9 +2503,12 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
         # without this check the hotkey would silently never fire.
         switch = _x11_layout_switch_conflict(binding.hotkey, self._xkb_options or ())
         if switch is not None:
+            # Grabbed as soon as the user moves the switch elsewhere (_regrab_all).
+            binding.retry_on_layout_change = True
             return self._reject(binding, switch)
         keycode = self._keycode_for(binding.hotkey.key)
         if not keycode:
+            binding.retry_on_layout_change = True
             return self._reject(
                 binding, f"the key of {label} is not on the current keyboard layout"
             )
@@ -2495,6 +2545,41 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
         self._display.sync()
         return False
 
+    def _check_super_alone(self) -> None:
+        """Note whether another client grabs a Super key on its own (hotkey thread only).
+
+        Xubuntu binds Super_L and Super_R without modifiers to its menu, and
+        xfsettingsd grabs them asynchronously and acts on the release. X
+        activates a passive grab only while the keyboard is not grabbed, so with
+        Super pressed first the whole keyboard belongs to that client until
+        Super is released, and Ctrl+Alt+Super+T never reaches this manager's
+        grab (Ctrl or Alt first works). Such a grab is found by asking for the
+        same one, which X refuses with BadAccess; a grab that is granted is
+        released at once. The result is explained in :attr:`note`.
+        """
+        taken = False
+        try:
+            for name in ("Super_L", "Super_R"):
+                keysym = _x11_string_to_keysym(name)
+                keycode = int(self._display.keysym_to_keycode(keysym)) if keysym else 0
+                if keycode and not self._grab(keycode, 0):
+                    taken = True
+                    break
+                if keycode:
+                    quiet = _XErrorCatcher()
+                    for variant in _x11_lock_variants(self._numlock_mask):
+                        self._root.ungrab_key(keycode, variant, onerror=quiet)
+                    self._display.sync()
+        except Exception:
+            log.debug("Checking the Super key grabs failed", exc_info=True)
+            return
+        if taken != self._super_taken:
+            self._super_taken = taken
+            if taken:
+                log.warning("Another program grabs the Super key on its own: %s", _SUPER_TAKEN_NOTE)
+        parts = [part for part in (self._base_note, _SUPER_TAKEN_NOTE if taken else None) if part]
+        self.note = " ".join(parts) or None
+
     def _ungrab(self, binding_id: int) -> None:
         grab = self._grabs.pop(binding_id, None)
         self._held.discard(binding_id)
@@ -2523,6 +2608,7 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
         for binding_id in list(self._grabs):
             self._ungrab(binding_id)
         self._numlock_mask = self._find_numlock_mask()
+        self._check_super_alone()  # the Super keys may have new keycodes
         for binding in wanted.values():
             ok = self._grab_binding(binding)  # logs why it failed
             if not ok:

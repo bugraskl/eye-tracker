@@ -10,7 +10,7 @@ checkable by anyone.
 | **Nothing leaves your computer.** | There is no networking code in the application. The only socket it listens on is a local, per-user IPC channel (a named pipe on Windows, a Unix socket elsewhere) used by `eye-tracker ctl`, and it accepts only your own user account. On Linux the app also talks to your desktop over the local D-Bus and X11 sockets. None of them reaches the network. | `scripts/check_privacy.py` fails CI on any networking import. Every release build, and every pull request that changes the packaging or the dependencies, is scanned as well: every bundled native library and every bundled Python module. Run a firewall or `strace -f -e trace=connect` yourself. |
 | **Frames are never stored.** | Camera frames live in memory for one analysis step. No image or video is written anywhere. | The privacy check fails CI on `imwrite`, `imencode` and `VideoWriter` under `src/`; other image APIs (such as Qt's `QImage.save`) are left to code review. |
 | **Only numbers are kept.** | The calibration file holds head angles, iris ratios and the screen points they map to. | Open `calibration.json`; it is plain JSON. |
-| **The camera is really off when it says so.** | Privacy mode, pause and the locked screen *release* the camera device (the webcam light goes out); they do not just ignore frames. | Watch the webcam LED. |
+| **The camera is really off when it says so.** | Privacy mode, pause and the locked screen *release* the camera device (the webcam light goes out); they do not just ignore frames. Privacy mode stays on after Eye Tracker or the computer restarts, also after an update, until you turn it off, so the camera never comes back on by itself (**Keep privacy mode on after a restart** in Settings → Presence & privacy). | Watch the webcam LED. |
 | **No telemetry, no accounts, no update checks.** | There is nothing to phone home to. | See the first row. |
 
 ## Why not the MediaPipe runtime
@@ -54,6 +54,7 @@ reviewed.
 |---|---|---|
 | `settings.json` | Your preferences | Windows `%LOCALAPPDATA%\bugraskl\eye-tracker\`, macOS `~/Library/Application Support/eye-tracker/`, Linux `~/.config/eye-tracker/` |
 | `calibration.json` | Calibration profiles: numeric feature vectors, target points, the fitted model, and learned samples from mouse use | Windows `%LOCALAPPDATA%\bugraskl\eye-tracker\`, macOS `~/Library/Application Support/eye-tracker/`, Linux `~/.local/share/eye-tracker/` |
+| `state.json` | Whether privacy mode is on, so that it stays on after a restart | Next to `calibration.json` |
 | `eye-tracker.log` | Events such as "switched to monitor 2" or "camera opened". No window titles, no key contents, no images. Rotated at 1 MB × 3. | The platform log directory; `eye-tracker doctor` prints the exact paths |
 
 The Windows portable ZIP uses the same folders. Started with `--config-dir DIR`, Eye Tracker keeps
@@ -95,7 +96,10 @@ Because faces are only counted, never recognised:
   the screen. The other way round, if you leave while another person stays in view, walk-away
   detection does not lock the computer; the curtain stays up instead.
 - With **Lock the computer**, once you unlock a lock the guard caused, it covers the screens instead
-  of locking again for 5 minutes, or until the second face has left.
+  of locking again, until nobody has looked over your shoulder for 5 minutes.
+- If the guard takes you for the person who left (you moved to another spot while a closer face hid
+  yours), a new second face still gets its reaction: the curtain, notification or lock does not
+  wait for your next keystroke.
 
 Like walk-away detection, the guard needs the camera: it pauses while tracking is paused, in privacy
 mode, during calibration and while another app has the camera.

@@ -36,6 +36,12 @@ Whose face is whose is judged by continuity, not by size:
   whoever works at the computer with a single face in view is the user from
   then on. That also heals a wrong judgement - the guard never stays stuck
   on a user sitting at their own desk.
+* While the owner is judged missing, two or more faces in view for
+  ``delay_s`` trigger the guard again. The judgement may be wrong (the user
+  moved to another spot while a larger face hid their box), and then a new
+  onlooker looks over the shoulder of a user reading without touching
+  anything: the reaction (curtain, notification, lock) must not stay off
+  until the next keystroke.
 """
 
 from __future__ import annotations
@@ -188,14 +194,21 @@ class ShoulderGuard:
         if face_count >= 2:
             self._single_since = None
             self._follow_owner_among_faces(face_box)
-            if self._active:
-                return None
+            if self._active and not self._owner_left:
+                return None  # already reacted to these faces
             if self._multi_since is None or now - self._multi_last > tolerance:
                 self._multi_since = now
             self._multi_last = now
             if now - self._multi_since >= cfg.delay_s:
-                self._active = True
                 self._multi_since = None
+                if self._active:
+                    # Several faces while the user was judged gone: whoever they
+                    # are, someone may be looking over a shoulder again (see the
+                    # module docstring). React once more; the guard stays active.
+                    self._owner_left = False
+                    log.info("Shoulder guard triggered again (%d faces)", face_count)
+                    return "trigger"
+                self._active = True
                 log.info("Shoulder guard triggered (%d faces)", face_count)
                 return "trigger"
             return None

@@ -80,11 +80,12 @@ while tracking is paused, in privacy mode, during calibration and while another 
 
 | Key | Default | Allowed | Description |
 |---|---|---|---|
+| `privacy.remember_privacy_mode` | `true` |  | Privacy mode stays on when Eye Tracker or the computer restarts (also after an update), so the camera never comes back on by itself. |
 | `privacy.pause_when_locked` | `true` |  | Release the camera while the session is locked. |
 | `privacy.yield_camera` | `true` |  | Release the camera while another app is using it (Windows and Linux only). Walk-away detection and the shoulder guard pause meanwhile. |
 | `privacy.pause_for_apps` | `[]` |  | Process names that pause tracking while running (e.g. 'obs64.exe'). The camera is released, so walk-away detection and the shoulder guard pause too. |
 | `privacy.shoulder_guard` | `false` |  | React when a second face appears behind you. |
-| `privacy.guard_action` | `curtain` | `notify` · `curtain` · `lock` | Shoulder guard reaction. After you unlock a lock it caused, 'lock' covers the screens instead of locking again for 5 minutes. |
+| `privacy.guard_action` | `curtain` | `notify` · `curtain` · `lock` | Shoulder guard reaction. After you unlock a lock it caused, 'lock' covers the screens instead of locking again until nobody has looked over your shoulder for 5 minutes. |
 | `privacy.guard_delay_s` | `2.0` | 0.5 – 30 | Seconds a second face must be visible before reacting. |
 
 ## Hotkeys

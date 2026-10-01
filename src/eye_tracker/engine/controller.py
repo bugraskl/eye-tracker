@@ -85,7 +85,7 @@ from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QCursor, QGuiApplication
 
 from .. import __version__, paths
-from ..config import Settings
+from ..config import Settings, atomic_write_text
 from ..gaze.filters import PointFilter
 from ..gaze.learning import DriftMonitor, ImplicitLearner, plausible_label, refit_model
 from ..gaze.model import gaze_feature_indices
@@ -178,9 +178,12 @@ DRIFT_ALERT_COOLDOWN_S = 1800.0
 #: invalidate a calibration that fits the new one.
 FEATURE_MISMATCH_LIMIT = 5
 #: After the user unlocks a session the shoulder guard locked, a second face in
-#: view shows the privacy curtain instead of locking again for this long (or
-#: until the onlooker has left): otherwise a colleague sitting down next to the
-#: user would lock the screen again two seconds after every unlock.
+#: view shows the privacy curtain instead of locking again: otherwise a colleague
+#: sitting down next to the user would lock the screen again two seconds after
+#: every unlock. The grace lasts this long after the unlock and after every later
+#: trigger it absorbs, so it holds while the colleague keeps coming back into
+#: view (turning to the user, looking down at notes) and ends once nobody has
+#: looked over the user's shoulder for this long.
 GUARD_RELOCK_GRACE_S = 300.0
 #: Consecutive refused pointer moves after which switching pauses (backing off
 #: from ``WARP_BACKOFF_S``, doubling up to ``WARP_BACKOFF_MAX_S``) instead of
@@ -476,6 +479,30 @@ class _BuiltBackend:
     gaze_indices: tuple[int, ...] | None
 
 
+def _saved_privacy_mode() -> bool:
+    """Whether privacy mode was on when the app last ran (``paths.state_file()``).
+
+    An unreadable file counts as "off": it is only ever written by
+    :func:`_save_privacy_mode`, so damage means it never held a choice.
+    """
+    try:
+        data = json.loads(paths.state_file().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError) as exc:
+        log.warning("Could not read the remembered privacy mode: %s", exc)
+        return False
+    return isinstance(data, dict) and data.get("privacy_mode") is True
+
+
+def _save_privacy_mode(enabled: bool) -> None:
+    """Remember privacy mode for the next start (never raises)."""
+    try:
+        atomic_write_text(paths.state_file(), json.dumps({"privacy_mode": enabled}) + "\n")
+    except OSError as exc:
+        log.warning("Could not remember privacy mode for the next start: %s", exc)
+
+
 def _layout_key(monitors: list[Monitor]) -> tuple[tuple[int, int, int, int, int], ...]:
     return tuple((m.index, m.rect.x, m.rect.y, m.rect.w, m.rect.h) for m in monitors)
 
@@ -605,6 +632,8 @@ class Controller(QObject):
         # Independent causes from which the state is derived (see _derive_state).
         self._paused = False
         self._privacy = False
+        # Privacy mode was switched back on at start (remember_privacy_mode).
+        self._privacy_restored = False
         self._calibrating = False
         self._session_locked = False
         self._yield_reason = ""
@@ -756,6 +785,18 @@ class Controller(QObject):
         self._set_monitors(self._read_monitors())
         self._presence.reset(now)
         self._paused = self._paused or bool(s.general.start_paused)
+        if _saved_privacy_mode() and not self._privacy:
+            if s.privacy.remember_privacy_mode:
+                # Turned on before the last quit, reboot or update: the camera must
+                # not come back on by itself. Applied before the first state, so
+                # the worker never opens it.
+                self._privacy = True
+                self._privacy_restored = True
+                log.info("Privacy mode is still on from the previous run")
+            else:
+                # Not remembered: turning remembering on later must not bring back
+                # a choice from a run that did not apply it.
+                _save_privacy_mode(False)
         self._load_calibration()
 
         worker = self._worker_factory(
@@ -776,6 +817,12 @@ class Controller(QObject):
         self._apply_motion_gate()
         self._sync_backend_info()
         self._validate_calibration(announce=False)
+        if self._model is None and self._calibration_useful() and not self._privacy:
+            # The app offers the calibration at start (also after a login start,
+            # once its quiet period is over); the reminders on the user's return
+            # (_remind_calibration) follow no sooner than CALIBRATION_REMINDER_S.
+            # In privacy mode it does not, and leaving it brings the reminder.
+            self._last_announce = now
 
         # Environment checks run before the camera may open.
         self._check_session_lock(now)
@@ -847,6 +894,12 @@ class Controller(QObject):
     def privacy(self) -> bool:
         """Privacy mode (camera fully off) is on."""
         return self._privacy
+
+    @property
+    def privacy_restored(self) -> bool:
+        """Privacy mode is on because it was on when the app last ran
+        (``privacy.remember_privacy_mode``) and has not been changed since."""
+        return self._privacy_restored and self._privacy
 
     @property
     def preview_enabled(self) -> bool:
@@ -986,14 +1039,19 @@ class Controller(QObject):
             self.pause()
 
     def set_privacy(self, enabled: bool) -> None:
-        """Privacy mode: the camera is fully released (its light goes off)."""
+        """Privacy mode: the camera is fully released (its light goes off).
+
+        The choice is remembered for the next start (``privacy.remember_privacy_mode``).
+        """
         enabled = bool(enabled)
         # An explicit choice made during a calibration is what applies afterwards.
         self._privacy_before_calibration = False
         if enabled == self._privacy:
             return
         self._privacy = enabled
+        self._privacy_restored = False
         log.info("Privacy mode %s", "on" if enabled else "off")
+        _save_privacy_mode(enabled)
         self._update_state()
 
     def toggle_privacy(self) -> None:
@@ -1172,18 +1230,19 @@ class Controller(QObject):
         ``"error: …"``.
         """
         cmd = (command or "").strip().lower()
-        if cmd == "pause":
-            self.pause()
-        elif cmd == "resume":
-            self.resume()
-        elif cmd == "toggle":
-            self.toggle_pause()
-        elif cmd == "privacy-on":
-            self.set_privacy(True)
-        elif cmd == "privacy-off":
-            self.set_privacy(False)
-        elif cmd == "privacy-toggle":
-            self.toggle_privacy()
+        mode_commands: dict[str, Callable[[], None]] = {
+            "pause": self.pause,
+            "resume": self.resume,
+            "toggle": self.toggle_pause,
+            "privacy-on": functools.partial(self.set_privacy, True),
+            "privacy-off": functools.partial(self.set_privacy, False),
+            "privacy-toggle": self.toggle_privacy,
+        }
+        change = mode_commands.get(cmd)
+        if change is not None:
+            before = (self._paused, self._privacy)
+            change()
+            self._confirm_mode_change(before)
         elif cmd == "calibrate":
             self.calibration_required.emit("ipc")
         elif cmd == "status":
@@ -1257,7 +1316,13 @@ class Controller(QObject):
             reason = self._hotkey_error(manager, name)
             if reason:
                 errors[name] = reason
-        return {"registered": registered, "errors": errors}
+        status: dict[str, Any] = {"registered": registered, "errors": errors}
+        note = getattr(manager, "note", None)
+        if isinstance(note, str) and note.strip():
+            # A limitation the running manager found (another program grabbing
+            # the Super key on its own): doctor shows it.
+            status["note"] = note.strip()
+        return status
 
     # ================================================================ housekeeping
     def tick(self) -> None:
@@ -1873,6 +1938,16 @@ class Controller(QObject):
             self._warp_suspensions = 0
             self._switching_suspended_until = -math.inf
             return True
+        # Windows refuses pointer moves as soon as the secure desktop (lock screen,
+        # UAC prompt, Ctrl+Alt+Del) has the input, up to LOCK_POLL_S before the
+        # regular poll notices. Ask now: a refusal caused by a lock says nothing
+        # about the desktop, so it neither counts towards the backoff nor tells
+        # the user that the cursor cannot be moved.
+        self._next_lock_check = now + LOCK_POLL_S
+        self._check_session_lock(now)
+        if self._session_locked:
+            log.info("The system refused to move the pointer: the session is locked")
+            return False
         self._warp_refusals += 1
         log.info("The system refused to move the pointer (%d in a row)", self._warp_refusals)
         if self._warp_refusals >= WARP_REFUSAL_LIMIT:
@@ -1922,7 +1997,7 @@ class Controller(QObject):
         self._learner.mark_refit()
         learned = self._learner.samples
         try:
-            refined = refit_model(cal.samples, learned, model)
+            refined = refit_model(cal.samples, learned, model, monitors=cal.monitors)
         except (ValueError, np.linalg.LinAlgError) as exc:
             log.warning("Could not refine the gaze model: %s", exc)
             return
@@ -1939,7 +2014,7 @@ class Controller(QObject):
             return
         learned = self._learner.samples
         try:
-            refined = refit_model(cal.samples, learned, cal.model)
+            refined = refit_model(cal.samples, learned, cal.model, monitors=cal.monitors)
         except (ValueError, np.linalg.LinAlgError) as exc:
             log.warning("Could not refit the gaze model: %s", exc)
             return
@@ -2079,7 +2154,10 @@ class Controller(QObject):
         if result == "trigger":
             self._on_guard_trigger(now)
         elif result == "clear":
-            self._guard_relock_until = -math.inf  # the onlooker left
+            # Only the curtain comes down. "Clear" means fewer than two faces for
+            # a moment (GuardConfig.clear_s), which a colleague who turns to the
+            # user or looks down at notes already causes; ending the relock grace
+            # here would lock the user out again as soon as they look back.
             self._show_curtain(False)
 
     def _on_guard_trigger(self, now: float) -> None:
@@ -2090,6 +2168,9 @@ class Controller(QObject):
                 return
             if now < self._guard_relock_until:
                 log.info("Shoulder guard: showing the curtain instead of locking again")
+                # Most likely the same visit that followed the unlock: keep the
+                # grace going while the second face keeps coming back.
+                self._guard_relock_until = now + GUARD_RELOCK_GRACE_S
                 self._show_curtain(True)
                 return
             # If locking fails, _finish_lock shows the privacy curtain instead.
@@ -2199,9 +2280,16 @@ class Controller(QObject):
             return TrackingState.AWAY
         if self._camera_error:
             return TrackingState.CAMERA_ERROR
-        if self._model is None:
+        if self._model is None and self._calibration_useful():
             return TrackingState.NEEDS_CALIBRATION
         return TrackingState.TRACKING
+
+    def _calibration_useful(self) -> bool:
+        """Whether a calibration would change anything: it only serves monitor
+        switching, so not with one monitor or with switching turned off. Then
+        presence, privacy mode and the shoulder guard are all there is, and the
+        state must not ask for a calibration (warning badge, prompts)."""
+        return len(self._monitors) >= 2 and self._settings.switching.enabled
 
     def _update_state(self) -> None:
         new = self._derive_state()
@@ -2379,7 +2467,7 @@ class Controller(QObject):
         kept = self._learner.samples
         if data.model.is_fitted:
             try:
-                data.model = refit_model(data.samples, kept, data.model)
+                data.model = refit_model(data.samples, kept, data.model, monitors=data.monitors)
             except (ValueError, np.linalg.LinAlgError) as exc:
                 log.warning(
                     "Could not refit the gaze model after trimming learned samples: %s", exc
@@ -2515,10 +2603,13 @@ class Controller(QObject):
 
     def _remind_calibration(self, now: float) -> None:
         """The user is back (from away, a lock or privacy mode): remind them of a
-        calibration that is still unusable, unless that was said recently."""
+        calibration that is still unusable, unless that was said recently.
+
+        Also when there never was one: otherwise a setup that starts at login and
+        was never calibrated would never be told why nothing switches.
+        """
         if (
-            self._calibration is None
-            or self._model is not None
+            self._model is not None
             or self._announce_pending is not None
             or now - self._last_announce < CALIBRATION_REMINDER_S
         ):
@@ -2554,11 +2645,12 @@ class Controller(QObject):
         """Whether a calibration prompt is appropriate right now.
 
         Not while the user is away or displays are off (monitors drop out during
-        display sleep and come back unchanged), and not with a single monitor,
-        where switching has nothing to do.
+        display sleep and come back unchanged), and not where a calibration would
+        not change anything (one monitor, or switching turned off; a pending
+        announcement is delivered once that changes).
         """
         return (
-            len(self._monitors) >= 2
+            self._calibration_useful()
             and not self._calibrating
             and not self._displays_off_only
             and self._state not in (TrackingState.AWAY, TrackingState.LOCKED, TrackingState.PRIVACY)
@@ -2771,12 +2863,71 @@ class Controller(QObject):
             log.debug("Hotkey %s ignored while hotkeys are suspended", name)
             return
         log.info("Hotkey: %s", name)
+        before = (self._paused, self._privacy)
         if name == "toggle_tracking":
             self.toggle_pause()
+            self._confirm_mode_change(before)
         elif name == "toggle_privacy":
             self.toggle_privacy()
+            self._confirm_mode_change(before)
         elif name == "recalibrate":
             self.calibration_required.emit("hotkey")
+
+    def _confirm_mode_change(self, before: tuple[bool, bool]) -> None:
+        """Confirm a pause or privacy change made by a hotkey or ``ctl`` command.
+
+        Both are toggles, and the tray icon often sits in a hidden overflow area,
+        so without a word the user cannot tell which way a press went, and
+        pausing also stops walk-away detection. ``before`` is ``(paused,
+        privacy)`` before the change. The tray menu needs no confirmation: its
+        check marks show the result.
+        """
+        paused, privacy = self._paused, self._privacy
+        was_paused, was_private = before
+        stopped = (
+            "Switching monitors and walk-away detection pause"
+            if self._settings.presence.enabled
+            else "Switching monitors pauses"
+        )
+        if self._state.camera_active:
+            back_on = "The camera is on again."
+        else:  # e.g. the session is locked, or another app has the camera
+            back_on = f"The camera stays off for now ({self._state.label})."
+        if privacy != was_private:
+            if privacy:
+                title = "Privacy mode on"
+                message = (
+                    f"The camera is off. {stopped} until you turn privacy mode "
+                    f"off{self._hotkey_hint('toggle_privacy')}."
+                )
+            else:
+                title = "Privacy mode off"
+                message = "Tracking is still paused: the camera stays off." if paused else back_on
+        elif paused != was_paused:
+            if paused:
+                title = "Tracking paused"
+                message = (
+                    f"The camera is released. {stopped} until you "
+                    f"resume{self._hotkey_hint('toggle_tracking')}."
+                )
+            else:
+                title = "Tracking resumed"
+                message = "Privacy mode is still on: the camera stays off." if privacy else back_on
+        else:
+            return
+        self._notify(title, message)
+
+    def _hotkey_hint(self, name: str) -> str:
+        """``" (Ctrl+Alt+Win+T)"`` for a registered hotkey ``name``, else ``""``."""
+        from ..platform.hotkeys import Hotkey, format_hotkey
+
+        manager = self._hotkeys
+        try:
+            hotkey = manager.registered.get(name) if manager is not None else None
+        except Exception:
+            log.debug("Reading the registered hotkeys failed", exc_info=True)
+            return ""
+        return f" ({format_hotkey(hotkey)})" if isinstance(hotkey, Hotkey) else ""
 
     # =================================================================== screens
     def _connect_screens(self) -> None:

@@ -15,8 +15,8 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
-from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QCursor, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 from .. import APP_NAME
@@ -61,9 +61,18 @@ _HOTKEY_ACTIONS = ("toggle_tracking", "toggle_privacy", "recalibrate")
 #: DBusMenu of Linux trays sends it as key names ("Super") the shell displays.
 _HOTKEY_AS_TEXT = sys.platform == "win32"
 
-_PAUSE_TIP = "Stop moving the cursor; the camera is released"
+#: Open the menu on a plain (left) click too. Windows shows a tray icon's menu
+#: only on a right-click, while users click tray apps with the left button and
+#: then see nothing happen. macOS shows the menu on any click itself, and Linux
+#: tray hosts differ (some already show it on a left click, a second menu must
+#: not appear there), so only Windows needs it.
+_MENU_ON_CLICK = sys.platform == "win32"
+
+_PAUSE_TIP = "Stop moving the cursor; the camera is released and the walk-away lock pauses too"
 _RESUME_TIP = "Start following your gaze again"
 _PRIVACY_TIP = "Release the camera completely (its light turns off)"
+#: Appended while privacy mode is remembered across restarts (the default).
+_PRIVACY_REMEMBERED_TIP = "; it stays on after a restart"
 _CALIBRATE_TIP = "Look at a few dots so the tracker learns your monitors"
 
 
@@ -111,7 +120,8 @@ class TrayIcon(QObject):
     Menu: status line · Pause/Resume tracking · Privacy mode · Calibrate… ·
     Show gaze dot · Camera preview… · Settings… · Start at login · About · Quit.
     Global hotkeys are shown next to the actions they trigger. Double-clicking
-    the icon opens the settings; a middle click pauses or resumes tracking.
+    the icon opens the settings; a middle click pauses or resumes tracking. On
+    Windows a single click opens the menu as well (see :data:`_MENU_ON_CLICK`).
 
     Args:
         controller: The :class:`~eye_tracker.engine.controller.Controller` (or a
@@ -163,6 +173,14 @@ class TrayIcon(QObject):
         self.tray = QSystemTrayIcon(self)
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self._on_activated)
+        # A single click opens the menu only once it is clearly no double-click
+        # (which opens the settings): Qt reports the first click of a
+        # double-click as a single click too.
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.setInterval(QGuiApplication.styleHints().mouseDoubleClickInterval())
+        self._click_timer.timeout.connect(self.popup_menu)
+        self._ignore_clicks_until = -math.inf
 
         self._connect_controller()
         hints = QGuiApplication.styleHints()
@@ -211,6 +229,7 @@ class TrayIcon(QObject):
         if self._disposed:
             return
         self._disposed = True
+        self._click_timer.stop()
         self.tray.hide()
         self.menu.deleteLater()
 
@@ -454,9 +473,12 @@ class TrayIcon(QObject):
         reason = getattr(self._controller, "calibration_reason", "")
         if state is TrackingState.NEEDS_CALIBRATION and isinstance(reason, str) and reason.strip():
             calibrate_tip = f"Switching is off until you calibrate ({reason.strip()})"
+        privacy_tip = _PRIVACY_TIP
+        if self._settings.privacy.remember_privacy_mode:
+            privacy_tip += _PRIVACY_REMEMBERED_TIP
         tips = {
             "toggle_tracking": _RESUME_TIP if paused else _PAUSE_TIP,
-            "toggle_privacy": _PRIVACY_TIP,
+            "toggle_privacy": privacy_tip,
             "recalibrate": calibrate_tip,
         }
         for name, action in self._hotkey_actions():
@@ -615,13 +637,30 @@ class TrayIcon(QObject):
         self._sync_hotkeys()
         self._sync_state()
 
+    def popup_menu(self) -> None:
+        """Show the menu at the pointer (what a single click on the icon does on Windows)."""
+        if self._disposed:
+            return
+        self.menu.popup(QCursor.pos())
+        # Takes the foreground, so that a click elsewhere closes the menu.
+        self.menu.activateWindow()
+
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if self._disposed:
             return
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._click_timer.stop()
+            # The second click of the pair may be reported as a single click too.
+            self._ignore_clicks_until = self._clock() + self._click_timer.interval() / 1000.0
             self.open_settings.emit()
         elif reason == QSystemTrayIcon.ActivationReason.MiddleClick:
             self._on_pause()
+        elif (
+            reason == QSystemTrayIcon.ActivationReason.Trigger
+            and _MENU_ON_CLICK
+            and self._clock() >= self._ignore_clicks_until
+        ):
+            self._click_timer.start()
 
     def _on_controller_notify(self, title: str, message: str) -> None:
         # The controller has already applied settings.general.notifications: what

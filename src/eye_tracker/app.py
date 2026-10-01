@@ -83,6 +83,9 @@ log = logging.getLogger(__name__)
 #: unannounced could hide a dialog the user is working with, such as the
 #: operating system's "keep these display settings?" countdown.
 EXPLICIT_CALIBRATION_REASONS = frozenset({"hotkey", "ipc", "user"})
+#: Calibrations the app offered rather than the user asked for (``open_calibration``
+#: reasons): closing one without saving brings the "Calibration needed" notice.
+_OFFERED_CALIBRATIONS = frozenset({"wizard", "cli"})
 #: With ``--background`` (login start) notifications stay quiet this long.
 STARTUP_QUIET_S = 20.0
 #: Clicking a "calibration needed" or "finish setup" notification later than
@@ -639,7 +642,7 @@ class EyeTrackerApp(QObject):
         log.info("Opening the calibration (%s)", reason)
         self._prompt = None
         window = CalibrationWindow(self._controller, self)
-        window.finished.connect(functools.partial(self._on_calibration_finished, window))
+        window.finished.connect(functools.partial(self._on_calibration_finished, window, reason))
         # Assigned before start(): start() emits finished(False) at once when
         # there is no monitor, and the slot clears this reference.
         self._calibration = window
@@ -688,10 +691,13 @@ class EyeTrackerApp(QObject):
         if self._closed or controller is None:
             return
         self._refresh_autostart()
+        self._remind_privacy_mode()
+        setup_offered = False
         if self._setup_pending():
             if self._options.background:
                 # A login start stays quiet; offer the setup once that is over.
                 self._after_quiet_period(self._prompt_setup)
+                setup_offered = True  # the setup offers the calibration itself
             else:
                 try:
                     self.open_wizard()
@@ -701,7 +707,11 @@ class EyeTrackerApp(QObject):
                     return  # the wizard offers the calibration itself
         if self._options.calibrate:
             self.open_calibration("cli")
-        elif not self._options.background:
+        elif not setup_offered:
+            # A login start too: the notice waits for the end of its quiet period
+            # (see _suggest_calibration). Skipping it there meant a setup that was
+            # never calibrated and starts at login was never told why nothing
+            # switches.
             self._suggest_calibration(controller.calibration_reason)
 
     def _on_calibration_required(self, reason: str) -> None:
@@ -725,11 +735,16 @@ class EyeTrackerApp(QObject):
     def _on_wizard_calibrate(self) -> None:
         self.open_calibration("wizard")
 
-    def _on_calibration_finished(self, window: CalibrationWindow, saved: bool) -> None:
+    def _on_calibration_finished(self, window: CalibrationWindow, reason: str, saved: bool) -> None:
         if self._calibration is window:
             self._calibration = None
         window.deleteLater()
         log.info("Calibration %s", "saved" if saved else "closed without saving")
+        controller = self._controller
+        if not saved and reason in _OFFERED_CALIBRATIONS and controller is not None:
+            # Offered rather than asked for (setup assistant, --calibrate): whoever
+            # put it off learns what that means, and that a click brings it back.
+            self._suggest_calibration(controller.calibration_reason)
 
     def _on_settings_closed(self, dialog: SettingsDialog, _result: int) -> None:
         if self._settings_dialog is dialog:
@@ -895,6 +910,12 @@ class EyeTrackerApp(QObject):
             return
         if len(controller.monitors()) < 2 or reason in self._announced:
             return  # with one monitor there is nothing to switch between
+        if not controller.settings.switching.enabled:
+            return  # switching is off on purpose: a calibration changes nothing
+        if getattr(controller, "privacy", False):
+            # The camera is off on purpose; the controller reminds the user once
+            # privacy mode ends (_remind_calibration).
+            return
         detail = f" ({reason})" if reason else ""
         shown = tray.notify(
             "Calibration needed",
@@ -916,6 +937,27 @@ class EyeTrackerApp(QObject):
         if reason is not None and not self._closed and controller is not None:
             # The reason may be stale by now; the current one is what matters.
             self._suggest_calibration(controller.calibration_reason or reason)
+
+    def _remind_privacy_mode(self) -> None:
+        """Say that privacy mode is still on from the previous run.
+
+        It is remembered across restarts so that the camera never comes back on
+        by itself (``privacy.remember_privacy_mode``); this tells the user why
+        nothing switches and walk-away detection is off. A notice swallowed by
+        the quiet period of a login start is shown once that period is over.
+        """
+        controller, tray = self._controller, self._tray
+        if self._closed or controller is None or tray is None:
+            return
+        if not getattr(controller, "privacy_restored", False):
+            return
+        shown = tray.notify(
+            "Privacy mode is still on",
+            "The camera stays off, as you left it, so monitor switching and walk-away "
+            "detection are paused. Turn privacy mode off in the tray menu.",
+        )
+        if not shown and tray.muted_for > 0:
+            self._after_quiet_period(self._remind_privacy_mode)
 
     def _prompt_setup(self) -> None:
         """After a quiet login start: offer the first-run setup that never happened."""

@@ -4,9 +4,16 @@ A user ~65 cm from 24" 1080p panels (53 cm wide). The head turns part of the way
 towards the target (a random share, as people do) and the eyes do the rest; the
 webcam reports head pose, head position and iris offsets like the face-mesh
 backend. Flat screens make pixels ~ tan(angle): the mapping is non-linear.
+
+Desks whose monitors differ in pixel density (a 4K panel next to a 1080p one;
+Windows and X11 report native pixels) are described by :class:`Panel`: where
+each monitor physically is and how large its pixels are.
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -30,6 +37,45 @@ STACKED = [
 ]
 
 
+@dataclass(frozen=True)
+class Panel:
+    """Where a monitor physically is: the top-left corner of its picture in cm from
+    the camera (x to the right, y downwards) and the size of one pixel in cm."""
+
+    monitor: Monitor
+    left_cm: float
+    top_cm: float
+    cm_per_px: float
+
+
+#: A 24" 1080p panel (left) next to a 27" 4K panel at 100 % (right), centred on
+#: each other with the camera on the seam. Both are about 65 cm away, so the same
+#: turn of the gaze covers 1.78x as many pixels on the 4K panel.
+MIXED = [
+    Monitor(0, "fhd", Rect(0, 0, 1920, 1080), primary=True),
+    Monitor(1, "uhd", Rect(1920, 0, 3840, 2160)),
+]
+MIXED_PANELS = (
+    Panel(MIXED[0], -53.1, 3.85, 53.1 / 1920),
+    Panel(MIXED[1], 0.0, 2.0, 59.8 / 3840),
+)
+
+
+def to_cm(points: np.ndarray, panels: Sequence[Panel]) -> tuple[np.ndarray, np.ndarray]:
+    """Physical position (cm from the camera; x right, y down) of desktop ``points``.
+
+    A point outside every monitor is placed with the pixel size of the nearest one.
+    """
+    pts = np.asarray(points, dtype=float)
+    xs, ys = np.empty(len(pts)), np.empty(len(pts))
+    for i, (px, py) in enumerate(pts):
+        panel = min(panels, key=lambda p: p.monitor.rect.distance_outside(px, py))
+        rect = panel.monitor.rect
+        xs[i] = panel.left_cm + (px - rect.x) * panel.cm_per_px
+        ys[i] = panel.top_cm + (py - rect.y) * panel.cm_per_px
+    return xs, ys
+
+
 def synth_features(
     points: np.ndarray,
     rng: np.random.Generator,
@@ -39,6 +85,7 @@ def synth_features(
     *,
     head_share: float = 0.55,
     pitch_share: float = 0.8,
+    panels: Sequence[Panel] | None = None,
 ) -> np.ndarray:
     """8-D features (yaw, pitch, roll, tx, ty, tz, iris_h, iris_v) for gaze ``points``.
 
@@ -47,12 +94,41 @@ def synth_features(
     back. ``head_share`` is the mean share of a gaze shift the head makes (the
     eyes do the rest), ``pitch_share`` scales it for vertical shifts: changing
     them models a user who moves the head more or less than while calibrating.
-    None of these change the random stream, so equal seeds stay comparable.
+    ``panels`` places the monitors physically (mixed pixel densities; ``camera_x``
+    is then ignored); by default every pixel is ``PX_CM`` wide and the camera
+    sits at ``camera_x``, 2 cm above ``y = 0``. None of these change the random
+    stream, so equal seeds stay comparable.
     """
     pts = np.asarray(points, dtype=float)
-    n = len(pts)
-    target_x = (pts[:, 0] - camera_x) * PX_CM
-    target_y = pts[:, 1] * PX_CM + 2.0
+    if panels is None:
+        target_x = (pts[:, 0] - camera_x) * PX_CM
+        target_y = pts[:, 1] * PX_CM + 2.0
+    else:
+        target_x, target_y = to_cm(pts, panels)
+    return features_at_cm(
+        target_x,
+        target_y,
+        rng,
+        noise,
+        head_offset,
+        head_share=head_share,
+        pitch_share=pitch_share,
+    )
+
+
+def features_at_cm(
+    target_x: np.ndarray,
+    target_y: np.ndarray,
+    rng: np.random.Generator,
+    noise: float = 0.0,
+    head_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    *,
+    head_share: float = 0.55,
+    pitch_share: float = 0.8,
+) -> np.ndarray:
+    """:func:`synth_features` for gaze targets given in cm from the camera (x right,
+    y down, in the plane of the screens): things that are not on a monitor."""
+    n = len(target_x)
     dx, dy, dz = head_offset
     hx = rng.normal(0, 2.5, n) + dx
     hy = rng.normal(0, 1.5, n) + dy
@@ -75,6 +151,7 @@ def grid_dataset(
     noise: float = 0.0,
     per_point: int = 20,
     camera_x: float = 1920.0,
+    panels: Sequence[Panel] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Calibration-like data: a 3x3 grid per monitor, ``per_point`` samples each."""
     points: list[tuple[float, float]] = []
@@ -85,7 +162,7 @@ def grid_dataset(
                 points += [m.rect.denormalize(nx, ny)] * per_point
                 groups += [len(groups) // per_point] * per_point
     P = np.array(points)
-    return synth_features(P, rng, noise, camera_x), P, np.array(groups)
+    return synth_features(P, rng, noise, camera_x, panels=panels), P, np.array(groups)
 
 
 def calibration_samples(
@@ -96,11 +173,13 @@ def calibration_samples(
     per_point: int = 20,
     camera_x: float = 1920.0,
     points_per_monitor: int = 9,
+    panels: Sequence[Panel] | None = None,
 ) -> list[CalibrationSample]:
     """Samples as the calibration collector would record them for ``make_plan(monitors)``."""
     samples = []
     for t in make_plan(monitors, points_per_monitor):
-        feats = synth_features(np.tile((t.x, t.y), (per_point, 1)), rng, noise, camera_x)
+        target = np.tile((t.x, t.y), (per_point, 1))
+        feats = synth_features(target, rng, noise, camera_x, panels=panels)
         samples += [CalibrationSample(f, t.x, t.y, t.monitor_index, t.point_id) for f in feats]
     return samples
 
@@ -124,6 +203,17 @@ def below_points(
     right = max(m.rect.right for m in monitors)
     bottom = max(m.rect.bottom for m in monitors)
     return np.column_stack([rng.uniform(left, right, n), np.full(n, bottom + cm / PX_CM)])
+
+
+def below_panels_cm(
+    panels: Sequence[Panel], rng: np.random.Generator, n: int, cm: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """:func:`below_points` for physically placed monitors, in cm for
+    :func:`features_at_cm`: ``cm`` below the lowest bottom edge, across the desk."""
+    left = min(p.left_cm for p in panels)
+    right = max(p.left_cm + p.monitor.rect.w * p.cm_per_px for p in panels)
+    bottom = max(p.top_cm + p.monitor.rect.h * p.cm_per_px for p in panels)
+    return rng.uniform(left, right, n), np.full(n, bottom + cm)
 
 
 def pixel_errors(pred: np.ndarray, truth: np.ndarray) -> np.ndarray:

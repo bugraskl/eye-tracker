@@ -1103,13 +1103,14 @@ def test_cli_does_not_judge_or_record_the_apps_accessibility_grant(
     assert doctor.permissions()["accessibility"] is None
     assert state_path.read_text(encoding="utf-8") == recorded
 
-    # Terminal has Accessibility access: not a grant of this (or any) app build.
+    # Terminal has Accessibility access: not a grant of this (or any) app build,
+    # and not a sign that the app has one (r3-platform-hotkeys-05).
     state_path.write_text(json.dumps({"trusted_build": "0.9:1:1"}), encoding="utf-8")
     fake.trusted = True
     trusted_terminal = macos.MacPlatform(clock=clock, state_path=state_path)
     trusted_terminal._modules["ApplicationServices"] = fake
-    assert trusted_terminal.accessibility_status() == "granted"
-    assert trusted_terminal.permissions()["accessibility"] is True
+    assert trusted_terminal.accessibility_status() == "unknown"
+    assert trusted_terminal.permissions()["accessibility"] is None
     assert json.loads(state_path.read_text(encoding="utf-8")) == {"trusted_build": "0.9:1:1"}
 
 

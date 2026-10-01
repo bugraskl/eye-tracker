@@ -520,25 +520,48 @@ def _hotkeys_section(
             conflict = None
         if conflict:
             conflicts[name] = conflict
+    # The manager that runs knows more than a fresh one (e.g. that another
+    # program grabs the Super key on its own, which only shows once grabbing).
+    instance = _instance_hotkeys() if live_manager is None and running else None
+    if live_manager is not None:
+        note = live_manager.note or ""
+    elif instance is not None and instance[2]:
+        note = instance[2]
+    else:
+        note = manager.note or ""
     out: dict[str, Any] = {
         "enabled": settings.hotkeys.enabled,
         "backend": manager.name,
         "supported": bool(manager.supported),
-        "note": manager.note or "",
+        "note": note,
         "configured": configured,
         "invalid": invalid,
         "layout_conflicts": conflicts,
     }
     wanted = [name for name in _HOTKEY_NAMES if configured[name] and name not in invalid]
     if settings.hotkeys.enabled and wanted and manager.supported:
-        out["registration"] = _hotkey_registration(wanted, live_manager, running)
+        out["registration"] = _hotkey_registration(
+            wanted, live_manager, running, instance=instance if running else _ASK
+        )
     return out
 
 
+#: Default of ``_hotkey_registration(instance=...)``: ask the running instance.
+_ASK: Any = object()
+
+
 def _hotkey_registration(
-    names: Sequence[str], live_manager: HotkeyManager | None, running: bool
+    names: Sequence[str],
+    live_manager: HotkeyManager | None,
+    running: bool,
+    *,
+    instance: tuple[set[str], dict[str, str], str] | None = _ASK,
 ) -> dict[str, str] | str:
-    """``{name: "registered" | "not registered: <why>"}``, or why that is unknown."""
+    """``{name: "registered" | "not registered: <why>"}``, or why that is unknown.
+
+    ``instance`` is what :func:`_instance_hotkeys` returned, when the caller
+    asked already.
+    """
     if live_manager is not None:
         registered = set(live_manager.registered)
         errors: dict[str, str] = {}
@@ -553,10 +576,10 @@ def _hotkey_registration(
     elif not running:
         return _HOTKEYS_NOT_RUNNING
     else:
-        live = _instance_hotkeys()
+        live = _instance_hotkeys() if instance is _ASK else instance
         if live is None:
             return _HOTKEYS_NOT_REPORTED
-        registered, errors = live
+        registered, errors, _note = live
     return {
         name: "registered"
         if name in registered
@@ -565,11 +588,12 @@ def _hotkey_registration(
     }
 
 
-def _instance_hotkeys() -> tuple[set[str], dict[str, str]] | None:
+def _instance_hotkeys() -> tuple[set[str], dict[str, str], str] | None:
     """What the running instance's ``status`` says about its hotkeys.
 
-    ``(registered names, {name: why it is not registered})``; ``None`` when the
-    instance does not answer or does not report its hotkeys (an older version).
+    ``(registered names, {name: why it is not registered}, its manager's note)``;
+    ``None`` when the instance does not answer or does not report its hotkeys
+    (an older version).
     """
     status = _instance_status()
     hotkeys = status.get("hotkeys") if status is not None else None
@@ -584,7 +608,8 @@ def _instance_hotkeys() -> tuple[set[str], dict[str, str]] | None:
         if isinstance(raw_errors, Mapping)
         else {}
     )
-    return names, errors
+    note = hotkeys.get("note")
+    return names, errors, note if isinstance(note, str) else ""
 
 
 def _instance_status() -> dict[str, Any] | None:
@@ -877,12 +902,18 @@ def _problems(report: dict[str, Any]) -> list[str]:
         problems.append("The settings file is not valid JSON; defaults are used.")
 
     calibration = report.get("calibration") or {}
+    # A calibration only serves monitor switching: none is missing with switching
+    # turned off, or with one real monitor (reported above already).
+    non_default = settings.get("non_default") or {}
+    switching_wanted = non_default.get("switching.enabled", True) is not False
+    one_monitor = monitors.get("count") == 1 and not monitors.get("virtual")
     if calibration.get("exists") is False:
-        # Spelled as this copy is run: release packages have no "eye-tracker" command.
-        command = _redacted_command(cli_command("calibrate"))
-        problems.append(
-            f"Not calibrated yet: choose 'Calibrate...' in the tray menu or run '{command}'."
-        )
+        if switching_wanted and not one_monitor:
+            # Spelled as this copy is run: release packages have no "eye-tracker" command.
+            command = _redacted_command(cli_command("calibrate"))
+            problems.append(
+                f"Not calibrated yet: choose 'Calibrate...' in the tray menu or run '{command}'."
+            )
     elif calibration.get("valid") is False:
         problems.append("The calibration file is damaged; please recalibrate.")
     elif calibration.get("compatible") is False:

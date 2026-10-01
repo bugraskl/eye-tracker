@@ -48,7 +48,7 @@ network.
 | 📖 | **Reading-aware** | Copying from a document on the other screen? Focus stays in your editor while you read. |
 | 🎯 | **Learns as you work** | Every time you move the mouse somewhere and stop, the calibration gets a little better. |
 | 🚶 | **Walk-away lock** | No face and no input for 45 s: lock and/or displays off, announced by a 10 s countdown during the last seconds. Displays wake when you return. Until the setup assistant is finished, it only shows a notification. |
-| 🙈 | **Privacy mode** | One hotkey releases the camera completely; the webcam light goes out. |
+| 🙈 | **Privacy mode** | One hotkey releases the camera completely; the webcam light goes out. It stays on after a restart or an update until you turn it off. |
 | 👥 | **Shoulder guard** | Opt-in (**Settings → Presence & privacy**): a second face behind you for 2 s gets a privacy curtain, a notification or a lock. |
 | 📞 | **Plays nice with calls** | Releases the camera automatically on Windows and Linux when Teams, Zoom or another app needs it. On macOS, add your call apps to **Pause while these apps run**. |
 | 🔋 | **Tiny CPU footprint** | Adaptive frame rate and a motion gate that skips unchanged frames. |
@@ -73,13 +73,16 @@ start it with `--config-dir FOLDER` to keep everything in a folder of your choic
 
 ## Quick start
 
-1. Install and start **Eye Tracker**. An eye icon appears in the tray (menu bar on macOS).
+1. Install and start **Eye Tracker**. An eye icon appears in the tray (menu bar on macOS); click
+   it for the menu, or right-click it on Linux. Windows 11 may keep it behind **^** on the
+   taskbar.
 2. Follow the short setup assistant: pick your camera, grant permissions on macOS, choose what
    happens when you walk away. Until it is finished, walking away only shows a notification. (If
    Eye Tracker first starts at sign-in, the assistant is offered as a notification; you can also
    open it with **Run setup assistant…** under Settings → General.)
 3. **Calibrate**: look at the dots as they appear, about 15 seconds per monitor.
-   ([Calibration guide](docs/calibration.md))
+   ([Calibration guide](docs/calibration.md)) With one monitor there is nothing to switch
+   between, and no calibration is needed.
 4. Work normally. Look at the other monitor and start typing.
 
 Default hotkeys:
@@ -94,8 +97,9 @@ The defaults avoid combinations that type characters on keyboards with AltGr (Ct
 Turkish Q, for example), the ⌃⌥ shortcuts of Rectangle and Magnet on macOS, and on Linux the
 Alt+Shift and Ctrl+Shift keyboard-layout switches and the Ctrl+Alt+Shift shortcuts of JetBrains IDEs
 and VS Code. You can change them in **Settings → Hotkeys**; a combination that another app already
-uses, or that types a character on one of your keyboard layouts, is reported as unavailable. Every
-other option is listed in the [configuration reference](docs/configuration.md).
+uses, or that types a character on one of your keyboard layouts, is reported as unavailable. The
+pause and privacy hotkeys confirm with a short notification which way they switched. Every other
+option is listed in the [configuration reference](docs/configuration.md).
 
 ## How it works
 
@@ -171,6 +175,9 @@ eye-tracker ctl privacy-toggle  # control the running app: show, settings, pause
 eye-tracker autostart enable    # start at login (enable | disable | status)
 eye-tracker reset --all         # forget calibrations and settings
 ```
+
+On Windows, `eye-tracker` and `eye-tracker calibrate` start the app on its own and return at
+once: closing the terminal does not end it.
 
 `eye-tracker ctl` also lets you bind actions to your own keyboard shortcuts, for example on Wayland
 where global hotkeys are not available. Bind the full command from the table: a shortcut bound to a

@@ -239,6 +239,8 @@ def refit_model(
     implicit: Sequence[CalibrationSample],
     template: GazeModel,
     bounds: Rect | None = None,
+    *,
+    monitors: Sequence[Monitor] | None = None,
 ) -> GazeModel:
     """Fit a new model on calibration plus learned samples.
 
@@ -246,11 +248,20 @@ def refit_model(
     calibration time and, unless ``bounds`` is given, the target normalisation.
     Sample weights are honoured, so learned samples count less than calibration
     samples. Without learned samples this reproduces the calibration-only fit.
+    The look-away regions (``GazeModel.away_regions``) are learned for
+    ``monitors`` (the calibrated layout), or else for the monitors the template
+    had them for.
     """
     items = [*base, *implicit]
     X, Y, W = samples_to_arrays(items)
+    if monitors is not None:
+        regions = [m.rect for m in monitors]
+    else:
+        regions = [region.rect for region in template.away_regions]
     model = GazeModel(degree=template.degree, alpha=template.alpha, nonlinear=template.nonlinear)
-    return model.fit(X, Y, W, bounds=bounds if bounds is not None else template.bounds)
+    return model.fit(
+        X, Y, W, bounds=bounds if bounds is not None else template.bounds, regions=regions
+    )
 
 
 def plausible_label(

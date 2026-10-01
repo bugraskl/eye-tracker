@@ -367,6 +367,107 @@ def test_calibrate_subcommand_runs_the_app_in_calibration_mode(
     assert args.background is True
 
 
+@pytest.fixture
+def popen(monkeypatch: pytest.MonkeyPatch) -> list[tuple[list[str], dict[str, Any]]]:
+    """Records what would be started; never starts anything (no GUI on this desktop)."""
+    started: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_popen(args: list[str], **kwargs: Any) -> None:
+        started.append((list(args), kwargs))
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    return started
+
+
+def test_the_windows_console_command_starts_the_app_on_its_own(
+    package: Callable[..., Path],
+    env: Path,
+    run_calls: list[argparse.Namespace],
+    popen: list[tuple[list[str], dict[str, Any]]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """r3-ux-docs-06: run in the terminal, the app died with the terminal window."""
+    folder = package("eye-tracker.exe", "eye-tracker-cli.exe", "EyeTracker.exe")
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(cli, "_instance_running", lambda: False)
+    trace = env / "trace.jsonl"
+    assert cli.main(["--camera", "1", "--log-level", "debug", "--trace", str(trace)]) == 0
+    assert cli.main(["calibrate", "--background"]) == 0
+    assert run_calls == []  # nothing ran inside the terminal
+    gui = str(folder / "EyeTracker.exe")
+    profile = ["--config-dir", str(env.resolve())]
+    (first, flags), (second, _) = popen
+    assert first == [
+        gui,
+        *profile,
+        "--log-level",
+        "DEBUG",
+        "--camera",
+        "1",
+        "--trace",
+        str(trace.resolve()),
+    ]
+    assert second == [gui, *profile, "--background", "--calibrate"]
+    assert flags["creationflags"] == cli._DETACHED_PROCESS | cli._CREATE_NEW_PROCESS_GROUP
+    assert flags["stdout"] is subprocess.DEVNULL
+    assert "starting in the system tray" in capsys.readouterr().out
+
+
+def test_the_console_command_hands_over_to_a_running_app_itself(
+    package: Callable[..., Path],
+    env: Path,
+    run_calls: list[argparse.Namespace],
+    popen: list[tuple[list[str], dict[str, Any]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package("eye-tracker-cli.exe", "EyeTracker.exe")
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(cli, "_instance_running", lambda: True)
+    assert cli.main(["--camera", "1"]) == 0
+    assert popen == []
+    assert len(run_calls) == 1  # prints what the running instance answers
+
+
+@pytest.mark.parametrize(
+    ("platform", "running"),
+    [("win32", "EyeTracker.exe"), ("linux", "eye-tracker-cli"), ("darwin", "eye-tracker-cli")],
+)
+def test_other_executables_run_the_app_in_place(
+    package: Callable[..., Path],
+    env: Path,
+    run_calls: list[argparse.Namespace],
+    popen: list[tuple[list[str], dict[str, Any]]],
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    running: str,
+) -> None:
+    package(running, "EyeTracker.exe", "Eye Tracker")
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(cli, "_instance_running", lambda: False)
+    assert cli.main([]) == 0
+    assert popen == []
+    assert len(run_calls) == 1
+
+
+def test_a_failed_detached_start_runs_the_app_in_place(
+    package: Callable[..., Path],
+    env: Path,
+    run_calls: list[argparse.Namespace],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package("eye-tracker-cli.exe", "EyeTracker.exe")
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(cli, "_instance_running", lambda: False)
+
+    def refuse(args: list[str], **kwargs: Any) -> None:
+        raise PermissionError("blocked by policy")
+
+    monkeypatch.setattr(cli.subprocess, "Popen", refuse)
+    assert cli.main([]) == 0
+    assert len(run_calls) == 1
+
+
 def test_config_dir_option(run_calls: list[argparse.Namespace], env: Path, tmp_path: Path) -> None:
     portable = tmp_path / "portable"
     assert cli.main(["--config-dir", str(portable)]) == 0

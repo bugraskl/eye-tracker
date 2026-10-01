@@ -48,7 +48,7 @@ bile göndermez.
 | 📖 | **Okumayı anlar** | Diğer ekrandaki bir belgeden mi kopyalıyorsunuz? Siz okurken odak editörünüzde kalır. |
 | 🎯 | **Kullandıkça öğrenir** | Fareyi bir yere götürüp her durdurduğunuzda kalibrasyon biraz daha iyileşir. |
 | 🚶 | **Uzaklaşınca kilit** | 45 sn boyunca yüz ve girdi yoksa kilit ve/veya ekranları kapatma; son saniyelerde 10 sn'lik bir geri sayımla duyurulur. Döndüğünüzde ekranlar açılır. Kurulum yardımcısı tamamlanana kadar yalnızca bildirim gösterir. |
-| 🙈 | **Gizlilik modu** | Tek kısayolla kamera tamamen bırakılır; webcam ışığı söner. |
+| 🙈 | **Gizlilik modu** | Tek kısayolla kamera tamamen bırakılır; webcam ışığı söner. Siz kapatana kadar yeniden başlatmadan veya güncellemeden sonra da açık kalır. |
 | 👥 | **Omuz koruması** | İsteğe bağlı (**Ayarlar → Presence & privacy**): arkanızda 2 sn boyunca ikinci bir yüz görünürse gizlilik perdesi, bildirim veya kilit. |
 | 📞 | **Görüşmelerle uyumlu** | Windows ve Linux'ta Teams, Zoom veya başka bir uygulama kameraya ihtiyaç duyunca kamerayı otomatik bırakır. macOS'ta görüşme uygulamalarınızı **Pause while these apps run** listesine ekleyin. |
 | 🔋 | **Çok düşük CPU** | Uyarlanabilir kare hızı ve değişmeyen kareleri atlayan hareket kapısı. |
@@ -75,13 +75,15 @@ kullanıcı profilinizde saklar; her şeyi seçtiğiniz bir klasörde tutmak iç
 ## Hızlı başlangıç
 
 1. **Eye Tracker**'ı kurup başlatın. Bildirim alanında (macOS'ta menü çubuğunda) bir göz simgesi
-   belirir.
+   belirir; menü için ona tıklayın, Linux'ta sağ tıklayın. Windows 11 onu görev çubuğundaki **^**
+   düğmesinin arkasında tutabilir.
 2. Kısa kurulum yardımcısını izleyin: kamerayı seçin, macOS'ta izinleri verin, uzaklaştığınızda ne
    olacağını belirleyin. Yardımcı tamamlanana kadar uzaklaşmak yalnızca bir bildirim gösterir.
    (Eye Tracker ilk kez oturum açılışında başlarsa yardımcı bir bildirimle önerilir; onu
    Ayarlar → General altındaki **Run setup assistant…** düğmesiyle de açabilirsiniz.)
 3. **Kalibre edin**: beliren noktalara bakın; monitör başına yaklaşık 15 saniye sürer.
-   ([Kalibrasyon rehberi](docs/calibration.md), İngilizce)
+   ([Kalibrasyon rehberi](docs/calibration.md), İngilizce) Tek monitörde geçiş yapılacak
+   başka bir monitör olmadığından kalibrasyon gerekmez.
 4. Normal çalışın. Diğer monitöre bakın ve yazmaya başlayın.
 
 Varsayılan kısayollar:
@@ -97,7 +99,8 @@ Ctrl+Alt+T `₺` yazar), macOS'ta Rectangle ve Magnet'in ⌃⌥ kısayollarında
 Ctrl+Shift klavye düzeni geçişlerinden ve JetBrains IDE'leri ile VS Code'un Ctrl+Alt+Shift
 kısayollarından kaçınır. **Ayarlar → Hotkeys** bölümünden değiştirebilirsiniz; başka bir uygulamanın
 zaten kullandığı ya da klavye düzenlerinizden birinde karakter yazan bir kombinasyon kullanılamaz
-olarak bildirilir. Diğer tüm seçenekler [ayar referansında](docs/configuration.md) listelenir.
+olarak bildirilir. Duraklatma ve gizlilik kısayolları, hangi yöne geçtiklerini kısa bir bildirimle
+onaylar. Diğer tüm seçenekler [ayar referansında](docs/configuration.md) listelenir.
 
 ## Nasıl çalışır
 
@@ -176,6 +179,9 @@ eye-tracker ctl privacy-toggle  # çalışan uygulamayı yönet: show, settings,
 eye-tracker autostart enable    # oturum açılışında başlat (enable | disable | status)
 eye-tracker reset --all         # kalibrasyonları ve ayarları sıfırla
 ```
+
+Windows'ta `eye-tracker` ve `eye-tracker calibrate` uygulamayı kendi başına başlatır ve hemen
+döner: terminali kapatmak uygulamayı sonlandırmaz.
 
 `eye-tracker ctl`, eylemleri kendi klavye kısayollarınıza bağlamanızı da sağlar; örneğin global
 kısayolların bulunmadığı Wayland'da. Tablodaki tam komutu bağlayın: var olmayan bir komuta bağlanan

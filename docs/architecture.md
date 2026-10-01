@@ -62,8 +62,11 @@ flowchart LR
    chosen by leave-one-point-out cross-validation on the calibration data. The same fit yields a
    linear estimate of the combined gaze direction (head plus eyes); when it lies more than 0.2 × the
    nearest monitor's diagonal outside every monitor, the user is looking away (phone, desk), which
-   suppresses switching. Models saved by older versions use a per-feature range test instead until
-   they are recalibrated or refined by adaptive learning.
+   suppresses switching. Monitors of different pixel density (a 4K panel next to a 1080p one) make
+   that single linear estimate overshoot on the coarser monitor, so the calibration also records
+   where the estimate places each monitor, and gaze near that place counts as on screen too. Models
+   saved by older versions use a per-feature range test instead until they are recalibrated or
+   refined by adaptive learning.
 5. **Smoothing.** A One Euro filter (`gaze/filters.py`) removes webcam jitter while keeping
    deliberate head turns fast.
 6. **Switch decision.** `engine/decision.py` turns the smoothed gaze into at most one switch; see
@@ -119,13 +122,18 @@ would lock out someone sitting at their own desk. It only decides whether its re
 notification, lock) is still needed. It triggers after a second face has been in view for 2 s,
 follows whose face is the user's by continuity of the face box (not by size, so a colleague leaning
 in closer never becomes the user), keeps the curtain up while only the other person's face is left,
-and clears once the user's face is the one in view again or the keyboard or mouse is used.
+and clears once the user's face is the one in view again or the keyboard or mouse is used. While it
+judges the user gone, two faces in view trigger it again, so a judgement that was wrong never
+silences it.
 
 The controller derives one tracking state from its flags, in this priority order:
 
 `Privacy > Locked > Calibrating > Paused > Yielded > Away > Camera error > Needs calibration > Tracking`
 
-The camera is released in Privacy, Locked, Paused and Yielded, so the webcam light is off.
+The camera is released in Privacy, Locked, Paused and Yielded, so the webcam light is off. Privacy
+mode is remembered across restarts (`privacy.remember_privacy_mode`), so the camera stays off until
+the user turns it off. *Needs calibration* applies only where a calibration would change something:
+with two or more monitors and switching turned on.
 
 ## Frame rate and CPU
 

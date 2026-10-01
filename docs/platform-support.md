@@ -111,9 +111,15 @@ Ctrl+Alt+Shift cannot be pressed at all where Alt+Shift or Ctrl+Shift switches t
 to press is reported as unavailable with the option's name instead of silently never firing, for
 example "Ctrl+Alt+Shift+T includes Alt+Shift, which switches the keyboard layout (XKB option
 grp:alt_shift_toggle)". The defaults themselves collide only with rare options such as
-`grp:ctrl_alt_toggle`, `grp:lwin_toggle` or `lv3:win_switch`. When the options change while Eye
-Tracker runs, the hotkeys are checked again; one that stops working is named in the log and by
-`eye-tracker doctor`, and comes back when the option is removed.
+`grp:ctrl_alt_toggle`, `grp:lwin_toggle`, `grp:win_menu_select`, `lv3:win_switch` or
+`altwin:ctrl_win`. When the options change while Eye Tracker runs, the hotkeys are checked again: one
+that stops working is named in the log and by `eye-tracker doctor`, and one that could not be
+registered starts working as soon as the option is removed, without a restart.
+
+Desktops that open a menu with the Super key on its own (Xubuntu's Xfce binds Super to the Whisker
+menu) take the whole keyboard while Super is held, so **press Ctrl and Alt before Super** there;
+with Super pressed first the shortcut does nothing. Eye Tracker detects such a binding and says so
+in **Settings → Hotkeys** and in `eye-tracker doctor`.
 
 ### Wayland
 
@@ -147,11 +153,14 @@ windows or grabbing keys. Eye Tracker runs through XWayland where it can. On Way
 Eye Tracker asks logind to lock the session (`loginctl lock-session`) and checks that the screen
 really locked. On GNOME and KDE every lock is confirmed through logind's *LockedHint*: GNOME ignores
 lock requests while locking is disabled by policy, and that is reported instead of taken for a
-lock. Elsewhere `loginctl` only counts once a screen locker (i3lock, swaylock, hyprlock, slock, …)
-is running, because nothing may listen to logind there (a bare tiling window manager without
+lock. Cinnamon, MATE, Xfce and Budgie (which lists GNOME only as a fallback) lock on logind's
+request too, but their lock screens do not all report the hint, so `loginctl` is trusted there.
+Elsewhere `loginctl` only counts once a screen locker (i3lock, swaylock, hyprlock, slock, …) is
+running, because nothing may listen to logind there (a bare tiling window manager without
 `xss-lock` or a swayidle `lock` hook); then `xdg-screensaver`, `dm-tool` and other tools are tried
-in turn. Each check waits up to 2 seconds. If nothing locked the screen, you get a "Could not lock
-the screen" notification instead of a silent failure. sway, Hyprland and similar sessions that set
+in turn. `dm-tool` (the LightDM greeter) is never put on top of a desktop's own lock screen. Each
+check waits up to 2 seconds. If nothing locked the screen, you get a "Could not lock the screen"
+notification instead of a silent failure. sway, Hyprland and similar sessions that set
 `XDG_CURRENT_DESKTOP=GNOME` or `KDE` are recognised by their own sockets.
 
 `eye-tracker doctor` lists the lock tools that are installed, in the order they are tried

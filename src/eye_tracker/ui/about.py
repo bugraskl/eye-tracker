@@ -32,12 +32,18 @@ __all__ = ["PRIVACY_STATEMENT", "THIRD_PARTY", "AboutDialog", "system_info"]
 TAGLINE = "Look at a monitor. Your cursor and keyboard focus follow."
 COPYRIGHT = "© 2026 Buğra Şıkel and contributors · MIT License"
 
+#: Kept in line with docs/privacy.md: only the app's own code is free of networking
+#: code; some libraries it ships contain networking code it never uses.
 PRIVACY_STATEMENT = (
     "Everything runs on this computer. Camera frames are analysed in memory and are "
-    "never saved, uploaded or shared. Eye Tracker contains no network code at all. "
-    "Only numbers are stored: your settings and the calibration (head-pose and eye "
-    "measurements with the positions of the calibration dots). The camera is released "
-    "completely in privacy mode, while paused, and while the screen is locked."
+    "never saved, uploaded or shared. Eye Tracker's own code contains no network code, "
+    "and it never connects to the network; some libraries it ships contain networking "
+    "code it does not use, and every release build is checked for it (see the privacy "
+    "documentation). Only numbers are stored: your settings and the calibration "
+    "(head-pose and eye measurements with the positions of the calibration dots). The "
+    "camera is released completely in privacy mode, which stays on until you turn it "
+    "off, also across restarts; while paused; and, unless turned off in the settings, "
+    "while the screen is locked."
 )
 
 #: (component, licence, what it is used for, homepage)
@@ -180,9 +186,17 @@ class AboutDialog(QDialog):
         bold = QFont(privacy_title.font())
         bold.setWeight(QFont.Weight.DemiBold)
         privacy_title.setFont(bold)
-        self.privacy_label = QLabel(PRIVACY_STATEMENT, self)
+        docs = "the privacy documentation"
+        self.privacy_label = QLabel(
+            html.escape(PRIVACY_STATEMENT).replace(
+                docs, f'<a href="{REPO_URL}/blob/main/docs/privacy.md">{docs}</a>'
+            ),
+            self,
+        )
+        self.privacy_label.setTextFormat(Qt.TextFormat.RichText)
         self.privacy_label.setWordWrap(True)
-        self.privacy_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.privacy_label.setOpenExternalLinks(True)
+        self.privacy_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         root.addWidget(privacy_title)
         root.addWidget(self.privacy_label)
 

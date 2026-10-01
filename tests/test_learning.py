@@ -295,6 +295,22 @@ def test_refit_without_learned_samples_restores_the_calibration_fit() -> None:
         calibrated.nonlinear,
         calibrated.bounds,
     )
+    assert restored.away_regions == calibrated.away_regions
+
+
+def test_refit_learns_the_look_away_regions_of_the_calibrated_monitors() -> None:
+    base = calibration_samples(TWO, np.random.default_rng(62), noise=1.0, per_point=8)
+    calibrated, _ = evaluate(base, TWO, nonlinear=GAZE)
+    assert [r.rect for r in calibrated.away_regions] == [m.rect for m in TWO]
+    # A model saved before the regions existed gains them with the next refit...
+    data = calibrated.to_dict()
+    del data["away_regions"]
+    legacy = GazeModel.from_dict(data)
+    assert refit_model(base, [], legacy).away_regions == ()
+    upgraded = refit_model(base, [], legacy, monitors=TWO)
+    assert upgraded.away_regions == calibrated.away_regions
+    # ...and a refit without monitors keeps those of the template.
+    assert refit_model(base, [], upgraded).away_regions == calibrated.away_regions
 
 
 # --------------------------------------------------------------------------- plausible labels

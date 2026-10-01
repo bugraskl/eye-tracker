@@ -295,6 +295,23 @@ def test_problems_from_a_synthetic_report() -> None:
     ]
 
 
+def test_a_missing_calibration_is_a_problem_only_where_switching_needs_one() -> None:
+    """r3-ux-docs-03: one monitor, or switching turned off, needs no calibration."""
+
+    def problems(monitors: dict[str, Any], non_default: dict[str, Any]) -> list[str]:
+        report = {
+            "monitors": monitors,
+            "settings": {"valid": True, "non_default": non_default},
+            "calibration": {"exists": False},
+        }
+        return [p for p in diagnostics._problems(report) if p.startswith("Not calibrated")]
+
+    assert len(problems({"count": 2}, {})) == 1
+    assert len(problems({"count": 1, "virtual": True}, {})) == 1  # a headless fake screen
+    assert problems({"count": 1}, {}) == []
+    assert problems({"count": 2}, {"switching.enabled": False}) == []
+
+
 def test_redact(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     home = tmp_path / "home" / "alice"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
@@ -708,6 +725,10 @@ def test_doctor_shows_why_a_hotkey_was_not_registered(env: Path, fake_hotkeys: N
     )
     text = diagnostics.format_report(report)
     assert "registration.toggle_tracking" in text
+    # The app's manager knows limits a fresh one cannot see (r3-platform-hotkeys-02).
+    live.note = "Press Ctrl and Alt before Super."
+    report = diagnostics.collect_report(hotkey_manager=live)
+    assert report["hotkeys"]["note"] == "Press Ctrl and Alt before Super."
 
 
 def test_doctor_asks_the_running_instance_about_its_hotkeys(env: Path, fake_hotkeys: None) -> None:
@@ -735,6 +756,14 @@ def test_doctor_asks_the_running_instance_about_its_hotkeys(env: Path, fake_hotk
             "application",
             "recalibrate": "registered",
         }
+
+        # What only the running manager found out (r3-platform-hotkeys-02).
+        status["hotkeys"]["note"] = "Another program uses the Super key on its own."
+        report = diagnostics.collect_report()
+        assert report["hotkeys"]["note"] == "Another program uses the Super key on its own."
+        assert (
+            "Global hotkeys: Another program uses the Super key on its own." in report["problems"]
+        )
     finally:
         server.close()
 

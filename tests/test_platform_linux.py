@@ -227,6 +227,32 @@ def test_desktop_detection() -> None:
     assert not linux._is_kde_env({"XDG_CURRENT_DESKTOP": "XFCE"})
 
 
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"XDG_CURRENT_DESKTOP": "GNOME"}, True),
+        ({"XDG_CURRENT_DESKTOP": "ubuntu:GNOME"}, True),
+        ({"XDG_CURRENT_DESKTOP": "pop:GNOME"}, True),
+        ({"XDG_CURRENT_DESKTOP": "GNOME-Classic:GNOME"}, True),
+        ({"XDG_CURRENT_DESKTOP": "GNOME-Flashback:GNOME"}, True),
+        ({"XDG_SESSION_DESKTOP": "gnome"}, True),
+        ({"XDG_CURRENT_DESKTOP": "KDE"}, True),
+        ({"KDE_FULL_SESSION": "true"}, True),
+        # r3-platform-hotkeys-01: GNOME listed as a fallback, budgie-screensaver locks.
+        ({"XDG_CURRENT_DESKTOP": "Budgie:GNOME"}, False),
+        ({"XDG_SESSION_DESKTOP": "budgie-desktop"}, False),
+        ({"XDG_CURRENT_DESKTOP": "X-Cinnamon"}, False),
+        ({"XDG_CURRENT_DESKTOP": "Unity:Unity7:ubuntu"}, False),
+        ({"XDG_CURRENT_DESKTOP": "GNOME", "SWAYSOCK": "/run/sway.sock"}, False),
+        ({}, False),
+    ],
+)
+def test_locked_hint_is_authoritative_only_for_gnome_shell_and_kde(
+    env: dict[str, str], expected: bool
+) -> None:
+    assert linux._locked_hint_authoritative(env) is expected
+
+
 # ------------------------------------------------------------------ prepare_process
 def test_prepare_forces_xcb_on_wayland_with_xwayland(
     monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform
@@ -459,7 +485,7 @@ def test_lock_falls_back_to_callers_session(
     assert tools.calls[-1] == ["loginctl", "lock-session"]
 
 
-@pytest.mark.parametrize("desktop", ["X-Cinnamon", "MATE", "XFCE"])
+@pytest.mark.parametrize("desktop", ["X-Cinnamon", "MATE", "XFCE", "Budgie:GNOME"])
 def test_lock_trusts_loginctl_on_desktops_that_handle_it(
     monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, desktop: str
 ) -> None:
@@ -468,6 +494,8 @@ def test_lock_trusts_loginctl_on_desktops_that_handle_it(
     monkeypatch.setenv("XDG_CURRENT_DESKTOP", desktop)
     tools.install(*_ALL_LOCKERS)
     tools.respond(["loginctl", "lock-session"], (0, ""))
+    # budgie-screensaver locks but never sets the hint: it must not be asked.
+    tools.respond(["loginctl", "show-session"], (0, "no\n"))
     assert plat.lock_screen() is True
     assert tools.calls == [["loginctl", "lock-session", "2"]]
 
@@ -475,7 +503,23 @@ def test_lock_trusts_loginctl_on_desktops_that_handle_it(
 _HINT_QUERY = ["loginctl", "show-session", "2", "-p", "LockedHint", "--value"]
 
 
-@pytest.mark.parametrize("desktop", ["GNOME", "KDE", "Budgie:GNOME"])
+def test_lock_policy_refusal_on_gnome_is_not_overridden_by_the_display_manager(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
+) -> None:
+    """r3-platform-hotkeys-01: a greeter (dm-tool lock) on top of a lock screen that
+    did not show in time locks the user twice, or again right after they unlocked."""
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "ubuntu:GNOME")
+    tools.install("loginctl", "xdg-screensaver", "dm-tool")
+    tools.respond(["loginctl", "lock-session"], (0, ""))
+    tools.respond(["xdg-screensaver"], (0, ""))
+    tools.respond(["dm-tool"], (0, ""))
+    tools.respond(["loginctl", "show-session"], (0, "no\n"))
+    assert plat.lock_screen() is False  # reported, so the guard shows its curtain
+    assert ["dm-tool", "lock"] not in tools.calls
+
+
+@pytest.mark.parametrize("desktop", ["GNOME", "KDE", "pop:GNOME"])
 def test_lock_on_gnome_and_kde_is_confirmed_by_locked_hint(
     monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, desktop: str
 ) -> None:

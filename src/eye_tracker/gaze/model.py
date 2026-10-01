@@ -57,6 +57,16 @@ features. Gaze at a monitor whose calibration dots were all skipped (which
 beyond the calibrated range; the clipped model places it on or next to that
 monitor. Models saved before this estimate existed fall back to the per-feature
 range test (see :data:`LOOK_AWAY_EXCESS`).
+
+One linear map serves the whole desk, but a turn of the gaze covers more pixels
+on a dense monitor (a 4K panel next to a 1080p one: Windows and X11 report
+native pixels) than on a coarse one. The map then overshoots on the coarse
+monitor, whose outer edge it places well outside that monitor, most of all
+when the user leans in. :meth:`GazeModel.fit` therefore also learns, from the
+calibration samples of each monitor, where the linear estimate actually puts
+that monitor (:class:`AwayRegion`); gaze near that place is never "away"
+either. On a desk of equal monitors the place is the monitor itself, so the
+test only ever becomes more lenient than with the monitor rectangles alone.
 """
 
 from __future__ import annotations
@@ -119,9 +129,75 @@ LOOK_AWAY_ALPHA = 10.0
 #: replaces it with the linear estimate.
 LOOK_AWAY_EXCESS = 0.25
 
+#: An :class:`AwayRegion` is learned from a monitor's samples only when their
+#: targets (at least three distinct ones) span at least this fraction of the
+#: monitor in both directions; otherwise the corners would be extrapolated from
+#: too narrow a base.
+REGION_MIN_SPAN = 0.25
+
+#: ...and only when the image of the monitor is at most this many times its
+#: diagonal: a larger one is a fit gone wrong, not a density difference (4K
+#: next to 1080p scales by about 1.3).
+REGION_MAX_SCALE = 3.0
+
 # A more complex candidate (higher degree, smaller alpha) must beat the simpler
 # one by this relative margin in cross-validation to be chosen.
 _PREFER_SIMPLER = 1e-3
+
+
+@dataclass(frozen=True, slots=True)
+class AwayRegion:
+    """Where the linear look-away estimate places one calibrated monitor.
+
+    ``rect`` is the monitor as calibrated. ``x0, y0, x1, y1`` bound both the
+    rectangle and its image under the linear estimate (an affine fit through
+    the monitor's samples); ``diagonal`` is the larger of the two diagonals.
+    Gaze within ``margin * diagonal`` of the box does not look away (see
+    :meth:`GazeModel.looks_away`).
+    """
+
+    rect: Rect
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    diagonal: float
+
+    @classmethod
+    def of(cls, rect: Rect) -> AwayRegion:
+        """The region of a monitor whose image is unknown: the monitor itself."""
+        return cls(rect, rect.x, rect.y, rect.right, rect.bottom, rect.diagonal)
+
+    def distance_outside(self, px: float, py: float) -> float:
+        """Euclidean distance from the point to the box (0 when inside)."""
+        dx = max(self.x0 - px, 0.0, px - self.x1)
+        dy = max(self.y0 - py, 0.0, py - self.y1)
+        return math.hypot(dx, dy)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rect": self.rect.to_list(),
+            "box": [self.x0, self.y0, self.x1, self.y1],
+            "diagonal": self.diagonal,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Any) -> AwayRegion:
+        """Inverse of :meth:`to_dict`. Raises ``ValueError`` on malformed input."""
+        if not isinstance(d, dict):
+            raise ValueError("away region must be an object")
+        try:
+            rect = Rect.from_list(d["rect"])
+            x0, y0, x1, y1 = (float(v) for v in d["box"])
+            diagonal = float(d["diagonal"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"invalid away region: {exc}") from exc
+        values = (x0, y0, x1, y1, diagonal)
+        if not all(math.isfinite(v) for v in values):
+            raise ValueError("away region contains non-finite numbers")
+        if rect.w <= 0 or rect.h <= 0 or x1 < x0 or y1 < y0 or diagonal <= 0.0:
+            raise ValueError("away region is inconsistent")
+        return cls(rect, x0, y0, x1, y1, diagonal)
 
 
 class GazeModel:
@@ -155,6 +231,9 @@ class GazeModel:
         self._coef: np.ndarray | None = None  # (n_terms, 2), in normalised target space
         # (1 + d, 2): the linear estimate behind looks_away (None: saved without it).
         self._linear_coef: np.ndarray | None = None
+        # Where that estimate places each calibrated monitor (empty: fitted without
+        # the monitors, or saved before the regions existed).
+        self._away_regions: tuple[AwayRegion, ...] = ()
         self._bounds: Rect | None = None
 
     # ---------------------------------------------------------------- properties
@@ -177,6 +256,12 @@ class GazeModel:
         """Virtual-desktop rectangle used to normalise targets (``None`` if unfitted)."""
         return self._bounds
 
+    @property
+    def away_regions(self) -> tuple[AwayRegion, ...]:
+        """Where the linear look-away estimate places each monitor passed to
+        :meth:`fit` as ``regions`` (see :class:`AwayRegion`)."""
+        return self._away_regions
+
     def __repr__(self) -> str:
         state = f"fitted, {self.n_features} features" if self.is_fitted else "unfitted"
         nonlinear = "" if self._nonlinear is None else f", nonlinear={list(self._nonlinear)}"
@@ -189,13 +274,17 @@ class GazeModel:
         Y: np.ndarray,
         weights: np.ndarray | None = None,
         bounds: Rect | None = None,
+        *,
+        regions: Sequence[Rect] | None = None,
     ) -> GazeModel:
         """Fit the model and return ``self``.
 
         ``X`` is ``(n, d)`` features, ``Y`` is ``(n, 2)`` targets in global pixels and
         ``weights`` optional non-negative per-sample weights (e.g. 0.5 for samples
         learned from mouse use). ``bounds`` should be the virtual desktop; when
-        omitted the bounding box of ``Y`` is used.
+        omitted the bounding box of ``Y`` is used. ``regions`` are the monitor
+        rectangles the samples were taken on; for each one, where the linear
+        look-away estimate places it is learned (:attr:`away_regions`).
         """
         X_arr = _as_matrix(X, "X")
         Y_arr = _as_targets(Y, X_arr.shape[0])
@@ -215,6 +304,12 @@ class GazeModel:
         self._mean, self._std = mean, std
         self._lo, self._hi = X_arr.min(axis=0), X_arr.max(axis=0)
         self._bounds = bounds
+        # The training samples lie within the calibrated range, so their linear
+        # estimate needs no clipping: it is the leading block of the design.
+        estimates = _denormalise(A[:, :k] @ self._linear_coef, bounds)
+        self._away_regions = tuple(
+            _away_region(rect, Y_arr, estimates, w) for rect in (regions or ())
+        )
         return self
 
     # ---------------------------------------------------------------- prediction
@@ -270,9 +365,11 @@ class GazeModel:
         that has the linear estimate (:attr:`has_linear_estimate`): True when
         that estimate of the gaze point lies more than ``margin`` times the
         nearest monitor's diagonal outside it (see :data:`LOOK_AWAY_MARGIN` and
-        the module docstring). The gaze-direction ``features`` (indices; default
-        :attr:`nonlinear`) extrapolate freely; the others are clipped to their
-        calibrated range, since leaning back is not looking away.
+        the module docstring), and more than ``margin`` times the diagonal of
+        every :attr:`away_regions` entry of those monitors outside that region.
+        The gaze-direction ``features`` (indices; default :attr:`nonlinear`)
+        extrapolate freely; the others are clipped to their calibrated range,
+        since leaning back is not looking away.
 
         Otherwise the fallback: True when one of the gaze-direction features
         lies more than ``threshold`` of its calibrated range outside that range
@@ -296,7 +393,15 @@ class GazeModel:
             if point is None:
                 return False
             monitor, distance = nearest_monitor(monitors, *point)
-            return distance > margin * monitor.rect.diagonal
+            if distance <= margin * monitor.rect.diagonal:
+                return False
+            # Regions of other layouts (a profile used elsewhere) do not apply.
+            rects = {m.rect for m in monitors}
+            return not any(
+                region.distance_outside(*point) <= margin * region.diagonal
+                for region in self._away_regions
+                if region.rect in rects
+            )
         excess = self.extrapolation(arr)
         if not indices:
             return False
@@ -364,6 +469,9 @@ class GazeModel:
             if self._linear_coef is not None:
                 # Absent in older files, which then use the per-feature test.
                 out["linear_coef"] = self._linear_coef.tolist()
+            if self._away_regions:
+                # Absent in older files: the monitor rectangles alone are used.
+                out["away_regions"] = [region.to_dict() for region in self._away_regions]
         return out
 
     @classmethod
@@ -397,6 +505,10 @@ class GazeModel:
                 if d.get("linear_coef") is not None
                 else None
             )
+            raw_regions = d.get("away_regions") or []
+            if not isinstance(raw_regions, list):
+                raise TypeError("away_regions must be a list")
+            regions = tuple(AwayRegion.from_dict(r) for r in raw_regions)
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             # OverflowError: int(inf) for a bounds value such as 1e400 or Infinity.
             raise ValueError(f"invalid model data: {exc}") from exc
@@ -425,6 +537,7 @@ class GazeModel:
 
         model._mean, model._std, model._lo, model._hi = mean, std, lo, hi
         model._coef, model._bounds, model._linear_coef = coef, bounds, linear
+        model._away_regions = regions
         return model
 
 
@@ -641,6 +754,62 @@ class _LopoFolds:
 
 
 # --------------------------------------------------------------------- internals
+def _away_region(rect: Rect, Y: np.ndarray, estimates: np.ndarray, w: np.ndarray) -> AwayRegion:
+    """Where the linear look-away estimate places the monitor ``rect``.
+
+    ``Y`` are the training targets, ``estimates`` their linear estimates and ``w``
+    the sample weights. The estimates of the samples on ``rect`` are fitted as an
+    affine function of their targets (weighted least squares), which maps the
+    corners of ``rect`` to its image. The region bounds the rectangle and that
+    image, so it is never smaller than the monitor itself; without enough
+    samples to place the corners reliably it is the monitor itself.
+    """
+    region = AwayRegion.of(rect)
+    on_rect = (
+        (Y[:, 0] >= rect.x)
+        & (Y[:, 0] < rect.right)
+        & (Y[:, 1] >= rect.y)
+        & (Y[:, 1] < rect.bottom)
+        & (w > 0.0)
+    )
+    targets = Y[on_rect]
+    if np.unique(targets, axis=0).shape[0] < 3:
+        return region
+    span = targets.max(axis=0) - targets.min(axis=0)
+    if span[0] < REGION_MIN_SPAN * rect.w or span[1] < REGION_MIN_SPAN * rect.h:
+        return region
+    root_w = np.sqrt(w[on_rect])[:, None]
+    design = np.column_stack([targets, np.ones(targets.shape[0])])
+    affine, _, rank, _ = np.linalg.lstsq(design * root_w, estimates[on_rect] * root_w, rcond=None)
+    if rank < 3:
+        return region
+    corners = np.array(
+        [
+            [rect.x, rect.y, 1.0],
+            [rect.right, rect.y, 1.0],
+            [rect.right, rect.bottom, 1.0],
+            [rect.x, rect.bottom, 1.0],
+        ]
+    )
+    image = corners @ affine
+    if not np.all(np.isfinite(image)):
+        return region
+    diagonal = max(float(np.hypot(*(image[2] - image[0]))), float(np.hypot(*(image[3] - image[1]))))
+    if diagonal > REGION_MAX_SCALE * rect.diagonal:
+        log.debug("Ignoring an implausible look-away region for %s", rect)
+        return region
+    x0, y0 = image.min(axis=0)
+    x1, y1 = image.max(axis=0)
+    return AwayRegion(
+        rect,
+        min(float(rect.x), float(x0)),
+        min(float(rect.y), float(y0)),
+        max(float(rect.right), float(x1)),
+        max(float(rect.bottom), float(y1)),
+        max(rect.diagonal, diagonal),
+    )
+
+
 def _n_terms(n_features: int, degree: int, nonlinear: tuple[int, ...] | None = None) -> int:
     k = n_features if nonlinear is None else len(nonlinear)
     n = 1 + n_features

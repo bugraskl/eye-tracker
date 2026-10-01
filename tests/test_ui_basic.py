@@ -627,6 +627,51 @@ def test_tray_actions_drive_controller(controller: FakeController, cleanup: list
     ]
 
 
+def test_tray_single_click_opens_the_menu_on_windows(
+    controller: FakeController, cleanup: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r3-ux-docs-04: a left click on the Windows tray icon did nothing at all."""
+    monkeypatch.setattr(tray_module, "_MENU_ON_CLICK", True)
+    clock = FakeClock()
+    tray = _tray(controller, cleanup, clock=clock)
+    settings: list[bool] = []
+    tray.open_settings.connect(lambda: settings.append(True))
+    trigger = QSystemTrayIcon.ActivationReason.Trigger
+    tray._on_activated(trigger)
+    assert tray._click_timer.isActive()  # opens once it is no double-click
+    # A double-click opens the settings instead, and its second click is no click.
+    tray._on_activated(QSystemTrayIcon.ActivationReason.DoubleClick)
+    assert not tray._click_timer.isActive()
+    assert settings == [True]
+    tray._on_activated(trigger)
+    assert not tray._click_timer.isActive()
+    clock.t += 1.0
+    tray._on_activated(trigger)
+    assert tray._click_timer.isActive()
+    tray._click_timer.stop()
+    tray.popup_menu()  # what the timer runs
+    assert tray.menu.isVisible()
+    tray.menu.hide()
+    # Elsewhere the desktop decides what a click does.
+    monkeypatch.setattr(tray_module, "_MENU_ON_CLICK", False)
+    clock.t += 1.0
+    tray._on_activated(trigger)
+    assert not tray._click_timer.isActive()
+
+
+def test_tray_tooltips_say_what_pause_and_privacy_also_do(
+    controller: FakeController, cleanup: list[Any]
+) -> None:
+    """r3-ux-docs-02 / -05: pausing stops the walk-away lock; privacy mode is kept."""
+    tray = _tray(controller, cleanup)
+    assert "walk-away lock" in tray.action_pause.toolTip()
+    assert "stays on after a restart" in tray.action_privacy.toolTip()
+    forgetful = controller.settings.copy()
+    forgetful.privacy.remember_privacy_mode = False
+    tray.set_settings(forgetful)
+    assert "restart" not in tray.action_privacy.toolTip()
+
+
 def test_tray_gaze_dot_keeps_other_settings(controller: FakeController, cleanup: list[Any]) -> None:
     tray = _tray(controller, cleanup)
     # Changed behind the tray's back (e.g. through IPC): must not be undone.
@@ -1646,6 +1691,10 @@ def test_about_dialog(cleanup: list[Any]) -> None:
     cleanup.append(dialog)
     assert __version__ in dialog.version_label.text()
     assert "never saved" in dialog.privacy_label.text()
+    # r3-ux-docs-07: as docs/privacy.md says, only the app's own code has none.
+    assert "no network code at all" not in dialog.privacy_label.text()
+    assert "own code contains no network code" in dialog.privacy_label.text()
+    assert "docs/privacy.md" in dialog.privacy_label.text()  # links the details
     notices = dialog.notices.toPlainText()
     for needle in ("MediaPipe", "YuNet", "OpenCV", "Qt 6", "LGPL-3.0", "Apache-2.0", "MIT"):
         assert needle in notices

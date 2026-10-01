@@ -567,7 +567,7 @@ def evaluate(
         uncovered_monitors=[int(i) for i in uncovered],
     )
     model = GazeModel(degree=selection.degree, alpha=selection.alpha, nonlinear=nonlinear).fit(
-        X, Y, W, bounds
+        X, Y, W, bounds, regions=[m.rect for m in monitor_list]
     )
     log.info(
         "Calibration evaluated: %s (degree %d, alpha %g)",

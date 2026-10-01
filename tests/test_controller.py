@@ -893,6 +893,109 @@ def test_handle_command_covers_every_ipc_command(
     assert c.handle_command("").startswith("error:")
 
 
+def test_privacy_mode_survives_a_restart(make_controller: Callable[..., Harness]) -> None:
+    """r3-ux-docs-02: after a reboot or a silent upgrade the camera came back on."""
+    first = make_controller()
+    first.controller.set_privacy(True)
+    first.controller.shutdown()
+    second = make_controller()
+    assert second.controller.privacy
+    assert second.controller.privacy_restored
+    assert second.state is S.PRIVACY
+    assert True not in second.worker.active  # the camera never opened
+    assert json.loads(second.controller.handle_command("status"))["privacy"] is True
+    second.controller.set_privacy(False)
+    assert not second.controller.privacy_restored
+    second.controller.shutdown()
+    third = make_controller()
+    assert not third.controller.privacy
+    assert third.state is S.TRACKING
+
+
+def test_privacy_mode_is_forgotten_when_not_remembered(
+    make_controller: Callable[..., Harness],
+) -> None:
+    first = make_controller()
+    first.controller.set_privacy(True)
+    first.controller.shutdown()
+    forgetful = make_settings()
+    forgetful.privacy.remember_privacy_mode = False
+    second = make_controller(forgetful)
+    assert not second.controller.privacy
+    assert second.state is S.TRACKING
+    second.controller.shutdown()
+    # Remembering turned on later does not bring back the choice of a run that ignored it.
+    third = make_controller()
+    assert not third.controller.privacy
+
+
+def test_a_damaged_privacy_state_file_counts_as_off(
+    make_controller: Callable[..., Harness],
+) -> None:
+    paths.state_file().write_text("{not json", encoding="utf-8")
+    h = make_controller()
+    assert not h.controller.privacy
+    paths.state_file().write_text('{"privacy_mode": "yes"}', encoding="utf-8")
+    assert not make_controller().controller.privacy
+
+
+def test_pause_and_privacy_hotkeys_say_what_they_did(
+    make_controller: Callable[..., Harness],
+) -> None:
+    """r3-ux-docs-05: both are toggles, and pausing also stops walk-away detection."""
+    h = make_controller()
+    toggle = h.hotkeys.bindings["toggle_tracking"][1]
+    privacy = h.hotkeys.bindings["toggle_privacy"][1]
+    toggle()
+    title, message = h.events["notify"][-1]
+    assert title == "Tracking paused"
+    assert "walk-away detection" in message
+    toggle()
+    assert h.events["notify"][-1] == ("Tracking resumed", "The camera is on again.")
+    privacy()
+    title, message = h.events["notify"][-1]
+    assert title == "Privacy mode on"
+    assert "The camera is off" in message
+    toggle()  # paused as well while private
+    toggle()
+    assert h.events["notify"][-1] == (
+        "Tracking resumed",
+        "Privacy mode is still on: the camera stays off.",
+    )
+    privacy()
+    assert h.events["notify"][-1] == ("Privacy mode off", "The camera is on again.")
+    # The same over the command socket (ctl); a command that changes nothing is silent.
+    count = len(h.events["notify"])
+    assert h.controller.handle_command("resume") == "ok"
+    assert len(h.events["notify"]) == count
+    assert h.controller.handle_command("privacy-on") == "ok"
+    assert h.events["notify"][-1][0] == "Privacy mode on"
+    # Notifications turned off: none of these.
+    quiet = h.controller.settings.copy()
+    quiet.general.notifications = False
+    h.controller.apply_settings(quiet)
+    count = len(h.events["notify"])
+    privacy()
+    assert len(h.events["notify"]) == count
+
+
+def test_mode_confirmation_names_the_registered_hotkey(
+    make_controller: Callable[..., Harness],
+) -> None:
+    from eye_tracker.platform.hotkeys import format_hotkey, parse_hotkey
+
+    class RealHotkeys(FakeHotkeys):
+        @property
+        def registered(self) -> dict[str, Any]:  # type: ignore[override]
+            return {name: parse_hotkey(combo) for name, (combo, _cb) in self.bindings.items()}
+
+    hotkeys = RealHotkeys()
+    h = make_controller(hotkeys=hotkeys)
+    assert h.controller.handle_command("pause") == "ok"
+    label = format_hotkey(parse_hotkey(Settings().hotkeys.toggle_tracking))
+    assert f"until you resume ({label})." in h.events["notify"][-1][1]
+
+
 # --------------------------------------------------------------------- rate/stats/etc
 def test_rate_follows_activity(make_controller: Callable[..., Harness]) -> None:
     s = make_settings()
@@ -1397,6 +1500,26 @@ def test_refused_pointer_moves_are_not_switches_and_back_off(
     assert ("activate_window", 9) in h.platform.calls
 
 
+def test_pointer_moves_refused_by_a_new_lock_screen_are_not_reported(
+    make_controller: Callable[..., Harness],
+) -> None:
+    """r3-logic-04: a lock screen or UAC prompt that takes the input right after
+    a lock poll refused enough moves to suspend switching and warn the user."""
+    h = make_controller()
+    h.tick(2.0)  # the lock poll has just run
+    h.platform.locked = True  # e.g. a UAC prompt raised by a background updater
+    h.cursor.allow = False
+    h.feed(gaze_obs(RIGHT_CENTRE), 1.9, step=1 / 12)
+    assert len(h.cursor.moves) == 1  # the first refusal revealed the lock
+    assert h.controller._warp_refusals == 0  # and did not count towards the backoff
+    assert titles(h) == []
+    assert h.state is S.LOCKED
+    unlock_session(h)
+    h.cursor.allow = True
+    h.feed(gaze_obs(RIGHT_CENTRE), 1.0)
+    assert h.events["switched"] == [1]
+
+
 # --------------------------------------------------------------- shoulder guard
 def test_guard_does_not_lock_again_right_after_the_user_unlocked(
     make_controller: Callable[..., Harness],
@@ -1411,10 +1534,37 @@ def test_guard_does_not_lock_again_right_after_the_user_unlocked(
     h.feed(two, 5.0)  # the colleague is still there
     assert h.platform.names().count("lock_screen") == 1
     assert h.events["guard_changed"] == [True]  # the curtain covers the screens instead
-    h.feed(gaze_obs((500, 500)), 2.0)  # they leave
+    h.feed(gaze_obs((500, 500)), 2.0)  # out of view for a moment
     assert h.events["guard_changed"] == [True, False]
-    h.feed(two, 2.5)  # someone else looks over the shoulder: lock again
+    # A second face soon after may be the same colleague: covered, not locked.
+    h.feed(two, 2.5)
+    assert h.platform.names().count("lock_screen") == 1
+    assert h.events["guard_changed"] == [True, False, True]
+    # Once nobody has looked over the shoulder for the whole grace, it locks again.
+    h.feed(gaze_obs((500, 500)), 2.0)
+    h.feed(gaze_obs((500, 500)), controller_module.GUARD_RELOCK_GRACE_S, step=1.0)
+    h.feed(two, 2.5)
     assert h.platform.names().count("lock_screen") == 2
+
+
+def test_guard_grace_survives_a_colleague_who_drops_out_of_view(
+    make_controller: Callable[..., Harness],
+) -> None:
+    """r3-logic-01: every 1.5 s dropout (the colleague turns to the user or looks
+    down at notes) ended the relock grace, so the next look locked the user out."""
+    h = make_controller(guard_settings("lock"))
+    two = gaze_obs((500, 500), faces=2)
+    h.feed(two, 2.5)
+    lock_session(h)
+    unlock_session(h)
+    h.feed(two, 3.0)
+    assert h.events["guard_changed"] == [True]
+    h.controller.dismiss_curtain()  # Esc: the user carries on working
+    for _ in range(20):  # a long visit, well beyond GUARD_RELOCK_GRACE_S in total
+        h.feed(gaze_obs((500, 500)), 2.0)  # profile view: one face detected
+        h.feed(two, 30.0, step=0.5)  # looking at the screen again
+    assert h.platform.names().count("lock_screen") == 1
+    assert h.state is S.TRACKING
 
 
 def test_no_switching_under_the_privacy_curtain(make_controller: Callable[..., Harness]) -> None:
@@ -1517,6 +1667,22 @@ def test_user_misjudged_as_the_onlooker_is_never_locked_and_input_lifts_the_curt
     h.feed(boxed_obs(1, SEATED_USER_BOX), 2.0)
     assert h.events["guard_changed"] == [True, False]
     assert not h.controller.guard_active
+
+
+def test_new_onlooker_after_a_misjudged_departure_is_reported(
+    make_controller: Callable[..., Harness],
+) -> None:
+    """r3-logic-03: the guard stayed silent for every later onlooker until input."""
+    h = make_controller(guard_settings("notify"))
+    h.feed(boxed_obs(1, SEATED_USER_BOX), 3.0)
+    h.feed(boxed_obs(2, LEANING_COLLEAGUE_BOX), 3.0)
+    assert titles(h) == ["Someone is looking at your screen"]
+    leaned_back = (0.55, 0.36, 0.13, 0.18)  # the user made room and stays there
+    h.feed(boxed_obs(1, leaned_back), 120.0, step=0.5)
+    assert h.controller._guard.owner_missing
+    h.feed(boxed_obs(2, leaned_back), 10.0, step=0.5)  # a stranger looks on
+    assert titles(h) == ["Someone is looking at your screen"] * 2
+    assert "lock_screen" not in h.platform.names()
 
 
 def test_user_left_alone_clears_the_guard(make_controller: Callable[..., Harness]) -> None:
@@ -1860,13 +2026,50 @@ def test_unusable_calibration_is_recalled_when_the_user_comes_back(
     assert h.events["calibration_required"] == ["the monitor layout changed"] * 2
 
 
-def test_never_calibrated_is_not_recalled(make_controller: Callable[..., Harness]) -> None:
+def test_never_calibrated_is_recalled_when_the_user_comes_back(
+    make_controller: Callable[..., Harness],
+) -> None:
+    """r3-ux-docs-01: a setup that was never calibrated (and starts at login) was
+    never told again why nothing switches."""
     h = make_controller(calibrated=False)
+    lock_session(h)
+    unlock_session(h)
+    ticks(h, 3.0)
+    assert h.events["calibration_required"] == []  # the app offered it at start
+    lock_session(h)
+    h.tick(controller_module.CALIBRATION_REMINDER_S)  # the night passes
+    unlock_session(h)
+    ticks(h, 3.0)
+    assert h.events["calibration_required"] == ["not calibrated yet"]
+
+
+def test_no_calibration_is_asked_for_where_it_changes_nothing(
+    make_controller: Callable[..., Harness],
+) -> None:
+    """r3-ux-docs-03: one monitor, or switching turned off, needs no calibration:
+    no warning state, no prompts."""
+    s = make_settings()
+    s.switching.enabled = False
+    h = make_controller(s, calibrated=False)
+    assert h.state is S.TRACKING
     lock_session(h)
     h.tick(controller_module.CALIBRATION_REMINDER_S)
     unlock_session(h)
     ticks(h, 3.0)
-    assert h.events["calibration_required"] == []  # the app offers it at start instead
+    assert h.events["calibration_required"] == []
+    # Turning switching on: now a calibration is what is missing, and the user
+    # back from the night is told so.
+    on = h.controller.settings.copy()
+    on.switching.enabled = True
+    h.controller.apply_settings(on)
+    assert h.state is S.NEEDS_CALIBRATION
+    ticks(h, 3.0)
+    assert h.events["calibration_required"] == ["not calibrated yet"]
+    # One monitor left (a laptop undocked): nothing to calibrate for.
+    del h.monitors[1]
+    h.controller.refresh_monitors()
+    assert h.state is S.TRACKING
+    assert h.controller.status()["calibrated"] is False
 
 
 # ------------------------------------------------------- calibration profiles

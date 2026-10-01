@@ -474,6 +474,8 @@ def gui_main(argv: Sequence[str] | None = None) -> int:
 
 # -------------------------------------------------------------------- commands
 def _cmd_run(args: argparse.Namespace) -> int:
+    if _start_detached(args):
+        return EXIT_OK
     from .app import run_app
 
     return run_app(args)
@@ -483,9 +485,62 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     # run_app forwards "calibrate" to a running instance instead of "show", so this
     # covers both "open it in the running app" and "start the app and calibrate".
     args.calibrate = True
+    if _start_detached(args):
+        return EXIT_OK
     from .app import run_app
 
     return run_app(args)
+
+
+#: ``CreateProcess`` flags of the detached app (``subprocess`` defines them on
+#: Windows only): no console, and Ctrl+C in the terminal does not reach it.
+_DETACHED_PROCESS = 0x00000008
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+
+def _start_detached(args: argparse.Namespace) -> bool:
+    """Start the tray app as the windowed executable, detached from this console.
+
+    Only for the console executables of a Windows package (``eye-tracker.exe``
+    on the installer's PATH, ``eye-tracker-cli.exe``): run there, the app would
+    live inside the terminal, filling it with log lines, and closing the
+    terminal would kill it without a clean shutdown. A running instance is
+    handed over in this process instead (``run_app``), so that what it answers
+    (e.g. "options not applied") is printed. Returns whether the app was
+    started; ``False`` means: run it here.
+    """
+    if sys.platform != "win32" or not paths.is_frozen():
+        return False
+    if Path(sys.executable).stem.lower() not in (FROZEN_CLI_NAME, APP_SLUG):
+        return False
+    command = app_command()
+    if Path(command[0]).stem.lower() in (FROZEN_CLI_NAME, APP_SLUG):
+        return False  # no windowed executable next to this one
+    if _instance_running():
+        return False
+    for flag, value in (
+        ("--log-level", getattr(args, "log_level", None)),
+        ("--camera", getattr(args, "camera", None)),
+        ("--backend", getattr(args, "backend", None)),
+        ("--trace", getattr(args, "trace", None)),
+    ):
+        if value:
+            command += [flag, str(Path(value).resolve()) if flag == "--trace" else str(value)]
+    command += [flag for flag in ("--background", "--calibrate") if getattr(args, flag[2:], False)]
+    try:
+        subprocess.Popen(  # our own windowed executable, arguments from our parser
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=_DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP,
+        )
+    except OSError as exc:
+        log.warning("Could not start %s on its own (%s); running it here", command[0], exc)
+        return False
+    _out(f"{APP_NAME} is starting in the system tray; you can close this window.")
+    return True
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:

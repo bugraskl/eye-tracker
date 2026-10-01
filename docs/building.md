@@ -42,6 +42,14 @@ uv run python scripts/check_privacy.py --bundle "dist/Eye Tracker.app" # macOS
 uv run python scripts/check_privacy.py --bundle dist/eye-tracker       # Linux
 ```
 
+The allow-list (`BUNDLE_ALLOWLIST` in `scripts/check_privacy.py`) names each file that may contain
+networking code, exactly what it may link or import, and why; the gate prints those as notices. A
+library that the app does not need is left out by the spec instead of being allowed: Qt's network
+plugins and what only they link, OpenSSL libraries that nothing imports, and on macOS every library
+that no bundled binary binds a symbol to. OpenCV's macOS wheel ships FFmpeg as Homebrew builds it,
+which links libraries it never uses (libX11, and libssl through libsrt); the spec makes those links
+weak in the copies it bundles and leaves the libraries out.
+
 ## Packages
 
 **Windows installer and portable ZIP**
@@ -101,7 +109,9 @@ altered (restore it from git), and the PyInstaller spec refuses to build without
   whenever a pull request or a push to `main` changes `packaging/`, the privacy gate, the model or
   icon scripts, `pyproject.toml` or `uv.lock`. It runs the bundle privacy gate, checks that the
   Linux bundle contains no GTK or GIO libraries and that the macOS bundle's minimum version is the
-  documented one, and smoke-tests the command-line tool. It publishes nothing.
+  documented one, and smoke-tests the command-line tool: it analyses an image and two video files
+  (AVI and MP4, read by the bundled FFmpeg) and probes the cameras (AVFoundation on macOS). It
+  publishes nothing.
 
 ## Releasing
 

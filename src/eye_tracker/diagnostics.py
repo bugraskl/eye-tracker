@@ -27,6 +27,7 @@ import logging
 import os
 import platform as py_platform
 import re
+import shlex
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -619,8 +620,33 @@ def _autostart_section() -> dict[str, Any]:
     }
 
 
-def _redacted_command(parts: Sequence[str]) -> str:
-    return format_command([_redact(part) or "" for part in parts])
+def _redacted_command(parts: Sequence[str], *, posix_shell: bool = os.name != "nt") -> str:
+    """:func:`format_command` with the home directory shown as ``~``.
+
+    A POSIX shell expands ``~`` only outside quotes, so there the ``~/`` that
+    replaced the home directory at the start of an argument stays in front of
+    the quoted rest, and a command the report suggests still runs when pasted:
+    ``~/'my apps/eye-tracker'``, not ``'~/my apps/eye-tracker'``. Windows
+    shells give ``~`` no meaning (there it only shortens the path), so
+    ``posix_shell`` is ``False`` there and the command is rendered as
+    :func:`format_command` renders it.
+    """
+    shown = [_redact(part) or "" for part in parts]
+    if not posix_shell:
+        return format_command(shown)
+    pattern = _home_pattern()
+    return " ".join(
+        _shell_home_path(text) if pattern is not None and pattern.match(part) else shlex.quote(text)
+        for part, text in zip(parts, shown, strict=True)
+    )
+
+
+def _shell_home_path(text: str) -> str:
+    """``~`` or ``~/rest`` for a POSIX shell: the tilde bare, the rest quoted as needed."""
+    tilde, slash, rest = text.partition("/")
+    if tilde != "~":  # the home directory followed by something else than a slash
+        return shlex.quote(text)
+    return f"~/{shlex.quote(rest)}" if rest else tilde + slash
 
 
 def _paths_section() -> dict[str, Any]:

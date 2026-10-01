@@ -7,6 +7,7 @@ a synthetic image written to a temporary directory.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -471,8 +472,34 @@ def test_autostart_section_reports_the_status_and_registered_command(
     report = diagnostics.collect_report()
     section = report["autostart"]
     assert section["status"] == "stale"
-    assert section["registered"].startswith("~")
+    # Unquoted on every OS: a POSIX shell would not expand a quoted '~/old/...'.
+    assert section["registered"] == str(Path("~") / "old" / "EyeTracker.exe")
     assert any(p.startswith("Start at login points to a copy") for p in report["problems"])
+
+
+def test_redacted_commands_keep_the_home_tilde_expandable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Commands the report suggests ("run '...'") must still run when pasted into a shell."""
+    home = re.compile(r"[\\/]+home[\\/]+alice(?![\w.\-])")
+    monkeypatch.setattr(diagnostics, "_home_pattern", lambda: home)
+    parts = [
+        "/home/alice/.local/bin/eye-tracker",
+        "--config-dir",
+        "/home/alice/my profiles/test",
+        "/home/alice",
+        "/home/alice/",
+        "/opt/eye tracker/x",
+        "~/a literal tilde",  # not from the redaction: stays quoted, like any other '~'
+        "/home/alice2/x",
+        "--log=/home/alice/x",  # a shell expands '~' only at the start of a word
+    ]
+    assert diagnostics._redacted_command(parts, posix_shell=True) == (
+        "~/.local/bin/eye-tracker --config-dir ~/'my profiles/test' ~ ~/ "
+        "'/opt/eye tracker/x' '~/a literal tilde' /home/alice2/x '--log=~/x'"
+    )
+    redacted = [diagnostics._redact(part) or "" for part in parts]
+    assert diagnostics._redacted_command(parts, posix_shell=False) == diagnostics.format_command(
+        redacted
+    )
 
 
 class _MacLikeServices(PlatformServices):

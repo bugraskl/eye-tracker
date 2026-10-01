@@ -691,6 +691,128 @@ def test_linux_system_libraries_are_allowed(
     assert result.ok, [str(v) for v in result.violations]
 
 
+_MAC = "Contents/Frameworks/"
+_MAC_CV2 = _MAC + "cv2/__dot__dylibs/"
+_SYSTEM = "/System/Library/Frameworks/"
+
+
+@pytest.mark.parametrize(
+    ("relative", "dylibs", "undefined"),
+    [
+        # What the macOS bundle's libraries link and import (measured on the macos-14
+        # runner with otool -L and nm -m: OpenCV 5.0.0.93, PySide6 6.11.2, pyobjc 12.2.2).
+        (
+            _MAC_CV2 + "libavformat.61.7.100.dylib",
+            ["@rpath/libzmq.5.dylib", "@rpath/libgnutls.30.dylib", "@rpath/libsrt.1.5.4.dylib"],
+            ["getaddrinfo", "getnameinfo"],
+        ),
+        (
+            _MAC_CV2 + "libavdevice.61.3.100.dylib",
+            ["/usr/lib/libcurl.4.dylib", "@rpath/libzmq.5.dylib", "@rpath/libgnutls.30.dylib"],
+            [],
+        ),
+        (
+            _MAC_CV2 + "libavfilter.10.4.100.dylib",
+            ["/usr/lib/libcurl.4.dylib", "@rpath/libzmq.5.dylib", "@rpath/libgnutls.30.dylib"],
+            [],
+        ),
+        (_MAC_CV2 + "librist.4.dylib", ["@rpath/libmbedcrypto.3.6.3.dylib"], ["getaddrinfo"]),
+        (
+            _MAC_CV2 + "libsrt.1.5.4.dylib",
+            ["@rpath/libssl.3.dylib", "@rpath/libcrypto.3.dylib"],
+            ["getaddrinfo", "getnameinfo"],
+        ),
+        (
+            _MAC_CV2 + "libssh.4.10.1.dylib",
+            ["@rpath/libcrypto.3.dylib", _SYSTEM + "Kerberos.framework/Versions/A/Kerberos"],
+            ["getaddrinfo", "getnameinfo"],
+        ),
+        (
+            _MAC_CV2 + "libzmq.5.dylib",
+            ["@rpath/libsodium.26.dylib"],
+            ["getaddrinfo", "getnameinfo"],
+        ),
+        (_MAC_CV2 + "libtesseract.5.dylib", ["/usr/lib/libcurl.4.dylib"], ["getaddrinfo"]),
+        (_MAC_CV2 + "libxcb.1.1.0.dylib", ["@rpath/libXau.6.dylib"], ["getaddrinfo"]),
+        (_MAC_CV2 + "libcrypto.3.dylib", [], ["getaddrinfo", "gethostbyname", "getnameinfo"]),
+        (_MAC + "objc/_objc.cpython-312-darwin.so", [], ["getaddrinfo", "getnameinfo"]),
+        (_MAC + "Foundation/_Foundation.cpython-312-darwin.so", [], ["getnameinfo"]),
+        (
+            _MAC + "PySide6/Qt/lib/QtNetwork.framework/Versions/A/QtNetwork",
+            [
+                _SYSTEM + "CFNetwork.framework/Versions/A/CFNetwork",
+                _SYSTEM + "Network.framework/Versions/A/Network",
+                _SYSTEM + "GSS.framework/Versions/A/GSS",
+                "/usr/lib/libresolv.9.dylib",
+            ],
+            ["getaddrinfo", "getnameinfo"],
+        ),
+        (
+            _MAC + "PySide6/QtNetwork.abi3.so",
+            ["@rpath/QtNetwork.framework/Versions/A/QtNetwork"],
+            [],
+        ),
+        (_MAC + "psutil/_psutil_osx.abi3.so", [], ["getnameinfo"]),
+        (
+            _MAC + "python3__dot__12/lib-dynload/_socket.cpython-312-darwin.so",
+            [],
+            ["getaddrinfo", "gethostbyaddr", "gethostbyname", "getnameinfo"],
+        ),
+    ],
+)
+def test_macos_bundle_libraries_are_allowed(
+    tmp_path: Path, relative: str, dylibs: list[str], undefined: list[str]
+) -> None:
+    binary = _macho([*dylibs, "/usr/lib/libSystem.B.dylib"], [*undefined, "malloc"])
+    result = check_privacy.scan_bundle(_bundle(tmp_path, {relative: binary}))
+    assert result.ok, [str(v) for v in result.violations]
+    assert result.allowed
+    assert all(finding.allowed_by and finding.allowed_by.reason for finding in result.allowed)
+
+
+def test_macos_allowlist_is_per_file_and_per_indicator(tmp_path: Path) -> None:
+    """The macOS entries cover OpenCV's own copies of these libraries and only what
+    they were measured to link; libX11, which nothing uses, is left out by the spec
+    rather than allowed."""
+    network = _SYSTEM + "Network.framework/Versions/A/Network"
+    root = _bundle(
+        tmp_path,
+        {
+            _MAC_CV2 + "libX11.6.dylib": _macho([], ["getaddrinfo"]),
+            _MAC + "libzmq.5.dylib": _macho([], ["getaddrinfo"]),
+            _MAC_CV2 + "libavdevice.61.3.100.dylib": _macho(["@rpath/libssl.3.dylib"]),
+            _MAC_CV2 + "libtesseract.5.dylib": _macho([], ["gethostbyname"]),
+            _MAC + "objc/_objc.cpython-312-darwin.so": _macho([], ["gethostbyname"]),
+            _MAC + "Foundation/_Foundation.cpython-312-darwin.so": _macho([], ["getaddrinfo"]),
+            _MAC + "PySide6/Qt/lib/QtGui.framework/Versions/A/QtGui": _macho([network]),
+        },
+    )
+    result = check_privacy.scan_bundle(root)
+    assert {(f.relative.rsplit("/", 1)[-1], f.detail) for f in result.violations} == {
+        ("libX11.6.dylib", "imports getaddrinfo"),
+        ("libzmq.5.dylib", "imports getaddrinfo"),
+        ("libavdevice.61.3.100.dylib", "links @rpath/libssl.3.dylib"),
+        ("libtesseract.5.dylib", "imports gethostbyname"),
+        ("_objc.cpython-312-darwin.so", "imports gethostbyname"),
+        ("_Foundation.cpython-312-darwin.so", "imports getaddrinfo"),
+        ("QtGui", f"links {network}"),
+    }
+    assert result.allowed == []
+
+
+@pytest.mark.parametrize("framework", ["CFNetwork", "GSS", "Kerberos", "LDAP", "Network"])
+def test_macos_network_frameworks_are_networking_libraries(framework: str) -> None:
+    """Apple's network frameworks, and the counterparts of libgssapi, libkrb5 and
+    libldap, which the gate reports on Linux."""
+    path = f"{_SYSTEM}{framework}.framework/Versions/A/{framework}"
+    binary = check_privacy.parse_binary(_macho([path, _SYSTEM + "Security.framework/Security"]))
+    assert binary is not None
+    indicators = check_privacy.network_indicators(binary)
+    assert [(i.rule, i.name, i.key) for i in indicators] == [
+        ("network-library", path, framework.lower())
+    ]
+
+
 def test_gio_fails_the_gate(tmp_path: Path) -> None:
     """r2-packaging-01: GLib's GIO (pulled in by the GTK3 platform theme) resolves
     host names; the spec keeps it out of the bundle instead of allowing it."""

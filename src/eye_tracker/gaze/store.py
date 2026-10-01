@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import weakref
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -32,9 +33,14 @@ from typing import Any
 import numpy as np
 
 from ..config import atomic_write_text
-from ..types import Monitor, Rect, layout_signature
-from .calibration import CalibrationSample
-from .model import GazeModel
+from ..types import Monitor, Rect, layout_signature, virtual_bounds
+from .calibration import (
+    CalibrationSample,
+    axis_errors_from_dict,
+    per_axis_errors,
+    samples_to_arrays,
+)
+from .model import SUPPORTED_DEGREES, GazeModel, lopo_predictions
 
 log = logging.getLogger(__name__)
 
@@ -188,6 +194,93 @@ def same_aspect(a: Sequence[int], b: Sequence[int]) -> bool:
     if min(wa, ha, wb, hb) <= 0:
         return True
     return abs((wa / ha) / (wb / hb) - 1.0) <= ASPECT_TOLERANCE
+
+
+# ------------------------------------------------------------ gaze accuracy
+#: Per-axis errors already worked out for a calibration (loaded, recomputed or
+#: found impossible to recompute: ``{}``), so each profile is looked at once.
+_AXIS_ERRORS: weakref.WeakKeyDictionary[CalibrationData, dict[int, tuple[float, float]]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def axis_error(data: CalibrationData, monitor: Monitor) -> tuple[float, float] | None:
+    """How far off the gaze estimate typically is on ``monitor``: ``(x_px, y_px)``.
+
+    The answer comes, in this order, from
+
+    1. the report's ``per_monitor_error_px`` (calibrations made by this version),
+    2. the leave-one-point-out predictions recomputed from the calibration's own
+       samples with the report's ``alpha`` and ``degree`` (older calibrations;
+       the result is added to :attr:`CalibrationData.report`, so it is saved
+       with the profile's next write), and
+    3. the report's mean error divided by √2 on both axes.
+
+    ``monitor`` is matched to the calibration's monitors by its rectangle (Qt may
+    number the same screens differently after a restart), then by index.
+    ``None`` when nothing is known. Runs a few small least-squares fits the first
+    time an old profile is asked about; later calls are dictionary lookups.
+    """
+    errors = _AXIS_ERRORS.get(data)
+    if errors is None:
+        errors = _axis_errors_of(data)
+        _AXIS_ERRORS[data] = errors
+    index = next((m.index for m in data.monitors if m.rect == monitor.rect), monitor.index)
+    found = errors.get(index)
+    if found is not None:
+        return found
+    mean = data.report.get("mean_error_px")
+    if isinstance(mean, int | float) and not isinstance(mean, bool):
+        value = float(mean) / math.sqrt(2.0)
+        if math.isfinite(value) and value > 0.0:
+            return (value, value)
+    return None
+
+
+def _axis_errors_of(data: CalibrationData) -> dict[int, tuple[float, float]]:
+    try:
+        stored = axis_errors_from_dict(data.report.get("per_monitor_error_px"))
+    except ValueError:
+        stored = {}
+    if stored:
+        return stored
+    computed = _recompute_axis_errors(data)
+    if computed:
+        data.report["per_monitor_error_px"] = {str(k): list(v) for k, v in computed.items()}
+        log.debug("Gaze error per axis recomputed for the calibration of %s", data.created_at)
+    return computed
+
+
+def _recompute_axis_errors(data: CalibrationData) -> dict[int, tuple[float, float]]:
+    """Leave-one-point-out errors per monitor and axis of an older calibration."""
+    known = {m.index for m in data.monitors}
+    samples = [s for s in data.samples if s.monitor_index in known]
+    groups = np.array([s.point_id for s in samples])
+    if not samples or np.unique(groups).shape[0] < 2:
+        return {}
+    report = data.report
+    alpha = report.get("alpha")
+    degree = report.get("degree")
+    if not isinstance(alpha, int | float) or isinstance(alpha, bool) or not alpha >= 0:
+        alpha = data.model.alpha
+    if not isinstance(degree, int) or isinstance(degree, bool) or degree not in SUPPORTED_DEGREES:
+        degree = data.model.degree
+    try:
+        X, Y, W = samples_to_arrays(samples)
+        preds = lopo_predictions(
+            X,
+            Y,
+            groups,
+            float(alpha),
+            degree=int(degree),
+            bounds=virtual_bounds(data.monitors),
+            weights=W,
+            nonlinear=data.model.nonlinear,
+        )
+        return per_axis_errors(preds, Y, [s.monitor_index for s in samples])
+    except (ValueError, np.linalg.LinAlgError) as exc:
+        log.debug("Cannot recompute the per-axis gaze error: %s", exc)
+        return {}
 
 
 # --------------------------------------------------------------------- library

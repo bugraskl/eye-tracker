@@ -17,6 +17,7 @@ from eye_tracker.gaze.calibration import (
     evaluate,
     grade_for,
     make_plan,
+    per_axis_errors,
     samples_to_arrays,
 )
 from eye_tracker.types import Monitor, Observation, Rect
@@ -528,3 +529,49 @@ def test_samples_to_arrays() -> None:
     assert W.tolist() == [1.0, 0.5]
     with pytest.raises(ValueError, match="no samples"):
         samples_to_arrays([])
+
+
+# ------------------------------------------------------------------ per-axis error
+def test_evaluate_reports_the_gaze_error_per_monitor_and_axis() -> None:
+    samples = calibration_samples(TWO, np.random.default_rng(104), noise=1.0)
+    _, report = evaluate(samples, TWO, nonlinear=GAZE)
+    assert set(report.per_monitor_error_px) == {0, 1}
+    for ex, ey in report.per_monitor_error_px.values():
+        assert 0.0 < ex < 400.0
+        assert 0.0 < ey < 400.0
+    # The 75th percentile of each axis is of the order of the mean distance.
+    worst = max(max(xy) for xy in report.per_monitor_error_px.values())
+    assert worst < 3 * report.mean_error_px
+
+
+def test_evaluate_leaves_uncovered_monitors_out_of_the_axis_errors() -> None:
+    covered = [s for s in calibration_samples(THREE, np.random.default_rng(105)) if s.x < 1920]
+    _, report = evaluate(covered, THREE)
+    assert report.uncovered_monitors == [2]
+    assert set(report.per_monitor_error_px) == {0, 1}
+
+
+def test_per_axis_errors_takes_the_75th_percentile_of_each_axis() -> None:
+    truth = np.zeros((5, 2))
+    preds = np.array([[1, -10], [-2, 20], [3, 30], [-4, 40], [math.nan, 0]], dtype=float)
+    errors = per_axis_errors(preds, truth, [0, 0, 0, 0, 0])
+    assert errors == {0: (pytest.approx(3.25), pytest.approx(32.5))}
+    assert per_axis_errors(preds[4:], truth[4:], [1]) == {}  # nothing finite on monitor 1
+    with pytest.raises(ValueError, match="differ in length"):
+        per_axis_errors(preds, truth, [0])
+
+
+def test_report_axis_errors_round_trip_and_old_reports_load() -> None:
+    report = _report(per_monitor_error_px={0: (31.5, 20.25), 1: (40.0, 22.0)})
+    data = report.to_dict()
+    assert data["per_monitor_error_px"] == {"0": [31.5, 20.25], "1": [40.0, 22.0]}
+    assert CalibrationReport.from_dict(data).per_monitor_error_px == {
+        0: (31.5, 20.25),
+        1: (40.0, 22.0),
+    }
+    old = {k: v for k, v in data.items() if k != "per_monitor_error_px"}
+    assert CalibrationReport.from_dict(old).per_monitor_error_px == {}
+    damaged = {**data, "per_monitor_error_px": {"0": [1.0], "1": [None, 2.0], "x": [1, 2]}}
+    assert CalibrationReport.from_dict(damaged).per_monitor_error_px == {}
+    with pytest.raises(ValueError, match="invalid calibration report"):
+        CalibrationReport.from_dict({**data, "per_monitor_error_px": [1, 2]})

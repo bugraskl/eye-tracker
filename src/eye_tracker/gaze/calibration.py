@@ -52,6 +52,12 @@ GRADE_THRESHOLDS: tuple[tuple[str, float], ...] = (
 MIN_SAMPLES = 10
 MIN_POINTS = 3
 
+#: Percentile of the absolute held-out error per axis that is reported as a
+#: monitor's gaze error (:attr:`CalibrationReport.per_monitor_error_px`). The 75th
+#: covers most looks without being dominated by the few dots the face was half
+#: lost on.
+AXIS_ERROR_PERCENTILE = 75.0
+
 # Timer ticks are sums of floats (11.8 + 0.8 = 12.599999…); without a little
 # slack a phase could end one tick late.
 _TIME_EPS = 1e-6
@@ -415,6 +421,12 @@ class CalibrationReport:
     #: not found while looking at them). They appear in ``per_monitor_accuracy``
     #: with 0.0 and cap the grade at "fair".
     uncovered_monitors: list[int] = field(default_factory=list)
+    #: Gaze error per monitor and axis, ``{monitor: (x_px, y_px)}``: the
+    #: :data:`AXIS_ERROR_PERCENTILE` th percentile of the absolute held-out error
+    #: of that monitor's samples. Split panes are only told apart where they are
+    #: large compared with it. Empty in reports saved before it existed (see
+    #: :func:`eye_tracker.gaze.store.axis_error`) and for uncovered monitors.
+    per_monitor_error_px: dict[int, tuple[float, float]] = field(default_factory=dict)
 
     def summary(self) -> str:
         """One human-readable line, e.g. ``"Excellent — 99% monitor accuracy, 180 samples"``."""
@@ -432,6 +444,10 @@ class CalibrationReport:
         """JSON-friendly dict (monitor keys become strings, non-finite numbers ``None``)."""
         out = asdict(self)
         out["per_monitor_accuracy"] = {str(k): v for k, v in self.per_monitor_accuracy.items()}
+        out["per_monitor_error_px"] = {
+            str(k): [_json_number(float(v)) for v in xy]
+            for k, xy in self.per_monitor_error_px.items()
+        }
         return {k: _json_number(v) for k, v in out.items()}
 
     @classmethod
@@ -452,9 +468,62 @@ class CalibrationReport:
                 grade=str(data["grade"]),
                 degree=int(data.get("degree", 2)),
                 uncovered_monitors=[int(i) for i in data.get("uncovered_monitors") or []],
+                per_monitor_error_px=axis_errors_from_dict(data.get("per_monitor_error_px")),
             )
         except (KeyError, TypeError, ValueError, AttributeError, OverflowError) as exc:
             raise ValueError(f"invalid calibration report: {exc}") from exc
+
+
+def axis_errors_from_dict(value: Any) -> dict[int, tuple[float, float]]:
+    """``per_monitor_error_px`` as stored (``{"0": [x, y]}``); absent or null gives ``{}``.
+
+    Entries that are not two finite, non-negative numbers are dropped: a damaged
+    entry only means "unknown", which callers estimate otherwise. A value that is
+    not an object at all raises ``ValueError``, like the rest of a malformed report.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("per_monitor_error_px must be an object")
+    out: dict[int, tuple[float, float]] = {}
+    for key, pair in value.items():
+        if not isinstance(pair, list | tuple) or len(pair) != 2:
+            continue
+        try:
+            ex, ey = float(pair[0]), float(pair[1])
+            index = int(key)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if all(math.isfinite(v) and v >= 0.0 for v in (ex, ey)):
+            out[index] = (ex, ey)
+    return dict(sorted(out.items()))
+
+
+def per_axis_errors(
+    predictions: np.ndarray, targets: np.ndarray, monitor_indices: Sequence[int]
+) -> dict[int, tuple[float, float]]:
+    """``{monitor: (x_px, y_px)}``: the :data:`AXIS_ERROR_PERCENTILE` th percentile of
+    the absolute error on each axis over each monitor's samples.
+
+    ``predictions`` and ``targets`` are ``(n, 2)`` arrays (held-out predictions and
+    the points looked at); ``monitor_indices`` gives each row's monitor. Rows with
+    a non-finite prediction are ignored; a monitor without a finite row is left out.
+    """
+    preds = np.asarray(predictions, dtype=np.float64).reshape(-1, 2)
+    truth = np.asarray(targets, dtype=np.float64).reshape(-1, 2)
+    owners = np.asarray([int(i) for i in monitor_indices], dtype=np.int64)
+    if not preds.shape[0] == truth.shape[0] == owners.shape[0]:
+        raise ValueError("predictions, targets and monitor indices differ in length")
+    err = np.abs(preds - truth)
+    finite = np.isfinite(err).all(axis=1)
+    out: dict[int, tuple[float, float]] = {}
+    for idx in sorted(set(owners.tolist())):
+        rows = err[(owners == idx) & finite]
+        if rows.shape[0] == 0:
+            continue
+        ex, ey = np.percentile(rows, AXIS_ERROR_PERCENTILE, axis=0)
+        out[int(idx)] = (float(ex), float(ey))
+    return out
 
 
 def grade_for(monitor_accuracy: float) -> str:
@@ -565,6 +634,7 @@ def evaluate(
         grade=grade,
         degree=selection.degree,
         uncovered_monitors=[int(i) for i in uncovered],
+        per_monitor_error_px=per_axis_errors(preds, Y, truth.tolist()),
     )
     model = GazeModel(degree=selection.degree, alpha=selection.alpha, nonlinear=nonlinear).fit(
         X, Y, W, bounds, regions=[m.rect for m in monitor_list]

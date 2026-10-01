@@ -84,10 +84,10 @@ share a short one.
   computer as well, and only for the position, focus and id of its terminal panes, never their text.
   Only pane positions, sizes and ids are read: pane titles, commands, working directories and
   contents are never stored, logged, traced or shown in `eye-tracker ctl status`. Electron and
-  Chromium apps are never asked anything, except the Claude desktop app when you turn on
-  `panes.desktop_apps` (off by default): then its window is asked through UI Automation for the
-  type, class name and rectangle of the elements on the way to its two chat sessions, and the
-  process of the element with the keyboard focus. Names and text of elements, and so your messages,
+  Chromium apps are never asked anything, except the Claude and ChatGPT desktop apps when you turn
+  on `panes.desktop_apps` (off by default): then their windows are asked through UI Automation for
+  the type, class name and rectangle of the elements on the way to their side-by-side sessions, and
+  the process of the element with the keyboard focus. Names and text of elements, and so your messages,
   are never read.
 - It does not identify you. It detects *a* face and where it looks; it does not recognise whose face
   it is.

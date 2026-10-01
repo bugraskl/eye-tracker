@@ -2949,11 +2949,12 @@ def test_denied_apps_are_never_inspected(make_controller: Callable[..., Harness]
     assert h.controller.status()["panes"]["panes"] == 0
 
 
-def test_the_claude_app_is_inspected_only_when_desktop_apps_is_on(
-    make_controller: Callable[..., Harness],
+@pytest.mark.parametrize("process", ["claude", "chatgpt"])
+def test_desktop_apps_are_inspected_only_when_desktop_apps_is_on(
+    make_controller: Callable[..., Harness], process: str
 ) -> None:
-    claude = AppIdentity("claude", "Chrome_WidgetWin_1")
-    h, provider = make_pane_controller(make_controller, app=claude)
+    desktop_app = AppIdentity(process, "Chrome_WidgetWin_1")
+    h, provider = make_pane_controller(make_controller, app=desktop_app)
     provider.name = "desktop_apps"
     settle_mouse(h)
     h.feed(gaze_obs(RIGHT_PANE), 3.0)

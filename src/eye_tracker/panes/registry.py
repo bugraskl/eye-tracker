@@ -9,7 +9,7 @@ Code get their own, purpose-built support later instead.
 
 The one exception is opt-in: with ``panes.desktop_apps`` on, the desktop apps
 that have a profile in :mod:`.providers.chromium_apps` (matched by process
-name *and* window class; today only the Claude app) skip the deny-list and go
+name *and* window class; the Claude and ChatGPT apps) skip the deny-list and go
 to that provider alone. Every other denied app stays denied.
 """
 

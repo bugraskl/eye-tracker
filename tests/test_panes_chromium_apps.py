@@ -18,10 +18,12 @@ import pytest
 from eye_tracker.config import PaneSettings, Settings, describe_settings
 from eye_tracker.panes.providers import chromium_apps
 from eye_tracker.panes.providers.chromium_apps import (
+    CHATGPT,
     CLAUDE,
     COMPOSER_BUDGET,
     NODE_BUDGET,
     PROVIDER_NAME,
+    AppProfile,
     ChromiumAppProvider,
     class_tokens,
     profile_for,
@@ -296,6 +298,68 @@ class FakeClient:
         return all(v.closed for v in self.views)
 
 
+GPT_APP = AppIdentity("chatgpt", "Chrome_WidgetWin_1")
+MAIN_RECT = Rect(2261, 96, 884, 940)
+SIDE_RECT = Rect(3145, 96, 691, 940)
+MAIN_ID = (42, 9, 1)
+SIDE_ID = (42, 9, 2)
+
+
+def chatgpt_tree(
+    *, side: bool = True, overlay: bool = True, build_hash: str = "bo1ta_2", messages: int = 3
+) -> ClaudeTree:
+    """The ChatGPT window as measured: main conversation and side chat."""
+    main_composer = Node(EDIT, "ProseMirror", rect=Rect(2347, 936, 712, 44), focusable=True)
+    main = Node(GROUP, "relative flex h-full flex-col min-h-0", rect=MAIN_RECT, rid=MAIN_ID).add(
+        Node(GROUP, "group/thread-scroll-layout has-[[data-composer]]").add(
+            conversation(messages), Node(GROUP, "composer").add(main_composer)
+        )
+    )
+    side_composer = Node(
+        EDIT, "ProseMirror ProseMirror-focused", rect=Rect(3174, 936, 634, 44), focusable=True
+    )
+    side_pane = Node(
+        GROUP, "relative z-[41] h-full min-h-0 min-w-0 shrink-0", rect=SIDE_RECT, rid=SIDE_ID
+    ).add(
+        Node(GROUP, "min-h-0 flex-1").add(
+            Node(
+                NATIVE,
+                "min-h-0 min-w-0 flex-1 outline-none relative",
+                aid="app-shell-tab-panel-app-shell-tab:4",
+                rect=Rect(3146, 96, 690, 940),
+            ).add(conversation(messages), side_composer)
+        )
+    )
+    container = Node(
+        GROUP,
+        f"outline-none _MainContentSurface_{build_hash}",
+        aid="_r_bs_",
+        rect=Rect(2260, 44, 1576, 992),
+    ).add(main)
+    if side:
+        container.add(side_pane)
+    if overlay:
+        container.add(Node(GROUP, "absolute toast", rect=Rect(3000, 100, 180, 40), rid=(42, 9, 3)))
+    sidebar = Node(GROUP, "app-shell-left-panel pointer-events-auto", rect=Rect(1920, 44, 340, 992))
+    for _ in range(100):
+        sidebar.add(Node(GROUP, "chat-item").add(Node(TEXT)))
+    document = Node(DOCUMENT, aid="RootWebArea", rect=AREA, focusable=True).add(
+        Node(GROUP, "").add(Node(GROUP, aid="root").add(sidebar, container))
+    )
+    window = Node(WINDOW_TYPE, "Chrome_WidgetWin_1", rect=AREA).add(
+        Node(NATIVE, "RootView").add(
+            Node(NATIVE, "NonClientView").add(
+                Node(NATIVE, "ChromeNodeFrameView").add(
+                    Node(NATIVE, "ChromeNodeClientView").add(
+                        Node(NATIVE, "View").add(Node(NATIVE, "Chrome_WidgetWin_1").add(document))
+                    )
+                )
+            )
+        )
+    )
+    return ClaudeTree(window, document, main, side_pane, main_composer, side_composer, sidebar)
+
+
 def provider(client: FakeClient) -> ChromiumAppProvider:
     return ChromiumAppProvider(
         client_rect=lambda ref: AREA if ref.handle == HWND else None, client=client
@@ -303,16 +367,33 @@ def provider(client: FakeClient) -> ChromiumAppProvider:
 
 
 # ---------------------------------------------------------------- profiles
-def test_only_the_claude_app_has_a_profile() -> None:
-    assert chromium_apps.PROFILES == (CLAUDE,)
+def test_only_the_claude_and_chatgpt_apps_have_a_profile() -> None:
+    assert chromium_apps.PROFILES == (CLAUDE, CHATGPT)
     assert profile_for(APP) is CLAUDE
     assert profile_for(AppIdentity("Claude", "Chrome_WidgetWin_1")) is CLAUDE
+    assert profile_for(GPT_APP) is CHATGPT
+    assert profile_for(AppIdentity("ChatGPT", "Chrome_WidgetWin_1")) is CHATGPT
     # Process name and window class must both match.
     assert profile_for(AppIdentity("claude", "Chrome_WidgetWin_0")) is None
     assert profile_for(AppIdentity("claude", "com.anthropic.claudefordesktop")) is None
-    assert profile_for(AppIdentity("chatgpt", "Chrome_WidgetWin_1")) is None  # no profile yet
+    assert profile_for(AppIdentity("chatgpt", "com.openai.chat")) is None
     assert profile_for(AppIdentity("code", "Chrome_WidgetWin_1")) is None
     assert profile_for(None) is None
+
+
+def test_a_profile_finds_panes_one_way() -> None:
+    with pytest.raises(ValueError, match="exactly one"):
+        AppProfile("x", frozenset({"x"}), "c", "ProseMirror")
+    with pytest.raises(ValueError, match="exactly one"):
+        AppProfile("x", frozenset({"x"}), "c", "ProseMirror", pane_token="a", container_prefix="b")
+
+
+def test_the_container_is_matched_by_token_prefix() -> None:
+    assert CHATGPT.is_container(class_tokens("outline-none _MainContentSurface_bo1ta_2"))
+    assert CHATGPT.is_container(class_tokens("_MainContentSurface_zz9_7"))  # another build
+    assert not CHATGPT.is_container(class_tokens("x_MainContentSurface_bo1ta_2"))
+    assert not CHATGPT.is_container(class_tokens("MainContentSurface outline-none"))
+    assert not CLAUDE.is_container(class_tokens("_MainContentSurface_bo1ta_2"))
 
 
 def test_creating_the_provider_touches_nothing() -> None:
@@ -628,6 +709,65 @@ def test_focus_of_a_session_that_is_gone_fails() -> None:
     assert other.focus(WINDOW, snapshot.panes[1]) is False
 
 
+# ---------------------------------------------------------------- ChatGPT
+def test_chatgpt_main_conversation_and_side_chat() -> None:
+    tree = chatgpt_tree(messages=100)
+    client = FakeClient(tree, focused=tree.secondary_composer)
+    snapshot = provider(client).detect(WINDOW, GPT_APP)
+    assert snapshot is not None
+    assert [p.id for p in snapshot.panes] == [MAIN_ID, SIDE_ID]  # not the small overlay
+    assert [p.rect for p in snapshot.panes] == [MAIN_RECT, SIDE_RECT]
+    assert snapshot.focused is not None
+    assert snapshot.focused.id == SIDE_ID
+    [view] = client.views
+    assert view.steps <= 40, view.steps
+    touched = {id(n) for _, n in view.reads if n is not tree.secondary_composer}
+    assert not any(id(n) in touched for n in list(walk(tree.sidebar))[1:])
+    for pane in (tree.primary, tree.secondary):
+        assert not any(id(n) in touched for n in list(walk(pane))[1:])
+    assert client.all_closed
+
+
+def test_chatgpt_container_of_another_build_is_found() -> None:
+    tree = chatgpt_tree(build_hash="x7k2p_9")
+    snapshot = provider(FakeClient(tree)).detect(WINDOW, GPT_APP)
+    assert snapshot is not None
+    assert snapshot.focused is not None
+    assert snapshot.focused.id == MAIN_ID
+
+
+def test_chatgpt_without_a_side_chat_is_not_a_split() -> None:
+    # The main conversation and a small overlay: one pane.
+    assert provider(FakeClient(chatgpt_tree(side=False))).detect(WINDOW, GPT_APP) is None
+
+
+def test_chatgpt_container_without_prefix_token_is_not_used() -> None:
+    tree = chatgpt_tree()
+    container = tree.primary.parent
+    assert container is not None
+    container.cls = "outline-none MainContentSurface"
+    assert provider(FakeClient(tree)).detect(WINDOW, GPT_APP) is None
+
+
+def test_chatgpt_focus_goes_to_the_message_box_of_each_side() -> None:
+    tree = chatgpt_tree(messages=500)
+    client = FakeClient(tree, focused=tree.secondary_composer)
+    p = provider(client)
+    snapshot = p.detect(WINDOW, GPT_APP)
+    assert snapshot is not None
+    assert p.focus(WINDOW, snapshot.panes[0]) is True
+    assert client.focus_set == [tree.primary_composer]
+    assert p.focus(WINDOW, snapshot.panes[1]) is True
+    assert client.focus_set == [tree.primary_composer, tree.secondary_composer]
+    assert client.all_closed
+
+
+def test_the_tree_not_built_yet_is_no_panes_for_chatgpt_too() -> None:
+    tree = chatgpt_tree()
+    tree.document.children.clear()
+    assert provider(FakeClient(tree)).detect(WINDOW, GPT_APP) is None
+
+
 # --------------------------------------------------------------- deny-list
 DENIED_ALWAYS = [
     AppIdentity("code", "Chrome_WidgetWin_1"),
@@ -635,7 +775,8 @@ DENIED_ALWAYS = [
     AppIdentity("cursor", "Chrome_WidgetWin_1"),
     AppIdentity("antigravity", "Chrome_WidgetWin_1"),
     AppIdentity("windsurf", "Chrome_WidgetWin_1"),
-    AppIdentity("chatgpt", "Chrome_WidgetWin_1"),  # no profile yet
+    # The ChatGPT process, but not its main window class.
+    AppIdentity("chatgpt", "Chrome_WidgetWin_0"),
     AppIdentity("chrome", "Chrome_WidgetWin_1"),
     AppIdentity("msedge", "Chrome_WidgetWin_1"),
     AppIdentity("someapp", "Chrome_WidgetWin_1"),
@@ -651,33 +792,42 @@ def _registry(client: FakeClient, other: RecordingProvider, *, desktop_apps: boo
     return PaneRegistry([other, provider(client)], desktop_apps=desktop_apps)
 
 
-def test_claude_is_never_asked_while_the_setting_is_off(qapp: Any) -> None:
-    client = FakeClient()
+PROFILED = [(APP, claude_tree), (GPT_APP, chatgpt_tree)]
+
+
+@pytest.mark.parametrize(("app", "tree"), PROFILED, ids=["claude", "chatgpt"])
+def test_profiled_apps_are_never_asked_while_the_setting_is_off(
+    qapp: Any, app: AppIdentity, tree: Any
+) -> None:
+    client = FakeClient(tree())
     other = RecordingProvider("tmux", snapshot=lambda ref: two_panes(ref.handle))
     registry = _registry(client, other, desktop_apps=False)
-    assert is_denied(APP)
-    assert registry.providers_for(APP) == []
+    assert is_denied(app)
+    assert registry.providers_for(app) == []
     worker = PaneWorker(registry, synchronous=True)
     results: list[Any] = []
     worker.detected.connect(results.append)
-    worker.request_detect(WINDOW, APP)
+    worker.request_detect(WINDOW, app)
     assert client.calls == []
     assert other.calls == []
     assert results[0].snapshot is None
 
 
-def test_with_the_setting_on_claude_goes_to_this_provider_alone(qapp: Any) -> None:
-    client = FakeClient()
+@pytest.mark.parametrize(("app", "tree"), PROFILED, ids=["claude", "chatgpt"])
+def test_with_the_setting_on_profiled_apps_go_to_this_provider_alone(
+    qapp: Any, app: AppIdentity, tree: Any
+) -> None:
+    client = FakeClient(tree())
     other = RecordingProvider("tmux", snapshot=lambda ref: two_panes(ref.handle))
     registry = _registry(client, other, desktop_apps=True)
-    assert not is_denied(APP, desktop_apps=True)
-    assert [p.name for p in registry.providers_for(APP)] == ["desktop_apps"]
+    assert not is_denied(app, desktop_apps=True)
+    assert [p.name for p in registry.providers_for(app)] == ["desktop_apps"]
     worker = PaneWorker(registry, synchronous=True)
     results: list[Any] = []
     worker.detected.connect(results.append)
-    worker.request_detect(WINDOW, APP)
+    worker.request_detect(WINDOW, app)
     assert client.calls == ["foreground", "control_view"]
-    assert other.calls == []  # tmux is not asked about the Claude window
+    assert other.calls == []  # tmux is not asked about the app's window
     assert results[0].snapshot is not None
     assert results[0].snapshot.provider == "desktop_apps"
     # Terminals still go to their providers, never to this one.
@@ -721,6 +871,8 @@ def test_the_setting_is_off_by_default_and_says_what_it_costs() -> None:
     assert Settings().panes.desktop_apps is False
     doc = next(row["doc"] for row in describe_settings() if row["key"] == "panes.desktop_apps")
     assert "Claude" in doc
+    assert "ChatGPT" in doc
+    assert "Codex" in doc
     assert "accessibility tree" in doc
     assert "CPU" in doc
 

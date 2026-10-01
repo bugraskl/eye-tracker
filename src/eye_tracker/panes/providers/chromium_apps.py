@@ -10,18 +10,28 @@ and are asked by this provider, and by no other. Every other Chromium window
 
 Profiles
 --------
-Only the Claude desktop app has one. It can show two chat sessions side by
-side; each is a ``Group`` element whose class contains the token
-``dframe-pane`` (the HTML class attribute, split on whitespace and matched
-token by token), and each has a message box: an ``Edit`` whose class contains
-``ProseMirror``. Other apps (ChatGPT, Codex) get a profile once their tree is
-known.
+Class names are the HTML class attribute, split on whitespace and matched token
+by token (never as substrings). A profile finds its panes in one of two ways:
+
+* by a **pane token**: every ``Group`` whose class has the token is a pane. The
+  Claude desktop app shows two chat sessions side by side, each a group with the
+  token ``dframe-pane``.
+* by a **container prefix**: the direct ``Group`` children of the first group
+  with a class token starting with the prefix are the panes (CSS-module classes
+  carry a build hash, so only the prefix is stable). The ChatGPT desktop app
+  (which also hosts Codex) shows the main conversation and a side chat or side
+  panel as the children of ``_MainContentSurface_<hash>``.
+
+Either way a pane must be at least :attr:`AppProfile.min_pane` pixels in both
+directions, which leaves out small overlays. Each session has a message box: an
+``Edit`` whose class has the token ``ProseMirror``. Names are never used (they
+are localised, and they are what the user wrote).
 
 The walk (``detect``)
 ---------------------
 The control view of the window is walked step by step (first child, next
-sibling), never as a whole: a full walk of the Claude window reads ~630
-elements and takes ~0.7 s.
+sibling), never as a whole: a full walk reads ~630 elements of the Claude
+window in ~0.7 s, ~420 of the ChatGPT window in ~0.33 s.
 
 1. From the window element, depth first through the native views (any control
    type except ``Document``, at most :data:`NATIVE_DEPTH` levels) to the
@@ -29,23 +39,26 @@ elements and takes ~0.7 s.
    documents are not entered.
 2. From there through ``Group`` elements only, at most :data:`WEB_DEPTH` levels
    below the document. A group whose class has the profile's pane token is a
-   pane: it is not entered. A group with one of the profile's skip tokens (the
-   sidebar) is not entered either. Once a group's children included panes, the
+   pane: it is not entered. A group with a token starting with the profile's
+   container prefix is the container: its children (one step each) are the
+   panes and the walk ends there. A group with one of the profile's skip tokens
+   (the sidebar) is not entered. Once a group's children included panes, the
    walk ends after that group.
 
 Every step of the walk (a first-child or next-sibling call) counts against
 :data:`NODE_BUDGET`; when it is used up the walk stops with what it found. On
-a tree shaped like the measured one, a detection takes about 25 steps and 35
-property reads (a focus about 30 and 40), against ~630 elements for a full
-walk. Per element only the control type is read, plus the class name of groups
-and editors and the automation id of documents; of the panes their rectangle,
+trees shaped like the measured ones, a detection takes about 25 steps and 35
+property reads for Claude, 15 and 30 for ChatGPT (a focus a few more). Per
+element only the control type is read, plus the class name of groups and
+editors and the automation id of documents; of the panes their rectangle,
 visibility and runtime id. Names, values and text are never read.
 
-Panes are the pane groups that are not off-screen and have a non-empty
-rectangle inside the window, at least two of them. The focused pane is the one
-containing the element with the keyboard focus (``GetFocusedElement``): its
-centre must lie in the pane and it must not be larger than the pane, so the
-whole page having the focus means no pane has it. The focused element counts
+Panes are the pane groups that are not off-screen and whose rectangle, cut to
+the window, is at least :attr:`AppProfile.min_pane` large, at least two of
+them. The focused pane is the one containing the element with the keyboard
+focus (``GetFocusedElement``): its centre must lie in the pane and it must not
+be larger than the pane, so the whole page having the focus means no pane has
+it. The focused element counts
 only if it belongs to the app's process. Pane ids are runtime ids, else the
 pane's rectangle (as for Windows Terminal).
 
@@ -104,7 +117,10 @@ COMPOSER_DEPTH = 24
 
 @dataclass(frozen=True, slots=True)
 class AppProfile:
-    """How to find the side-by-side sessions of one desktop app."""
+    """How to find the side-by-side sessions of one desktop app.
+
+    Exactly one of ``pane_token`` and ``container_prefix`` is set.
+    """
 
     #: Short name used in logs.
     name: str
@@ -112,15 +128,33 @@ class AppProfile:
     processes: frozenset[str]
     #: Class of the app's top-level windows.
     window_class: str
-    #: Class token of a ``Group`` that is one session pane.
-    pane_token: str
     #: Class token of the session's message box (an ``Edit``).
     composer_token: str
+    #: Class token of a ``Group`` that is one session pane.
+    pane_token: str | None = None
+    #: Prefix of a class token of the ``Group`` whose ``Group`` children are the panes.
+    container_prefix: str | None = None
     #: Class tokens of groups never entered while looking for panes.
     skip_tokens: frozenset[str] = field(default_factory=frozenset)
+    #: Smallest pane (width, height) in pixels; smaller children are overlays.
+    min_pane: tuple[int, int] = (200, 200)
+
+    def __post_init__(self) -> None:
+        if (self.pane_token is None) == (self.container_prefix is None):
+            raise ValueError("an AppProfile needs exactly one of pane_token, container_prefix")
 
     def matches(self, app: AppIdentity) -> bool:
         return app.process.strip().lower() in self.processes and app.app_id == self.window_class
+
+    def is_container(self, tokens: frozenset[str]) -> bool:
+        """Whether a group with these class tokens holds the panes."""
+        prefix = self.container_prefix
+        if not prefix:
+            return False
+        return any(t.startswith(prefix) for t in tokens)
+
+    def large_enough(self, rect: Rect) -> bool:
+        return rect.w >= self.min_pane[0] and rect.h >= self.min_pane[1]
 
 
 #: The Claude desktop app (Windows).
@@ -133,8 +167,18 @@ CLAUDE = AppProfile(
     skip_tokens=frozenset({"dframe-sidebar"}),
 )
 
+#: The ChatGPT desktop app (Windows), which also hosts Codex.
+CHATGPT = AppProfile(
+    name="chatgpt",
+    processes=frozenset({"chatgpt"}),
+    window_class="Chrome_WidgetWin_1",
+    container_prefix="_MainContentSurface_",
+    composer_token="ProseMirror",
+    skip_tokens=frozenset({"app-shell-left-panel"}),
+)
+
 #: Every app with a profile; only these ever skip the registry's deny-list.
-PROFILES: tuple[AppProfile, ...] = (CLAUDE,)
+PROFILES: tuple[AppProfile, ...] = (CLAUDE, CHATGPT)
 
 
 def profile_for(app: AppIdentity | None) -> AppProfile | None:
@@ -253,9 +297,17 @@ def find_panes(view: ElementView, document: Any, profile: AppProfile, budget: _B
             if view.control_type(child) != UIA_GROUP_CONTROL_TYPE_ID:
                 continue
             tokens = class_tokens(view.class_name(child))
-            if profile.pane_token in tokens:
+            if profile.pane_token is not None and profile.pane_token in tokens:
                 here.append(child)  # a pane: its contents are not walked
                 continue
+            if profile.is_container(tokens):
+                # Its group children are the panes; their contents are not walked.
+                panes.extend(
+                    c
+                    for c in _children(view, child, budget)
+                    if view.control_type(c) == UIA_GROUP_CONTROL_TYPE_ID
+                )
+                return True
             if tokens & profile.skip_tokens or depth >= WEB_DEPTH:
                 continue
             if visit(child, depth + 1):
@@ -418,8 +470,10 @@ class ChromiumAppProvider:
             if rect is None:
                 continue
             clipped = _clip(rect, bounds)
+            if clipped is None or not profile.large_enough(clipped):
+                continue
             ident = pane_id(view.runtime_id(node), rect)
-            if clipped is None or ident is None or ident in seen:
+            if ident is None or ident in seen:
                 continue
             seen.add(ident)
             found.append(_Found(node, ident, clipped))

@@ -1312,12 +1312,14 @@ class SettingsDialog(QDialog):
             )
         )
         desktop = self._check(
-            panes, "panes.desktop_apps", "Also switch between Claude desktop app sessions"
+            panes,
+            "panes.desktop_apps",
+            "Also switch between side-by-side sessions in the Claude and ChatGPT apps",
         )
         desktop_hint = self._hint(
-            "Two Claude chats side by side: the one you look at gets the focus in its message "
-            "box. Windows only. Asks the app for its accessibility tree, which can cost the app "
-            "some CPU and memory."
+            "Two Claude chats, or a ChatGPT or Codex conversation and its side chat: the one you "
+            "look at gets the focus in its message box. Windows only. Asks the app for its "
+            "accessibility tree, which can cost the app some CPU and memory."
         )
         panes.addRow(desktop_hint)
         self._depends(follow, [precision, desktop, desktop_hint])

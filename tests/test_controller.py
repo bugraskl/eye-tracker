@@ -2823,6 +2823,8 @@ class PaneProviderFake:
         self.calls: list[tuple[str, Any]] = []
         self.focused = "%0"
         self.focus_ok = True
+        #: The panes and where they are (changed by tests to re-split the window).
+        self.rects: dict[str, Rect] = {"%0": Rect(0, 0, 960, 1080), "%1": Rect(960, 0, 960, 1080)}
 
     def applies(self, app: AppIdentity) -> bool:
         self.calls.append(("applies", app.process))
@@ -2830,9 +2832,9 @@ class PaneProviderFake:
 
     def detect(self, ref: WindowRef, app: AppIdentity) -> PaneSnapshot | None:
         self.calls.append(("detect", ref.handle))
-        panes = (
-            Pane("%0", Rect(0, 0, 960, 1080), self.focused == "%0", self.name),
-            Pane("%1", Rect(960, 0, 960, 1080), self.focused == "%1", self.name),
+        panes = tuple(
+            Pane(pane_id, rect, self.focused == pane_id, self.name)
+            for pane_id, rect in self.rects.items()
         )
         return PaneSnapshot(ref.handle, panes, 0.0)
 
@@ -2900,7 +2902,9 @@ def test_split_panes_are_off_by_default(make_controller: Callable[..., Harness])
 def test_gaze_on_another_pane_moves_only_the_keyboard_focus(
     make_controller: Callable[..., Harness],
 ) -> None:
-    h, provider = make_pane_controller(make_controller)
+    s = pane_settings()
+    s.panes.move_cursor = False  # the cursor stays too (see the tests below for the default)
+    h, provider = make_pane_controller(make_controller, s)
     settle_mouse(h)  # also the first window polls: the panes are known
     assert ("detect", TERMINAL.handle) in provider.calls
     h.feed(gaze_obs(LEFT_PANE), 1.0)
@@ -2921,6 +2925,124 @@ def test_gaze_on_another_pane_moves_only_the_keyboard_focus(
     # The focus now is where the user looks: nothing more happens.
     h.feed(gaze_obs(RIGHT_PANE), 2.0)
     assert provider.names().count("focus") == 1
+
+
+RIGHT_PANE_CENTRE = (1440, 540)
+
+
+def look_at_the_right_pane(h: Harness) -> None:
+    """Work in the left (focused) pane, then look at the right one long enough."""
+    h.feed(gaze_obs(LEFT_PANE), 1.0)
+    h.feed(gaze_obs(RIGHT_PANE), 1.0)
+
+
+def test_the_cursor_follows_into_the_pane_centre(make_controller: Callable[..., Harness]) -> None:
+    h, provider = make_pane_controller(make_controller)
+    settle_mouse(h)  # the cursor rests at (500, 500): in the left pane
+    look_at_the_right_pane(h)
+    assert ("focus", "%1") in provider.calls
+    assert h.cursor.moves == [RIGHT_PANE_CENTRE]
+    assert "activate_window" not in h.platform.names()
+    assert h.events["switched"] == []  # no monitor switch
+
+
+def test_the_cursor_returns_to_where_it_was_left_in_the_pane(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h, _provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    h.cursor.position = (1700, 300)  # the user worked in the right pane ...
+    h.tick()
+    h.cursor.position = (500, 500)  # ... and went back to the left one
+    h.tick()
+    settle_mouse(h)
+    look_at_the_right_pane(h)
+    assert h.cursor.moves == [(1700, 300)]
+
+
+def test_a_remembered_spot_outside_the_pane_now_is_ignored(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h, provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    h.cursor.position = (1700, 300)
+    h.tick()
+    h.cursor.position = (500, 500)
+    h.tick()
+    # The right pane shrinks to the lower half: (1700, 300) is no longer in it.
+    provider.rects["%1"] = Rect(960, 540, 960, 540)
+    settle_mouse(h)  # the next refreshes see the new layout
+    h.feed(gaze_obs(LEFT_PANE), 1.5)
+    h.feed(gaze_obs((1440, 810)), 1.0)
+    assert ("focus", "%1") in provider.calls
+    assert h.cursor.moves == [(1440, 810)]  # the centre of the pane as it is now
+
+
+def test_no_cursor_move_when_the_focus_failed(make_controller: Callable[..., Harness]) -> None:
+    h, provider = make_pane_controller(make_controller)
+    provider.focus_ok = False
+    settle_mouse(h)
+    look_at_the_right_pane(h)
+    assert ("focus", "%1") in provider.calls
+    assert h.cursor.moves == []
+
+
+def test_no_cursor_move_when_it_is_already_in_the_pane(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h, provider = make_pane_controller(make_controller)
+    h.cursor.position = (1500, 900)  # resting in the right pane, focus in the left one
+    settle_mouse(h)
+    look_at_the_right_pane(h)
+    assert ("focus", "%1") in provider.calls
+    assert h.cursor.moves == []
+
+
+def test_our_own_cursor_move_is_not_mouse_use(make_controller: Callable[..., Harness]) -> None:
+    h, provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    look_at_the_right_pane(h)
+    assert h.cursor.moves == [RIGHT_PANE_CENTRE]
+    mouse_before = h.controller._input.last_mouse_activity
+    h.feed(gaze_obs(RIGHT_PANE), 1.0)  # polls see the cursor at its new place
+    assert h.controller._input.last_mouse_activity == mouse_before
+    # So the mouse grace does not hold the next pane switch: back to the left
+    # pane after the cooldown and the dwell, well within the mouse grace (1.5 s).
+    h.feed(gaze_obs(LEFT_PANE), 1.0)
+    assert [c for c in provider.calls if c[0] == "focus"] == [("focus", "%1"), ("focus", "%0")]
+
+
+def test_refused_cursor_moves_count_towards_the_warp_backoff(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h, provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    h.cursor.allow = False
+    look_at_the_right_pane(h)
+    assert ("focus", "%1") in provider.calls  # the focus moved anyway
+    assert h.cursor.moves == [RIGHT_PANE_CENTRE]
+    assert h.controller._warp_refusals == 1
+
+
+def test_remembered_spots_of_closed_panes_and_windows_are_forgotten(
+    make_controller: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h, provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    h.cursor.position = (1700, 300)
+    h.tick()
+    spots = h.controller._pane_cursor
+    [(window, remembered)] = spots.values()
+    assert remembered["%1"] == (1700, 300)
+    # The right pane closes (another one opens): its spot goes.
+    provider.rects = {"%0": Rect(0, 0, 960, 1080), "%2": Rect(960, 0, 960, 1080)}
+    h.feed(gaze_obs(LEFT_PANE), 1.5)
+    assert "%1" not in remembered
+    # The window closes while another one has the focus: its spots go.
+    monkeypatch.setattr(h.platform, "is_window_valid", lambda ref: ref.handle != window.handle)
+    h.platform.foreground = WindowRef(handle=0x99, pid=5, rect=Rect(0, 0, 800, 600))
+    h.tick(0.6)
+    assert h.controller._pane_cursor == {}
 
 
 def test_status_never_carries_titles_or_paths(make_controller: Callable[..., Harness]) -> None:

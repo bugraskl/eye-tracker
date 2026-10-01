@@ -56,9 +56,11 @@ With ``panes.enabled`` the focused window is followed as well: its application
 is identified, its panes are asked for (once when it gets focus, then about
 every :data:`PANE_REFRESH_S` while the gaze is inside it) and, while the monitor
 decider finds the gaze on the cursor's monitor, :class:`~eye_tracker.panes.decider.PaneDecider`
-decides when the keyboard focus moves to another pane. That only asks the
-terminal to focus the pane: the cursor stays and no window is activated. Pane
-focus waits ``panes.after_monitor_switch_ms`` after a monitor switch.
+decides when the keyboard focus moves to another pane. That asks the terminal
+to focus the pane; no window is activated. Once it reports success the cursor
+follows into the pane (``panes.move_cursor``), through the same announced warp
+as a monitor switch. Pane focus waits ``panes.after_monitor_switch_ms`` after a
+monitor switch.
 
 Unreliable pointer position
 ---------------------------
@@ -108,8 +110,9 @@ from ..panes.decider import (
     PaneDecision,
     eligible_panes,
 )
+from ..panes.providers.command import window_key
 from ..panes.registry import PaneRegistry, default_providers, is_denied
-from ..panes.types import PaneSnapshot
+from ..panes.types import Pane, PaneSnapshot
 from ..panes.worker import DetectResult, FocusResult, PaneWorker
 from ..platform.base import PlatformServices
 from ..trace import TraceWriter
@@ -248,6 +251,8 @@ LOCK_JOIN_TIMEOUT_S = 2.0
 PANE_REFRESH_S = 1.0
 #: How long :meth:`Controller.shutdown` waits for a pane provider call in progress.
 PANE_JOIN_TIMEOUT_S = 2.0
+#: Windows whose pane cursor positions are remembered (least recently used dropped).
+PANE_CURSOR_WINDOWS = 16
 #: Walk-away actions that lock the session or blank the displays. Until the
 #: first-run setup is finished they only notify: the owner of a PC who never
 #: saw the setup assistant must not be locked out by an app they just installed.
@@ -740,6 +745,9 @@ class Controller(QObject):
         ) = None
         self._pane_sigma_used: tuple[float, float] | None = None
         self._pane_switches = 0
+        # Where the cursor was last seen in each pane (panes.move_cursor): window
+        # key -> (the window, pane id -> position), most recently used last.
+        self._pane_cursor: dict[object, tuple[WindowRef, dict[Any, tuple[int, int]]]] = {}
 
         # Calibration: every saved profile, and the one in use.
         self._library = CalibrationLibrary()
@@ -1472,6 +1480,8 @@ class Controller(QObject):
         # pointer: no remembered positions, learning labels or undone switches.
         if self._input.manual_move and self._cursor_reliable:
             self._on_manual_move(pos, now)
+        if self._cursor_reliable:
+            self._remember_pane_cursor(pos)
 
     def _on_manual_move(self, pos: tuple[int, int], now: float) -> None:
         monitor = monitor_at(self._monitors, pos[0], pos[1])
@@ -1619,6 +1629,7 @@ class Controller(QObject):
             self._pane_snapshot = None
             self._pane_requested_at = -math.inf
             self._pane_valid_from = self._pane_last_request + 1
+            self._prune_pane_cursors()
             app = self._platform_call("window_app", ref)
             self._pane_app = app if isinstance(app, AppIdentity) else None
             fresh = True
@@ -1650,6 +1661,13 @@ class Controller(QObject):
         if result.request_id < self._pane_valid_from:
             return  # asked before a window change or with the providers since replaced
         self._pane_snapshot = result.snapshot
+        if result.snapshot is not None:
+            # Panes that closed take their remembered cursor position with them.
+            entry = self._pane_cursor.get(window_key(window))
+            if entry is not None:
+                ids = {p.id for p in result.snapshot.panes}
+                for gone in [pid for pid in entry[1] if pid not in ids]:
+                    del entry[1][gone]
 
     def _on_pane_focused(self, result: FocusResult) -> None:
         if self._closed:
@@ -1660,8 +1678,65 @@ class Controller(QObject):
         self._pane_switches += 1
         snapshot = self._pane_snapshot
         if snapshot is not None and _same_handle(snapshot.window_handle, result.window_handle):
+            pane = snapshot.pane(result.pane_id)
             self._pane_snapshot = snapshot.with_focus(result.pane_id)
+            if pane is not None and self._settings.panes.move_cursor:
+                self._move_cursor_into_pane(pane)
         self._pane_requested_at = -math.inf  # confirm the new layout at the next poll
+
+    # ------------------------------------------------- cursor in split panes
+    def _move_cursor_into_pane(self, pane: Pane) -> None:
+        """After a pane got the keyboard focus: the cursor follows, to where the
+        user last left it in that pane (if still inside it), else its centre.
+
+        The same path as a monitor switch: the warp is announced to the input
+        tracker first (so it is not taken for mouse use) and refusals count
+        towards the warp backoff. Nothing happens if the cursor is already in
+        the pane.
+        """
+        window = self._pane_window
+        if window is None:
+            return
+        rect = pane.rect
+        cursor = self._cursor_pos()
+        if self._cursor_reliable and cursor is not None and rect.contains(*cursor):
+            return
+        entry = self._pane_cursor.get(window_key(window))
+        spot = entry[1].get(pane.id) if entry is not None else None
+        if spot is None or not rect.contains(*spot):
+            spot = rect.clamp(*rect.center)
+        now = self._clock()
+        self._input.note_programmatic_move(spot, now)
+        if self._move_cursor(spot[0], spot[1], now):
+            log.debug("Cursor moved into pane %s", pane.id)
+
+    def _remember_pane_cursor(self, pos: tuple[int, int]) -> None:
+        """Record ``pos`` for the pane of the followed window that contains it."""
+        window = self._pane_window
+        snapshot = self._pane_snapshot
+        if (
+            window is None
+            or snapshot is None
+            or not self._settings.panes.move_cursor
+            or not _same_handle(snapshot.window_handle, window.handle)
+        ):
+            return
+        pane = next((p for p in snapshot.panes if p.rect.contains(*pos)), None)
+        if pane is None:
+            return
+        key = window_key(window)
+        entry = self._pane_cursor.pop(key, None)  # re-inserted: most recently used last
+        spots = entry[1] if entry is not None else {}
+        spots[pane.id] = (int(pos[0]), int(pos[1]))
+        self._pane_cursor[key] = (window, spots)
+        while len(self._pane_cursor) > PANE_CURSOR_WINDOWS:
+            self._pane_cursor.pop(next(iter(self._pane_cursor)))
+
+    def _prune_pane_cursors(self) -> None:
+        """Forget the cursor positions of windows that are gone."""
+        for key, (ref, _spots) in list(self._pane_cursor.items()):
+            if not self._platform_call("is_window_valid", ref, default=False):
+                del self._pane_cursor[key]
 
     def _pane_sigma(self, rect: Rect) -> tuple[float, float] | None:
         """The calibration's gaze error on the monitor showing ``rect`` (cached)."""
@@ -1690,7 +1765,8 @@ class Controller(QObject):
         enabled: bool,
     ) -> PaneDecision:
         """Move the keyboard focus between split panes (only while the monitor
-        decider is content). Never moves the cursor nor activates a window."""
+        decider is content). Never activates a window; the cursor follows only once
+        the focus call succeeded (:meth:`_on_pane_focused`)."""
         s = self._settings.panes
         worker = self._pane_worker
         window = self._pane_window

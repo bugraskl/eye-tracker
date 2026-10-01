@@ -4,7 +4,8 @@ Eye Tracker moves the cursor and the keyboard focus to the monitor you look at. 
 focus on, it goes one step further: when you look at another pane of the focused terminal window,
 on the monitor you are already working on, that pane gets the keyboard focus. Nothing is typed or
 clicked for you: Eye Tracker asks the terminal itself to focus the pane, through its own
-command-line tool or, for Windows Terminal, through UI Automation. The cursor stays where it is.
+command-line tool or, for Windows Terminal, through UI Automation. The mouse cursor follows into
+that pane, like it follows to another monitor (see [the cursor](#the-cursor)).
 
 It is **off by default**. Turn it on with **Follow split panes** in the tray menu, under
 **Settings → Switching → Split panes (experimental)**, or with `panes.enabled` in
@@ -94,6 +95,16 @@ from their saved samples the first time it is needed.
    a log or a man page next to your editor), that other pane becomes a *reading pane*: reading pauses
    do not move the focus there until 8 s after your last keystroke (`panes.reading_grace_ms`). This
    is the same rule as for [reading another monitor](../README.md#features).
+
+### The cursor
+
+Once the terminal reports that the new pane has the keyboard focus, the mouse cursor moves into
+that pane: back to where you last left it in that pane, as long as that spot is still inside the
+pane, otherwise to the pane's centre. It does not move when it is already inside the pane, nor when
+the focus could not be moved. Eye Tracker remembers one spot per pane while the pane exists (and
+forgets the spots of panes and windows that closed). The move is announced like a monitor switch's,
+so it never counts as you using the mouse. Turn it off with `panes.move_cursor` (or **Also move the
+cursor into that pane** in the settings) to keep the cursor where it is.
 
 The panes of the focused window are asked for when it gets the focus and then about every second
 while you look at it. A tool that keeps failing (three times in a row) is left alone until Eye

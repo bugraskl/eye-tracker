@@ -267,6 +267,7 @@ def _non_default_settings() -> Settings:
     s.switching.focus_window = False
     s.switching.smoothing = 0.377
     s.panes.enabled = True
+    s.panes.move_cursor = False
     s.panes.precision = 3.33
     s.presence.enabled = False
     s.presence.action = "display_off"
@@ -366,15 +367,22 @@ def test_split_pane_options_on_the_switching_page(
     try:
         follow = dlg.widget_for("panes.enabled")
         precision = dlg.widget_for("panes.precision")
+        move = dlg.widget_for("panes.move_cursor")
         assert isinstance(follow, QCheckBox)
+        assert isinstance(move, QCheckBox)
         assert not follow.isChecked()  # experimental: off by default
+        assert move.isChecked()  # but once on, the cursor follows like for monitors
         assert not precision.isEnabled()
+        assert not move.isEnabled()
         follow.setChecked(True)
         assert precision.isEnabled()
+        assert move.isEnabled()
         precision.setValue(4.0)  # type: ignore[attr-defined]
+        move.setChecked(False)
         assert dlg.apply()
         new = controller.applied[-1]
         assert new.panes.enabled is True
+        assert new.panes.move_cursor is False
         assert new.panes.precision == pytest.approx(4.0)
         assert new.panes.dwell_ms == 400  # not in the dialog: kept as it was
         assert new.panes.desktop_apps is False  # opt-in, not switched on with the rest

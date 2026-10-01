@@ -79,6 +79,7 @@ of 120 px that is 300 px. Supported terminals and the full rules: [split-pane fo
 | `panes.precision` | `2.5` | 1 – 6 | A pane takes part only if it is at least this many times your gaze error (measured by the calibration) wide, for panes side by side, or tall, for stacked panes. Higher is safer, lower allows smaller panes. |
 | `panes.hysteresis` | `0.5` | 0 – 3 | How far past the divider the gaze must be, as a fraction of your gaze error. |
 | `panes.min_pane_px` | `240` | 0 – 4000 | Panes narrower (or lower) than this many pixels never take part. |
+| `panes.move_cursor` | `true` |  | Also move the mouse cursor into the pane that gets the keyboard focus, back to where you last left it in that pane. |
 | `panes.tmux` | `true` |  | Follow tmux panes (through the tmux command, also in WSL). |
 | `panes.wezterm` | `true` |  | Follow WezTerm panes (through the wezterm command). |
 | `panes.windows_terminal` | `true` |  | Follow Windows Terminal panes (Windows only, through UI Automation). |

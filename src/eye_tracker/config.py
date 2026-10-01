@@ -218,6 +218,11 @@ class PaneSettings:
     min_pane_px: int = _opt(
         240, lo=0, hi=4000, doc="Panes narrower (or lower) than this many pixels never take part."
     )
+    move_cursor: bool = _opt(
+        True,
+        doc="Also move the mouse cursor into the pane that gets the keyboard focus, back to "
+        "where you last left it in that pane.",
+    )
     tmux: bool = _opt(True, doc="Follow tmux panes (through the tmux command, also in WSL).")
     wezterm: bool = _opt(True, doc="Follow WezTerm panes (through the wezterm command).")
     windows_terminal: bool = _opt(

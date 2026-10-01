@@ -1296,6 +1296,9 @@ class SettingsDialog(QDialog):
         )
         if not self._caps.get("panes", True):
             follow.setText(follow.text() + " (not supported on this system)")
+        move = self._check(
+            panes, "panes.move_cursor", "Also move the cursor into that pane, where I left it"
+        )
         precision = self._float(
             panes,
             "panes.precision",
@@ -1322,7 +1325,7 @@ class SettingsDialog(QDialog):
             "accessibility tree, which can cost the app some CPU and memory."
         )
         panes.addRow(desktop_hint)
-        self._depends(follow, [precision, desktop, desktop_hint])
+        self._depends(follow, [move, precision, desktop, desktop_hint])
 
         learn = self._group(layout, "Adaptive accuracy")
         adaptive = self._check(learn, "learning.adaptive", "Learn from how I use the mouse")

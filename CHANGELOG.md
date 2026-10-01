@@ -25,6 +25,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   element types, class names and rectangles. Asking for that tree makes the app build it, which can
   cost it some CPU and memory while the setting is on. Every other Chromium and Electron app stays
   on the deny-list.
+- With split-pane focus, the mouse cursor follows into the pane that gets the keyboard focus, back
+  to where you last left it in that pane, or its centre (`panes.move_cursor`, on by default).
 - The calibration now measures the gaze error on each monitor across and down; calibrations made
   with earlier versions get it from their saved samples when it is first needed.
 - `eye-tracker ctl status` reports split-pane focus in a `panes` block, and `--trace` records the

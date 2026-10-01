@@ -12,6 +12,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import io
+import json
 import logging
 import ntpath
 import os
@@ -22,6 +23,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import textwrap
 import tomllib
 import urllib.error
 from collections.abc import Sequence
@@ -425,8 +427,8 @@ def test_installer_app_id_never_changes() -> None:
 def test_installer_upgrades_keep_the_users_autostart_choice() -> None:
     """packaging-04 / journeys-14: an upgrade must not turn start-at-login back on.
 
-    The behaviour itself is exercised on the disposable release runner (see the
-    installer smoke test in release.yml); here the wiring is checked.
+    The behaviour itself is exercised on the disposable CI runner (see the installer
+    smoke test in build.yml); here the wiring is checked.
     """
     text = _iss_text()
     registry = [
@@ -438,8 +440,8 @@ def test_installer_upgrades_keep_the_users_autostart_choice() -> None:
     code = text[text.index("[Code]") :]
     for fragment in (
         "function ShouldWriteAutostart: Boolean;",
-        "else if AutostartWasOn then\n    Result := False",
-        "else if WizardSilent or not StartupPageSynced then\n    Result := StartupTaskParam = 1",
+        "else if AutostartWasOn then\n    Result := False\n  else\n"
+        "    Result := StartupChoiceIsExplicit;",
         "procedure CurPageChanged(CurPageID: Integer);",
         "WizardSelectTasks('!startup')",
         "IsUpgrade := RegKeyExists(HKCU, '{#UninstallKey}');",
@@ -450,6 +452,41 @@ def test_installer_upgrades_keep_the_users_autostart_choice() -> None:
         assert fragment in code.replace("\r\n", "\n"), fragment
     # The state is captured before the [Registry] section runs (ssInstall).
     assert code.index("if CurStep = ssInstall then") < code.index("CurStep = ssPostInstall")
+
+
+def test_installer_honours_an_explicit_startup_choice_on_upgrades() -> None:
+    """``/MERGETASKS=startup`` on a silent upgrade must turn start at sign-in on.
+
+    Setup clicks through every wizard page when it runs silently, so CurPageChanged
+    also runs for winget's upgrades. Setting the "startup" task to the real state
+    there used to undo a ``/MERGETASKS=startup`` from the command line. It now runs
+    only when the command line says nothing about the task, and a choice counts as
+    the user's own when it was made on the command line or on a page they saw.
+    """
+    code = _iss_code()
+    page = code[code.index("procedure CurPageChanged") : code.index("function StartupChoiceIs")]
+    assert (
+        "if (CurPageID = wpSelectTasks) and IsUpgrade and not StartupPageSynced and\n"
+        "     (StartupTaskParam = -1) then"
+    ) in page
+    assert (
+        "function StartupChoiceIsExplicit: Boolean;\nbegin\n"
+        "  Result := (StartupTaskParam <> -1) or (StartupPageSynced and not WizardSilent);\nend;"
+    ) in code
+    # Turning it off explicitly (an unticked box, or !startup) removes the entries.
+    assert (
+        "if AutostartWasOn and not WizardIsTaskSelected('startup') and StartupChoiceIsExplicit then"
+    ) in code
+    # The command line is read the way Setup reads it: /TASKS deselects what it does not
+    # list, /MERGETASKS changes only what it names.
+    task_param = code[code.index("function StartupTaskParam") : code.index("procedure CurPage")]
+    for fragment in (
+        "if Pos('/tasks=', Param) = 1 then",
+        "else if Pos('/mergetasks=', Param) = 1 then",
+        "if (Task = 'startup') or (Task = '*startup') then\n        Result := 1",
+        "else if Task = '!startup' then\n        Result := 0;",
+    ):
+        assert fragment in task_param, fragment
 
 
 def _iss_code() -> str:
@@ -581,16 +618,22 @@ def test_shell_scripts_use_lf_line_endings() -> None:
         assert b"\r\n" not in data, f"{path} must use LF line endings"
 
 
+_PACKAGES = (
+    "windows-x64-setup.exe",
+    "windows-x64-portable.zip",
+    "macos-arm64.dmg",
+    "linux-x86_64.AppImage",
+    "linux-x86_64.tar.gz",
+)
+
+
 def test_release_workflow_artifact_names() -> None:
-    text = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
-    for suffix in (
-        "windows-x64-setup.exe",
-        "windows-x64-portable.zip",
-        "macos-arm64.dmg",
-        "linux-x86_64.AppImage",
-        "linux-x86_64.tar.gz",
-    ):
-        assert f"EyeTracker-${{{{ env.VERSION }}}}-{suffix}" in text, suffix
+    """build.yml keeps the packages that release.yml checksums, attests and publishes."""
+    for name in ("build.yml", "release.yml"):
+        text = _workflow(name)
+        for suffix in _PACKAGES:
+            assert f"EyeTracker-${{{{ env.VERSION }}}}-{suffix}" in text, (name, suffix)
+    text = _workflow("release.yml")
     assert "softprops/action-gh-release@" in text
     assert "SHA256SUMS.txt" in text
 
@@ -606,13 +649,43 @@ def _jobs(text: str) -> dict[str, str]:
     return dict(zip(parts[1::2], parts[2::2], strict=True))
 
 
-@pytest.mark.parametrize("name", ["ci.yml", "release.yml", "bundle.yml"])
+def _steps(job: str) -> dict[str, str]:
+    """The text of each step of a job, by step name."""
+    parts = re.split(r"^      - name: (.+)\n", job, flags=re.MULTILINE)
+    return dict(zip(parts[1::2], parts[2::2], strict=True))
+
+
+def _joined(text: str) -> str:
+    """``text`` with backslash-continued shell lines joined."""
+    return re.sub(r" *\\\n *", " ", text)
+
+
+_WORKFLOW_FILES = ["ci.yml", "build.yml", "release.yml", "bundle.yml"]
+#: How release.yml and bundle.yml run the one build definition (same commit, no tag).
+_BUILD_CALL = "./.github/workflows/build.yml"
+
+
+@pytest.mark.parametrize("name", _WORKFLOW_FILES)
 def test_workflow_actions_are_pinned_to_commits(name: str) -> None:
     """packaging-05: a moved tag must not change what runs with release permissions."""
     uses = re.findall(r"^\s*(?:-\s+)?uses:\s*(.+)$", _workflow(name), flags=re.MULTILINE)
     assert uses
     for reference in uses:
-        assert re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+", reference), reference
+        assert reference == _BUILD_CALL or re.fullmatch(
+            r"[\w.-]+/[\w./-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+", reference
+        ), reference
+
+
+def test_workflows_pin_one_version_of_each_action() -> None:
+    """Dependabot updates every workflow at once; no job may lag behind another."""
+    pins: dict[str, set[str]] = {}
+    for name in _WORKFLOW_FILES:
+        for action, pin in re.findall(
+            r"uses:\s*([\w.-]+/[\w./-]+)@([0-9a-f]{40} # v\S+)", _workflow(name)
+        ):
+            pins.setdefault(action, set()).add(pin)
+    assert {"actions/checkout", "actions/upload-artifact", "astral-sh/setup-uv"} <= set(pins)
+    assert {action: pin for action, pin in pins.items() if len(pin) > 1} == {}
 
 
 def test_dependabot_keeps_actions_and_python_updated() -> None:
@@ -622,21 +695,96 @@ def test_dependabot_keeps_actions_and_python_updated() -> None:
     assert "mediapipe" not in text
 
 
-def test_release_smoke_tests_use_the_current_backends() -> None:
-    from eye_tracker.vision.backends import BACKEND_NAMES
+def test_packages_are_built_and_tested_in_one_place() -> None:
+    """The Bundle check runs exactly the release build, packaging and smoke tests.
 
-    text = _workflow("release.yml")
-    loop = f"for backend in {' '.join(BACKEND_NAMES)}; do"
-    assert text.count(loop) == 3
-    quoted = ", ".join(f'"{name}"' for name in BACKEND_NAMES)
-    assert text.count(f"for backend in ({quoted}):") == 3
-    assert "mediapipe" not in text
-    assert "opencv" not in text.replace("opencv_", "")
+    A release dry run once failed on packaging steps (signing and the disk image, the
+    installer test) that only release.yml ran, while the Bundle check passed: now
+    build.yml is the only definition, and release.yml adds nothing but publishing.
+    """
+    release = _jobs(_workflow("release.yml"))
+    bundle = _jobs(_workflow("bundle.yml"))
+    assert set(release) == {"build", "release"}
+    assert set(bundle) == {"build"}
+    for job in (release["build"], bundle["build"]):
+        assert f"    uses: {_BUILD_CALL}\n" in job
+    assert "    needs: build\n" in release["release"]
+    for name in ("release.yml", "bundle.yml"):
+        text = _workflow(name)
+        for step in (
+            "pyinstaller packaging/",
+            "scripts/check_privacy.py --bundle",
+            "python scripts/smoke_test_bundle.py",
+            "packaging\\windows\\installer.iss",
+            "bash packaging/macos/make_dmg.sh",
+            "bash packaging/linux/build_appimage.sh",
+            "runs-on: windows",
+            "runs-on: macos",
+        ):
+            assert step not in text, (name, step)
+    build = _jobs(_workflow("build.yml"))
+    assert set(build) == {"prepare", "build-windows", "build-macos", "build-linux"}
+    for job, runner in (
+        ("build-windows", "windows-latest"),
+        ("build-macos", "macos-14"),
+        ("build-linux", "ubuntu-22.04"),
+    ):
+        assert f"    runs-on: {runner}\n" in build[job], job
+        assert "    needs: prepare\n" in build[job], job
+        steps = _steps(build[job])
+        # Packaging and its smoke tests run whether or not the packages are kept.
+        for name, step in steps.items():
+            assert ("if: inputs.upload" in step) == ("upload-artifact@" in step), (job, name)
+
+
+def test_the_bundle_check_keeps_and_publishes_nothing() -> None:
+    """Least privilege: only the release job (for a tag) may write, attest or publish.
+
+    The Bundle check gets read access, no secret (its macOS app is signed ad hoc) and
+    keeps no artifact; the release passes the optional signing certificate by name.
+    """
+    write = re.compile(r"^\s+[\w-]+: write$", re.MULTILINE)
+    for name in ("build.yml", "bundle.yml", "release.yml"):
+        assert "\npermissions:\n  contents: read\n" in _workflow(name), name
+    assert write.findall(_workflow("build.yml")) == []
+    bundle = _workflow("bundle.yml")
+    assert write.findall(bundle) == []
+    assert "secrets" not in bundle
+    assert "    with:\n      upload: false\n" in bundle
+    release = _jobs(_workflow("release.yml"))
+    assert write.findall(release["build"]) == []
+    assert "    with:\n      upload: true\n" in release["build"]
+    assert "secrets: inherit" not in _workflow("release.yml")
+    for secret in ("CERT_P12", "CERT_PASSWORD", "IDENTITY"):
+        line = f"      MACOS_SIGNING_{secret}: ${{{{ secrets.MACOS_SIGNING_{secret} }}}}\n"
+        assert line in release["build"], secret
+    publish = release["release"]
+    assert "    if: github.ref_type == 'tag'\n" in publish
+    for fragment in (
+        "      contents: write\n",
+        "      id-token: write\n",
+        "      attestations: write\n",
+        "uses: actions/attest-build-provenance@",
+        "uses: softprops/action-gh-release@",
+    ):
+        assert fragment in publish, fragment
+    assert "attest-build-provenance" not in _workflow("build.yml")
+    assert "action-gh-release" not in _workflow("build.yml")
+
+
+def test_workflow_runs_are_grouped() -> None:
+    """A newer push cancels an older check; release runs never cancel each other. The
+    called build workflow runs in its caller's group (it may not define its own)."""
+    assert "concurrency" not in _workflow("build.yml")
+    for name, cancel in (("ci.yml", "true"), ("bundle.yml", "true"), ("release.yml", "false")):
+        text = _workflow(name)
+        assert "\nconcurrency:\n  group: ${{ github.workflow }}-" in text, name
+        assert f"\n  cancel-in-progress: {cancel}\n" in text, name
 
 
 def test_release_builds_pass_the_bundle_privacy_gate() -> None:
     """Every frozen build is scanned before it is packaged or smoke-tested."""
-    jobs = _jobs(_workflow("release.yml"))
+    jobs = _jobs(_workflow("build.yml"))
     for job, bundle in (
         ("build-windows", "dist/EyeTracker"),
         ("build-macos", '"dist/Eye Tracker.app"'),
@@ -653,6 +801,7 @@ def test_release_builds_pass_the_bundle_privacy_gate() -> None:
             "build-linux": "Create the AppImage and the tarball",
         }[job]
         assert gate < text.index(packaging_step)
+        assert gate < text.index("scripts/smoke_test_bundle.py")
 
 
 def _apt_packages(text: str) -> list[str]:
@@ -667,28 +816,35 @@ def _apt_packages(text: str) -> list[str]:
     return " ".join(command).split()[4:]
 
 
+def test_linux_build_bundles_the_x11_libraries() -> None:
+    linux = _jobs(_workflow("build.yml"))["build-linux"]
+    assert {"libsm6", "libice6", "libxcb-cursor0"} <= set(_apt_packages(linux))
+    assert "find dist/eye-tracker -name 'libxcb-cursor.so.0*' | grep ." in linux
+
+
 _MACOS_MINIMUM = re.compile(r'^  MACOS_MINIMUM: "(\d+\.\d+)"$', re.MULTILINE)
 
 
 def test_release_checks_the_documented_macos_minimum() -> None:
     """r2-packaging-02: numpy's macosx_14_0 wheel makes the DMG need macOS 14. The
     release fails if LSMinimumSystemVersion stops matching what users are told."""
-    text = _workflow("release.yml")
+    text = _workflow("build.yml")
     [minimum] = _MACOS_MINIMUM.findall(text)
     assert minimum == "14.0"
-    assert _MACOS_MINIMUM.findall(_workflow("bundle.yml")) == [minimum]
+    for name in ("release.yml", "bundle.yml"):
+        assert "MACOS_MINIMUM" not in _workflow(name), name  # defined once
     jobs = _jobs(text)
     macos = jobs["build-macos"]
     assert 'minimum="$(plutil -extract LSMinimumSystemVersion raw "$plist")"' in macos
     assert 'if [[ "$minimum" != "$MACOS_MINIMUM" ]]; then' in macos
-    assert macos.index("LSMinimumSystemVersion") < macos.index('"$cli" --version')
+    assert macos.index("LSMinimumSystemVersion") < macos.index("scripts/smoke_test_bundle.py")
     prepare = jobs["prepare"]
     assert 'mac_min = os.environ["MACOS_MINIMUM"].removesuffix(".0")' in prepare
     assert "| macOS {mac_min} or later (Apple silicon) |" in prepare
 
 
 def test_release_smoke_tests_the_path_entry_and_the_command() -> None:
-    windows = _jobs(_workflow("release.yml"))["build-windows"]
+    windows = _jobs(_workflow("build.yml"))["build-windows"]
     for fragment in (
         '& "$app\\eye-tracker.exe" --version',
         'if ((Get-PathCount) -ne 1) { throw "the installer did not add $app to the user PATH" }',
@@ -699,61 +855,123 @@ def test_release_smoke_tests_the_path_entry_and_the_command() -> None:
         assert fragment in windows, fragment
 
 
-def test_bundle_workflow_builds_every_platform_like_the_release() -> None:
-    """r2-packaging-01: a bundle that fails the gate shows up on the pull request."""
+def test_installer_smoke_test_covers_start_at_sign_in_on_upgrades() -> None:
+    """An upgrade keeps start at sign-in as the user left it (off in the app, or
+    disabled in Task Manager), while /MERGETASKS=startup or !startup does what it says."""
+    windows = _steps(_jobs(_workflow("build.yml"))["build-windows"])
+    [smoke] = [
+        step for name, step in windows.items() if name.startswith("Smoke-test the installer")
+    ]
+    order = [
+        'Invoke-Setup "install" @("/MERGETASKS=startup,!desktopicon")',
+        "Remove-ItemProperty -Path $runKey -Name EyeTracker",
+        'Invoke-Setup "upgrade-silent" @()',
+        'if (Get-Autostart $runKey) { throw "a silent upgrade re-enabled start at sign-in" }',
+        'Invoke-Setup "upgrade-enable" @("/MERGETASKS=startup")',
+        'if (-not (Get-Autostart $runKey)) { throw "/MERGETASKS=startup did not enable it" }',
+        'Invoke-Setup "upgrade-disable" @("/MERGETASKS=!startup")',
+        'Invoke-Setup "upgrade-disabled" @()',
+        "throw \"an upgrade cleared Task Manager's 'disabled' flag\"",
+        'Invoke-Setup "upgrade-enable-disabled" @("/MERGETASKS=startup")',
+        "throw \"/MERGETASKS=startup left Task Manager's 'disabled' flag\"",
+        'Invoke-Setup "upgrade-no-path" @("/MERGETASKS=!addtopath")',
+        'throw "uninstall left the StartupApproved value behind"',
+    ]
+    positions = [smoke.index(fragment) for fragment in order]
+    assert positions == sorted(positions)
+    # The setup logs (which say why start at sign-in was or was not written) on failure.
+    assert "catch {" in smoke
+    assert "Get-Content $log" in smoke
+
+
+def test_installer_never_replaces_a_path_it_cannot_read() -> None:
+    """r3-packaging-06: a user PATH stored as REG_MULTI_SZ (or REG_BINARY) cannot be read
+    with RegQueryStringValue. Treating it as empty would replace it with the installation
+    folder alone, and uninstalling would then delete it: setup leaves it alone instead."""
+    code = _iss_code()
+    add = code[code.index("procedure AddAppToPath;") : code.index("{ Remove the installation")]
+    read = add.index("if not RegQueryStringValue(HKCU, EnvironmentKey, 'Path', PathList) then")
+    guard = add.index("if RegValueExists(HKCU, EnvironmentKey, 'Path') then")
+    assert read < guard < add.index("Exit;", guard) < add.index("PathList := '';")
+    assert add.index("PathList := '';") < add.index("RegWriteExpandStringValue")
+    # Removing the entry already leaves an unreadable value alone.
+    remove = code[code.index("procedure RemoveAppFromPath;") : code.index('{ Remove the "start')]
+    read_or_exit = (
+        "if not RegQueryStringValue(HKCU, EnvironmentKey, 'Path', PathList) then\n    Exit;"
+    )
+    assert remove.index(read_or_exit) < remove.index("RegDeleteValue")
+    # The CI runner checks it for real, with a REG_MULTI_SZ value, and restores PATH.
+    windows = _steps(_jobs(_workflow("build.yml"))["build-windows"])
+    [smoke] = [
+        step for name, step in windows.items() if name.startswith("Smoke-test the installer")
+    ]
+    for fragment in (
+        'Set-ItemProperty -Path "HKCU:\\Environment" -Name Path -Type MultiString `',
+        'Invoke-Setup "upgrade-unreadable-path" @("/MERGETASKS=addtopath")',
+        'throw "setup replaced a user PATH that it cannot read"',
+        'Set-ItemProperty -Path "HKCU:\\Environment" -Name Path -Type $pathKind -Value $pathValue',
+    ):
+        assert fragment in smoke, fragment
+    assert smoke.index("finally {") < smoke.index("$app\\unins000.exe")
+
+
+def test_bundle_workflow_runs_for_what_decides_the_packages() -> None:
+    """r2-packaging-01 / r3-packaging-03: a change that would fail the release build,
+    packaging or smoke tests shows up on the pull request, the app's code included."""
     text = _workflow("bundle.yml")
     triggers = text[: text.index("\npermissions:")]
     for path in (
+        "src/**",
         "packaging/**",
         "scripts/check_privacy.py",
         "scripts/fetch_models.py",
         "scripts/make_icons.py",
+        "scripts/smoke_test_bundle.py",
         "pyproject.toml",
         "uv.lock",
+        ".github/workflows/build.yml",
         ".github/workflows/bundle.yml",
+        ".github/workflows/release.yml",
     ):
         assert triggers.count(f'      - "{path}"\n') == 2, path  # pull_request and push
-    release = _jobs(_workflow("release.yml"))
-    for job in ("build-windows", "build-macos", "build-linux"):
-        runs_on = re.search(r"^    runs-on: (\S+)$", release[job], re.MULTILINE)
-        assert runs_on, job
-        assert f"          - os: {runs_on.group(1)}\n" in text, job
-    for bundle in ("dist/EyeTracker", "dist/Eye Tracker.app", "dist/eye-tracker"):
-        assert f"            bundle: {bundle}\n" in text
-    steps = text[text.index("    steps:") :]
-    build = steps.index("pyinstaller packaging/pyinstaller/eye-tracker.spec --noconfirm --clean")
-    gate = steps.index('run: uv run --no-sync python scripts/check_privacy.py --bundle "$BUNDLE"')
-    assert build < gate < steps.index("Smoke-test the frozen CLI")
-    assert "upload-artifact" not in text
-    assert "contents: write" not in text
-    # The same system libraries as the release build, so the same ones get bundled.
-    assert _apt_packages(text) == _apt_packages(release["build-linux"])
-    assert {"libsm6", "libice6", "libxcb-cursor0"} <= set(_apt_packages(text))
 
 
 def test_linux_builds_check_that_gtk_and_gio_stay_out() -> None:
     check = "-name 'libgtk-3.so*' -o -name 'libgio-2.0.so*'"
-    linux = _jobs(_workflow("release.yml"))["build-linux"]
+    linux = _jobs(_workflow("build.yml"))["build-linux"]
     assert check in linux
     assert linux.index(check) < linux.index("scripts/check_privacy.py --bundle")
-    assert check in _workflow("bundle.yml")
 
 
-def test_bundle_smoke_test_reads_videos_and_probes_cameras() -> None:
-    """The frozen app must still import OpenCV, decode video files with the bundled
-    FFmpeg and run the camera backends after the spec leaves libraries out."""
-    text = _workflow("bundle.yml")
-    smoke = text[text.index("- name: Smoke-test the frozen CLI") :]
+_SMOKE_TEST = "uv run --no-sync python scripts/smoke_test_bundle.py --version"
+
+
+def test_every_package_is_smoke_tested_as_users_get_it() -> None:
+    """The bundle (the portable ZIP) and the installed copy on Windows, the tool inside
+    the mounted disk image on macOS, the AppImage on Linux: version, models, both
+    backends, video files and camera probing (scripts/smoke_test_bundle.py)."""
+    jobs = {job: _joined(text) for job, text in _jobs(_workflow("build.yml")).items()}
+    windows = jobs["build-windows"]
+    assert f'{_SMOKE_TEST} "$VERSION" dist/EyeTracker/eye-tracker-cli.exe' in windows
+    assert windows.index("dist/EyeTracker/eye-tracker-cli.exe") < windows.index(
+        "Create the portable ZIP"
+    )
+    assert f'{_SMOKE_TEST} $env:VERSION "$app\\eye-tracker.exe"' in windows
+    macos = _steps(jobs["build-macos"])["Smoke-test the app inside the disk image"]
     for fragment in (
-        "bench --camera packaging/linux/eye-tracker.png",
-        '("clip.avi", cv2.CAP_OPENCV_MJPEG, "MJPG")',
-        '("clip.mp4", cv2.CAP_FFMPEG, "mp4v")',
-        'bench --camera "$clips/$clip"',
-        'assert video["modes"]["max"]["analysed"] > 0',
-        "doctor --probe-cameras --json > probe.json 2> probe.err",
-        '"OpenCV: camera failed to properly initialize!" in errors',
+        'hdiutil attach -nobrowse -readonly -mountpoint "$mnt"',
+        'broken="$(find -L "$app" -type l)"',
+        'codesign --verify --deep --strict --verbose=2 "$app"',
+        'cli="$app/Contents/MacOS/eye-tracker-cli"',
+        f'{_SMOKE_TEST} "$VERSION" "$cli"',
     ):
-        assert fragment in smoke, fragment
+        assert fragment in macos, fragment
+    linux = _steps(jobs["build-linux"])["Smoke-test the AppImage and the tarball"]
+    for fragment in (
+        f'{_SMOKE_TEST} "$VERSION" "dist/EyeTracker-$VERSION-linux-x86_64.AppImage"',
+        'broken="$(find -L "$RUNNER_TEMP/eye-tracker" -type l)"',
+    ):
+        assert fragment in linux, fragment
 
 
 def test_bug_report_names_the_command_of_every_package() -> None:
@@ -776,10 +994,11 @@ def test_bug_report_names_the_command_of_every_package() -> None:
 
 def test_release_notes_explain_macos_permissions_after_updates() -> None:
     """journeys-15: ad-hoc builds lose the Accessibility grant on every update."""
-    prepare = _jobs(_workflow("release.yml"))["prepare"]
+    jobs = _jobs(_workflow("build.yml"))
+    prepare = jobs["prepare"]
     assert "MACOS_STABLE_SIGNATURE: ${{ secrets.MACOS_SIGNING_CERT_P12 != '' }}" in prepare
     assert 'remove\n              Eye Tracker with "−" and add it again.' in prepare
-    macos = _jobs(_workflow("release.yml"))["build-macos"]
+    macos = jobs["build-macos"]
     # Signing with a stable certificate is optional; without the secret the
     # import step exits early and make_dmg.sh falls back to an ad-hoc signature.
     assert 'if [[ -z "$CERT_P12" ]]; then' in macos
@@ -787,13 +1006,269 @@ def test_release_notes_explain_macos_permissions_after_updates() -> None:
     assert "security delete-keychain" in macos
 
 
+def _release_notes(
+    tmp_path: Path, changelog: str, *, ref_type: str = "tag", version: str = "1.2.0"
+) -> subprocess.CompletedProcess[str]:
+    """Run the prepare job's release-notes script (as written in build.yml) in ``tmp_path``."""
+    step = _steps(_jobs(_workflow("build.yml"))["prepare"])[
+        "Extract the release notes from CHANGELOG.md"
+    ]
+    start = step.index("python3 - <<'PY'\n") + len("python3 - <<'PY'\n")
+    script = textwrap.dedent(step[start : step.index("\n          PY\n")])
+    (tmp_path / "CHANGELOG.md").write_text(textwrap.dedent(changelog), encoding="utf-8")
+    env = {
+        **os.environ,
+        "VERSION": version,
+        "GITHUB_REF_TYPE": ref_type,
+        "MACOS_MINIMUM": "14.0",
+        "MACOS_STABLE_SIGNATURE": "false",
+        "PYTHONUTF8": "1",
+    }
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+        check=False,
+    )
+
+
+_CHANGELOG = """\
+    # Changelog
+
+    ## [Unreleased]
+    {unreleased}
+    ## [1.2.0] - 2026-10-01
+
+    ### Fixed
+
+    - The fix that 1.2.0 ships.
+
+    [Unreleased]: https://github.com/bugraskl/eye-tracker/compare/v1.2.0...HEAD
+    [1.2.0]: https://github.com/bugraskl/eye-tracker/releases/tag/v1.2.0
+    """
+
+
+@pytest.mark.parametrize(
+    "unreleased",
+    [
+        "",
+        # Keep a Changelog's empty sub-headings are no notes.
+        "\n    ### Added\n\n    ### Fixed\n",
+    ],
+)
+def test_release_notes_are_the_versions_section(tmp_path: Path, unreleased: str) -> None:
+    proc = _release_notes(tmp_path, _CHANGELOG.format(unreleased=unreleased))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    notes = (tmp_path / "release-notes.md").read_text(encoding="utf-8")
+    assert notes.startswith("### Fixed\n\n- The fix that 1.2.0 ships.\n\n### Downloads\n")
+    assert "`EyeTracker-1.2.0-macos-arm64.dmg`" in notes
+    assert "::" not in proc.stdout
+
+
+def test_release_fails_while_unreleased_has_notes(tmp_path: Path) -> None:
+    """r3-packaging-04: a tag ships every change made before it, so notes still under
+    [Unreleased] would be missing from the release notes and announced again later."""
+    changelog = _CHANGELOG.format(unreleased="\n    ### Fixed\n\n    - Not moved yet.\n")
+    proc = _release_notes(tmp_path, changelog)
+    assert proc.returncode == 1
+    assert (
+        "::error file=CHANGELOG.md::CHANGELOG.md still has notes under '## [Unreleased]': "
+        "move them under '## [1.2.0] - YYYY-MM-DD' before tagging v1.2.0"
+    ) in proc.stdout
+    assert not (tmp_path / "release-notes.md").exists()
+    # A build that is not for a tag (the Bundle check, a manual run) only says so.
+    proc = _release_notes(tmp_path, changelog, ref_type="branch")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "::notice file=CHANGELOG.md::CHANGELOG.md still has notes under" in proc.stdout
+    assert "Not moved yet" not in (tmp_path / "release-notes.md").read_text(encoding="utf-8")
+
+
+def test_release_fails_without_a_section_for_the_version(tmp_path: Path) -> None:
+    changelog = _CHANGELOG.format(unreleased="")
+    proc = _release_notes(tmp_path, changelog, version="1.3.0")
+    assert proc.returncode == 1
+    assert "has no non-empty '## [1.3.0] - YYYY-MM-DD' section" in proc.stdout
+    proc = _release_notes(tmp_path, changelog, version="1.3.0", ref_type="branch")
+    assert proc.returncode == 0
+    notes = (tmp_path / "release-notes.md").read_text(encoding="utf-8")
+    assert notes.startswith("Development build.\n")
+
+
+def _make_dmg_text() -> str:
+    return (PACKAGING / "macos" / "make_dmg.sh").read_text(encoding="utf-8")
+
+
 def test_make_dmg_can_sign_with_a_stable_identity() -> None:
-    text = (PACKAGING / "macos" / "make_dmg.sh").read_text(encoding="utf-8")
+    text = _make_dmg_text()
     assert 'IDENTITY="${MACOS_SIGN_IDENTITY:--}"' in text
     assert "--identity) IDENTITY=" in text
     assert 'SIGN_ARGS=(--force --deep --sign "$IDENTITY" --timestamp=none)' in text
     # A certificate-based signature must not leave a build-specific requirement.
     assert '"$REQUIREMENT" == *cdhash*' in text
+
+
+def test_make_dmg_refuses_dangling_symlinks_before_signing() -> None:
+    """The release dry run failed in ``xattr -cr`` on links to libraries that the spec
+    had left out; the script now says so before it touches the app."""
+    text = _make_dmg_text()
+    check = text.index('if ! BROKEN="$(find -L "$APP" -type l)"; then')
+    assert check < text.index('xattr -cr "$APP"') < text.index('codesign "${SIGN_ARGS[@]}" "$APP"')
+    assert 'die "the app bundle is incomplete; rebuild it' in text
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="make_dmg.sh runs on macOS")
+def test_make_dmg_names_the_dangling_symlinks(tmp_path: Path) -> None:
+    app = tmp_path / "Eye Tracker.app"
+    frameworks = app / "Contents" / "Frameworks"
+    frameworks.mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_text("<plist/>\n", encoding="utf-8")
+    (frameworks / "cv2").mkdir()
+    (frameworks / "cv2" / "libavformat.61.dylib").write_bytes(b"x")
+    (frameworks / "libavformat.61.dylib").symlink_to("cv2/libavformat.61.dylib")
+    (frameworks / "libX11.6.dylib").symlink_to("cv2/libX11.6.dylib")
+    out = tmp_path / "out.dmg"
+    script = PACKAGING / "macos" / "make_dmg.sh"
+    proc = subprocess.run(
+        ["bash", str(script), "--app", str(app), "--version", "9.9.9", "--out", str(out)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "Contents/Frameworks/libX11.6.dylib -> cv2/libX11.6.dylib" in proc.stderr
+    assert "libavformat" not in proc.stderr
+    assert "the app bundle is incomplete" in proc.stderr
+    assert "Signing" not in proc.stdout  # stopped before xattr and codesign
+    assert not out.exists()
+
+
+# ======================================================================== the smoke test
+smoke_test_bundle = _load(REPO_ROOT / "scripts" / "smoke_test_bundle.py", "smoke_test_bundle")
+
+
+def _fake_cli(
+    monkeypatch: pytest.MonkeyPatch, version: str = "1.2.3", **broken: Any
+) -> list[list[str]]:
+    """Answer the smoke test's commands like a healthy frozen build of ``version`` (or
+    one with the ``broken`` part); returns the commands it was given."""
+    from eye_tracker.vision.backends import MODEL_FILES
+
+    calls: list[list[str]] = []
+
+    def run(command: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        args = command[1:]
+        stderr = ""
+        if args == ["--version"]:
+            data: Any = f"Eye Tracker {version}\n"
+        elif "--probe-cameras" in args:
+            data = {"cameras": {"probed": True, "devices": []}}
+            stderr = broken.get("probe_stderr", smoke_test_bundle.AVFOUNDATION_PROBE_MESSAGE)
+        elif "doctor" in args and "--json" in args:
+            models = {name: {"present": True, "sha256_ok": True} for name in MODEL_FILES}
+            models.update(broken.get("models", {}))
+            data = {"app": {"version": version, "frozen": True}, "backends": {"models": models}}
+        elif "doctor" in args:
+            data = "Eye Tracker - diagnostics\n"
+        else:
+            camera = Path(args[args.index("--camera") + 1])
+            backend = args[args.index("--backend") + 1] if "--backend" in args else "facemesh"
+            size = [160, 120] if camera.suffix != ".png" else [512, 512]
+            data = {
+                "backend": backend,
+                "device": f"file {camera.name}",
+                "frame_size": broken.get("frame_size", size),
+                "modes": {"max": {"analysed": broken.get("analysed", 25)}},
+            }
+        stdout = data if isinstance(data, str) else json.dumps(data)
+        return subprocess.CompletedProcess(command, 0, stdout, stderr)
+
+    monkeypatch.setattr(smoke_test_bundle, "_run", run)
+    return calls
+
+
+def test_smoke_test_checks_every_backend_video_and_the_cameras(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from eye_tracker.vision.backends import BACKEND_NAMES
+
+    cli = tmp_path / "eye-tracker-cli"
+    cli.write_bytes(b"")
+    calls = _fake_cli(monkeypatch)
+    assert smoke_test_bundle.main(["--version", "1.2.3", str(cli)]) == 0
+    assert "smoke test passed" in capsys.readouterr().out
+    assert all(command[0] == str(cli.resolve()) for command in calls)
+    benches = [command for command in calls if "bench" in command]
+    backends = [command[command.index("--backend") + 1] for command in benches[:2]]
+    assert backends == list(BACKEND_NAMES)
+    assert [Path(command[command.index("--camera") + 1]).name for command in benches] == [
+        "eye-tracker.png",
+        "eye-tracker.png",
+        "clip.avi",
+        "clip.mp4",
+    ]
+    assert calls[-1][-3:] == ["doctor", "--probe-cameras", "--json"]
+    # Everything it writes goes to a temporary configuration folder.
+    assert all(command[1:3] == ["--config-dir", calls[1][2]] for command in calls[1:])
+
+
+@pytest.mark.parametrize(
+    ("version", "broken", "message"),
+    [
+        ("1.2.4", {}, "does not report 1.2.4"),
+        ("1.2.3", {"models": {"face_detection_yunet_2023mar.onnx": {"present": False}}}, "model"),
+        ("1.2.3", {"analysed": 0}, "analysed no frame"),
+        ("1.2.3", {"frame_size": [80, 60]}, "decoded wrongly"),
+    ],
+)
+def test_smoke_test_fails_on_a_broken_build(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    version: str,
+    broken: dict[str, Any],
+    message: str,
+) -> None:
+    cli = tmp_path / "eye-tracker-cli"
+    cli.write_bytes(b"")
+    _fake_cli(monkeypatch, **broken)
+    assert smoke_test_bundle.main(["--version", version, str(cli)]) == 1
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="the AVFoundation check is macOS-only")
+def test_smoke_test_needs_avfoundation_to_be_asked_on_macos(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli = tmp_path / "eye-tracker-cli"
+    cli.write_bytes(b"")
+    _fake_cli(monkeypatch, probe_stderr="")
+    assert smoke_test_bundle.main(["--version", "1.2.3", str(cli)]) == 1
+    assert "probing did not reach AVFoundation" in capsys.readouterr().err
+
+
+def test_smoke_test_reports_a_failing_command() -> None:
+    code = "import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)"
+    with pytest.raises(smoke_test_bundle.SmokeTestError, match=r"(?s)exit status 3.*out.*err"):
+        smoke_test_bundle._run([sys.executable, "-c", code])
+
+
+def test_smoke_test_writes_the_video_files_it_decodes(tmp_path: Path) -> None:
+    import cv2
+
+    for clip in smoke_test_bundle.write_clips(tmp_path):
+        capture = cv2.VideoCapture(str(clip))
+        try:
+            ok, frame = capture.read()
+            assert ok, clip.name
+            assert frame.shape[:2] == (120, 160)
+        finally:
+            capture.release()
 
 
 @pytest.mark.parametrize(
@@ -945,6 +1420,7 @@ _DOCS = {"docs/troubleshooting.md", "docs/privacy.md", "docs/platform-support.md
         "pyproject.toml",
         ".github/ISSUE_TEMPLATE/config.yml",
         ".github/ISSUE_TEMPLATE/bug_report.yml",
+        ".github/workflows/build.yml",
         ".github/workflows/release.yml",
     ],
 )
@@ -1016,6 +1492,9 @@ _SPEC_HELPERS = (
     "_macho_slice",
     "macho_bindings",
     "prune_unused_macos_libraries",
+    "dangling_symlinks",
+    "broken_symlinks",
+    "require_intact_symlinks",
 )
 # Module-level constants that the helpers above use.
 _SPEC_CONSTANTS = (
@@ -1989,3 +2468,122 @@ def test_spec_leaves_out_unused_libraries_on_macos_only() -> None:
     assert source.rindex("\nif IS_MACOS:\n", 0, call) > source.index(
         "a.binaries = prune_unreferenced_openssl("
     )
+
+
+# ========================================================================== symbolic links
+_QT_CORE = "PySide6/Qt/lib/QtCore.framework"
+
+
+def _macos_toc() -> list[tuple[str, str, str]]:
+    """``a.binaries + a.datas`` of a macOS build after the spec left libX11, libssl and
+    libhwy out of ``a.binaries``: Analysis keeps every SYMLINK entry in ``a.datas``."""
+    binaries = [
+        ("cv2/.dylibs/libavformat.61.dylib", "/src/libavformat.61.dylib", "BINARY"),
+        ("cv2/cv2.abi3.so", "/src/cv2.abi3.so", "EXTENSION"),
+        (f"{_QT_CORE}/Versions/A/QtCore", "/src/QtCore", "BINARY"),
+    ]
+    datas = [
+        (f"{_QT_CORE}/Versions/A/Resources/Info.plist", "/src/Info.plist", "DATA"),
+        # PyInstaller's links from the top-level folder: to a library that stays...
+        ("libavformat.61.dylib", "cv2/.dylibs/libavformat.61.dylib", "SYMLINK"),
+        # ...and to the three that the release dry run found dangling in the app.
+        ("libX11.6.dylib", "cv2/.dylibs/libX11.6.dylib", "SYMLINK"),
+        ("libssl.3.dylib", "cv2/.dylibs/libssl.3.dylib", "SYMLINK"),
+        ("libhwy.1.2.0.dylib", "cv2/.dylibs/libhwy.1.2.0.dylib", "SYMLINK"),
+        # A .framework bundle's links, resolved through Versions/Current.
+        (f"{_QT_CORE}/Versions/Current", "A", "SYMLINK"),
+        (f"{_QT_CORE}/QtCore", "Versions/Current/QtCore", "SYMLINK"),
+        (f"{_QT_CORE}/Resources", "Versions/Current/Resources", "SYMLINK"),
+    ]
+    return binaries + datas
+
+
+def test_dangling_symlinks_are_the_links_to_what_was_left_out(
+    spec_helpers: dict[str, Any],
+) -> None:
+    """The release dry run: libX11, libssl and libhwy were left out of the macOS bundle,
+    but their links from the top-level folder (in a.datas) were not, and BUNDLE made
+    each of them a dangling link in Contents/Frameworks and Contents/Resources."""
+    dangling = spec_helpers["dangling_symlinks"](_macos_toc())
+    assert dangling == {"libX11.6.dylib", "libssl.3.dylib", "libhwy.1.2.0.dylib"}
+
+
+def test_dangling_symlinks_follow_chains_and_relative_targets(
+    spec_helpers: dict[str, Any],
+) -> None:
+    entries = [
+        *_macos_toc(),
+        # Relative to the link's own folder, also upwards.
+        ("cv2/.dylibs/libavformat.dylib", "libavformat.61.dylib", "SYMLINK"),
+        ("cv2/qt/libQtCore", f"../../{_QT_CORE}/QtCore", "SYMLINK"),
+        # A link to a link that dangles dangles too; so do links that go in a circle.
+        ("libX11.dylib", "libX11.6.dylib", "SYMLINK"),
+        ("loop-a", "loop-b", "SYMLINK"),
+        ("loop-b", "loop-a", "SYMLINK"),
+        # Windows separators in a TOC entry.
+        ("cv2\\.dylibs\\libavformat.so", "libavformat.61.dylib", "SYMLINK"),
+        # Outside the bundle: not judged.
+        ("libz.dylib", "/usr/lib/libz.1.dylib", "SYMLINK"),
+        # A folder that holds nothing but links exists all the same.
+        ("aliases/libavformat.dylib", "../cv2/.dylibs/libavformat.61.dylib", "SYMLINK"),
+        ("aliases-link", "aliases", "SYMLINK"),
+        # Up and out of the bundle.
+        ("cv2/outside", "../../elsewhere/lib.dylib", "SYMLINK"),
+    ]
+    assert spec_helpers["dangling_symlinks"](entries) == {
+        "libX11.6.dylib",
+        "libssl.3.dylib",
+        "libhwy.1.2.0.dylib",
+        "libX11.dylib",
+        "loop-a",
+        "loop-b",
+        "cv2/outside",
+    }
+    # Nothing to do on a TOC without links, such as the Windows build's.
+    assert spec_helpers["dangling_symlinks"](_entries(("Qt6Core.dll", "BINARY"))) == set()
+
+
+def _symlink(link: Path, target: str, *, folder: bool = False) -> None:
+    """A relative link (written with the native separator, as COLLECT does on Windows)."""
+    try:
+        os.symlink(target.replace("/", os.sep), link, target_is_directory=folder)
+    except OSError as exc:  # Windows without the right to create symbolic links
+        pytest.skip(f"cannot create symbolic links here: {exc}")
+
+
+def test_broken_symlinks_in_the_build_output_fail_the_build(
+    spec_helpers: dict[str, Any], tmp_path: Path
+) -> None:
+    out = tmp_path / "Eye Tracker.app"
+    (out / "Contents" / "Frameworks" / "cv2").mkdir(parents=True)
+    (out / "Contents" / "Frameworks" / "cv2" / "libavformat.61.dylib").write_bytes(b"x")
+    spec_helpers["require_intact_symlinks"](out)  # no links at all
+    frameworks = out / "Contents" / "Frameworks"
+    _symlink(frameworks / "libavformat.61.dylib", "cv2/libavformat.61.dylib")
+    _symlink(out / "Contents" / "Resources", "Frameworks", folder=True)  # not followed
+    spec_helpers["require_intact_symlinks"](out)
+    assert spec_helpers["broken_symlinks"](out) == []
+
+    _symlink(frameworks / "libX11.6.dylib", "cv2/libX11.6.dylib")
+    _symlink(frameworks / "cv2" / "gone", "../gone", folder=True)
+    broken = ["Contents/Frameworks/cv2/gone", "Contents/Frameworks/libX11.6.dylib"]
+    assert spec_helpers["broken_symlinks"](out) == broken
+    with pytest.raises(SystemExit, match=r"2 symbolic link\(s\) in .*: " + ", ".join(broken)):
+        spec_helpers["require_intact_symlinks"](out)
+
+
+def test_spec_drops_the_links_to_what_it_leaves_out() -> None:
+    """The links are dropped from a.datas after every library that the spec leaves out
+    is known, and the build fails if COLLECT or BUNDLE still made a dangling one."""
+    source = _spec_text()
+    dangling = source.index("_dangling = dangling_symlinks(a.binaries + a.datas)\n")
+    assert source.index("a.binaries = prune_unused_macos_libraries(") < dangling
+    assert source.index("a.datas = [entry for entry in a.datas if not _unwanted(") < dangling
+    assert dangling < source.index("pyz = PYZ(a.pure)")
+    for line in (
+        'a.binaries = [e for e in a.binaries if not (e[2] == "SYMLINK" and e[0] in _dangling)]',
+        'a.datas = [e for e in a.datas if not (e[2] == "SYMLINK" and e[0] in _dangling)]',
+    ):
+        assert line in source[dangling:]
+    assert source.index("coll = COLLECT(") < source.index("require_intact_symlinks(coll.name)")
+    assert source.index("app = BUNDLE(") < source.index("require_intact_symlinks(app.name)")

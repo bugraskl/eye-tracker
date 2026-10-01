@@ -59,6 +59,21 @@ ARCH="$(uname -m)"
 OUT="${OUT:-$ROOT/dist/EyeTracker-$VERSION-macos-$ARCH.dmg}"
 mkdir -p "$(dirname "$OUT")"
 
+# A symbolic link whose target is missing (a library that the spec left out, still
+# linked from the top-level folders) makes xattr and codesign fail with messages that
+# do not say why. With -L, find reports exactly those links as type l.
+echo "==> Checking the symbolic links in $APP"
+if ! BROKEN="$(find -L "$APP" -type l)"; then
+  die "cannot check the symbolic links in $APP (see find's message above)"
+fi
+if [[ -n "$BROKEN" ]]; then
+  echo "make_dmg: these symbolic links in $APP point at files that do not exist:" >&2
+  while IFS= read -r link; do
+    echo "  ${link#"$APP"/} -> $(readlink "$link")" >&2
+  done <<<"$BROKEN"
+  die "the app bundle is incomplete; rebuild it with packaging/pyinstaller/eye-tracker.spec"
+fi
+
 SIGN_ARGS=(--force --deep --sign "$IDENTITY" --timestamp=none)
 if [[ -n "$KEYCHAIN" ]]; then
   SIGN_ARGS+=(--keychain "$KEYCHAIN")

@@ -1,7 +1,7 @@
 # -*- mode: python -*-
 """PyInstaller recipe for Eye Tracker: one-folder builds for Windows, macOS and Linux.
 
-Build from the repository root (the release workflow does exactly this):
+Build from the repository root (.github/workflows/build.yml does exactly this):
 
     uv run python scripts/fetch_models.py --check   # models present and verified
     uv run python scripts/make_icons.py             # .ico / .icns / .png from ui.icons
@@ -21,10 +21,14 @@ both are parsed, not imported. Executable names are mirrored in ``entry.py``,
 which picks the entry point, and in ``eye_tracker/platform/autostart.py``, which
 registers the windowed one.
 
-After the build, the release workflow (and .github/workflows/bundle.yml, on pull
-requests that change the packaging or the dependencies) runs the bundle privacy gate:
+After the build, .github/workflows/build.yml (run by the release workflow, and by
+bundle.yml for pull requests that change the packaging or the dependencies) runs the
+bundle privacy gate, packages the bundle and smoke-tests the packages:
 
     uv run python scripts/check_privacy.py --bundle dist/<DIST_NAME>
+
+The build itself fails if the output contains a symbolic link to a file that is not
+bundled (see ``dangling_symlinks``).
 
 The Windows installer additionally installs eye-tracker-cli.exe as eye-tracker.exe
 (packaging/windows/installer.iss), the name the documentation uses on PATH.
@@ -39,6 +43,7 @@ import importlib.util
 import logging
 import os
 import platform
+import posixpath
 import re
 import shutil
 import struct
@@ -245,9 +250,10 @@ def _file_name(dest: str) -> str:
 def _without(entries: list, dropped: set) -> list:
     """``entries`` minus the BINARY entries whose destination is in ``dropped``.
 
-    Symbolic links that PyInstaller adds on Linux and macOS (``libfoo.so.1`` in
-    the top-level folder, pointing at ``pkg.libs/libfoo.so.1``) go with their
-    target, so no dangling link is left behind.
+    A SYMLINK entry of ``entries`` that links one of them into the top-level folder
+    goes too. Analysis keeps its symbolic links in ``a.datas``, though, not with the
+    binaries: the spec removes those with :func:`dangling_symlinks` once everything
+    that is left out is known.
     """
     gone = {dest.replace("\\", "/") for dest in dropped}
     return [
@@ -701,6 +707,87 @@ def prune_unused_macos_libraries(entries: list, scratch: Path) -> list:
     return _without(result, unused)
 
 
+# ------------------------------------------------------------------------ symbolic links
+def dangling_symlinks(entries: list) -> set:
+    """Destinations of the SYMLINK entries whose target is not collected.
+
+    Analysis files every entry that is not a BINARY or an EXTENSION under
+    ``a.datas``, its symbolic links included: on Linux and macOS a library that
+    is collected into a package folder is also linked from the top-level folder
+    (``libX11.6.dylib`` -> ``cv2/.dylibs/libX11.6.dylib``), and a .framework
+    bundle comes with its ``Versions/Current`` links. Leaving a library out of
+    ``a.binaries`` therefore leaves its links in ``a.datas``. COLLECT and BUNDLE
+    would create them all the same, and in the macOS app bundle (where BUNDLE
+    links each of them into both ``Contents/Frameworks`` and ``Contents/Resources``)
+    a dangling link makes ``xattr`` and ``codesign`` fail.
+
+    A link's target is relative to the link's folder and may lead through other
+    links (``QtCore.framework/Resources`` -> ``Versions/Current/Resources``); a
+    link that ends at a dangling link, or goes round in a circle, dangles too.
+    Targets are resolved by name, the way PyInstaller computed them. Links with
+    an absolute target point outside the bundle and are not judged here.
+    """
+    files: set = set()
+    links: dict = {}  # normalised destination -> (destination as given, normalised target)
+    for dest, src, kind in entries:
+        path = posixpath.normpath(dest.replace("\\", "/"))
+        if kind != "SYMLINK":
+            files.add(path)
+            continue
+        target = src.replace("\\", "/")
+        if posixpath.isabs(target):
+            continue
+        links[path] = (dest, posixpath.normpath(posixpath.join(posixpath.dirname(path), target)))
+    # A folder exists when anything is collected into it, a link included.
+    folders = {
+        "/".join(parts[:end])
+        for parts in (path.split("/") for path in (*files, *links))
+        for end in range(1, len(parts))
+    }
+
+    def resolve(path: str, seen: frozenset):
+        """The collected file or folder that ``path`` leads to, or ``None``."""
+        current = ""
+        for part in path.split("/"):
+            current = f"{current}/{part}" if current else part
+            if current in links:
+                if current in seen:
+                    return None
+                current = resolve(links[current][1], seen | {current})
+                if current is None:
+                    return None
+        return current if current in files or current in folders else None
+
+    return {dest for path, (dest, _target) in links.items() if resolve(path, frozenset()) is None}
+
+
+def broken_symlinks(folder: Path) -> list:
+    """The symbolic links below ``folder`` whose target does not exist (POSIX paths
+    relative to ``folder``). Links to folders are reported, not followed."""
+    broken = []
+    for parent, subfolders, names in os.walk(folder):
+        for name in (*subfolders, *names):
+            path = Path(parent, name)
+            if path.is_symlink() and not path.exists():
+                broken.append(path.relative_to(folder).as_posix())
+    return sorted(broken)
+
+
+def require_intact_symlinks(folder) -> None:
+    """Fail the build when the output in ``folder`` has a link that points at nothing.
+
+    :func:`dangling_symlinks` keeps such links out of the bundle; this checks the
+    result, including the links that COLLECT and BUNDLE make themselves, before
+    packaging or signing (``make_dmg.sh``) runs into them.
+    """
+    broken = broken_symlinks(Path(folder))
+    if broken:
+        raise SystemExit(
+            f"eye-tracker.spec: {len(broken)} symbolic link(s) in {folder} point at files "
+            "that are not bundled (xattr and codesign fail on them): " + ", ".join(broken)
+        )
+
+
 def macos_minimum_version(distributions, floor=(12, 0)) -> str:
     """The oldest macOS every bundled wheel supports (never below ``floor``).
 
@@ -973,6 +1060,12 @@ if IS_MACOS:
         a.binaries, Path(workpath) / "unused-libraries"  # noqa: F821 - injected by PyInstaller
     )
 a.datas = [entry for entry in a.datas if not _unwanted(entry[0])]
+# The links to what was left out above: Analysis keeps them in a.datas (see the function).
+_dangling = dangling_symlinks(a.binaries + a.datas)
+if _dangling:
+    log.info("Not linking files that are not bundled: %s", ", ".join(sorted(_dangling)))
+    a.binaries = [e for e in a.binaries if not (e[2] == "SYMLINK" and e[0] in _dangling)]
+    a.datas = [e for e in a.datas if not (e[2] == "SYMLINK" and e[0] in _dangling)]
 
 pyz = PYZ(a.pure)  # noqa: F821 - injected by PyInstaller
 
@@ -1047,6 +1140,7 @@ coll = COLLECT(  # noqa: F821 - injected by PyInstaller
     upx=False,
     name=DIST_NAME,
 )
+require_intact_symlinks(coll.name)
 
 if IS_MACOS:
     MACOS_MINIMUM = macos_minimum_version(RUNTIME_DISTRIBUTIONS)
@@ -1078,3 +1172,5 @@ if IS_MACOS:
             "NSHumanReadableCopyright": COPYRIGHT,
         },
     )
+    # BUNDLE links every top-level file into Contents/Frameworks and Contents/Resources.
+    require_intact_symlinks(app.name)

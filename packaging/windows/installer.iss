@@ -82,8 +82,8 @@ DisableProgramGroupPage=yes
 DisableDirPage=auto
 DisableReadyPage=yes
 UsePreviousAppDir=yes
-; Remembers the desktop-icon choice. The "startup" task is never re-applied from
-; the previous installation: see ShouldWriteAutostart in [Code].
+; Remembers the desktop-icon and PATH choices. The "startup" task is never re-applied
+; from the previous installation: see CurPageChanged and ShouldWriteAutostart in [Code].
 UsePreviousTasks=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -179,7 +179,7 @@ var
   IsUpgrade: Boolean;
   { Start-at-login was on for this installation just before files were copied. }
   AutostartWasOn: Boolean;
-  { The Select Tasks page shows the real start-at-login state (upgrades only). }
+  { The "startup" task was set to the real start-at-login state (upgrades only). }
   StartupPageSynced: Boolean;
   { This setup asked a running Eye Tracker to quit (see RelaunchAfterSilentUpgrade). }
   AppWasRunning: Boolean;
@@ -246,38 +246,58 @@ begin
   end;
 end;
 
-{ Upgrades: show the real start-at-login state on the Select Tasks page instead
-  of the choice made at the first installation, which UsePreviousTasks would
-  restore even after the user turned autostart off in the app or Task Manager. }
+{ Upgrades: set the "startup" task to the real start-at-login state instead of the
+  choice made at the first installation, which UsePreviousTasks would restore even
+  after the user turned autostart off in the app or Task Manager. Silent setups
+  pass through the Select Tasks page as well (Setup clicks through every page
+  unseen), so this also runs for winget and /VERYSILENT; a choice made on the
+  command line with /TASKS or /MERGETASKS is kept as Setup applied it. }
 procedure CurPageChanged(CurPageID: Integer);
 begin
-  if (CurPageID = wpSelectTasks) and IsUpgrade and not StartupPageSynced then
+  if (CurPageID = wpSelectTasks) and IsUpgrade and not StartupPageSynced and
+     (StartupTaskParam = -1) then
   begin
     if AutostartEnabledFor(WizardDirValue) then
-      WizardSelectTasks('startup')
+    begin
+      Log('Start at sign-in is on: keeping the startup task selected');
+      WizardSelectTasks('startup');
+    end
     else
+    begin
+      Log('Start at sign-in is off (or disabled in Task Manager): deselecting the startup task');
       WizardSelectTasks('!startup');
+    end;
     StartupPageSynced := True;
   end;
+end;
+
+{ Whether the start-at-login choice of this setup is the user's own: given with
+  /TASKS or /MERGETASKS on the command line, or made on the Select Tasks page of an
+  interactive upgrade, which showed the real state (see CurPageChanged). A silent
+  upgrade without either only carries over what the earlier installation chose. }
+function StartupChoiceIsExplicit: Boolean;
+begin
+  Result := (StartupTaskParam <> -1) or (StartupPageSynced and not WizardSilent);
 end;
 
 { Check for the [Registry] autostart entries, evaluated when the "startup" task
   is selected. A new installation writes them as chosen. An upgrade never turns
   start-at-login back on by itself (silent upgrades such as winget re-apply the
   first installation's task selection): it writes them only when autostart is
-  off now and the user asked for it, by ticking the box on a page that showed
-  the real state, or with /TASKS or /MERGETASKS on a silent command line. An
-  entry that is already on is left as it is (it may carry the app's options). }
+  off now (no entry, or disabled in Task Manager) and the user asked for it
+  explicitly, which also clears Task Manager's "disabled" flag. An entry that is
+  already on is left as it is (it may carry the app's options). }
 function ShouldWriteAutostart: Boolean;
 begin
   if not IsUpgrade then
     Result := True
   else if AutostartWasOn then
     Result := False
-  else if WizardSilent or not StartupPageSynced then
-    Result := StartupTaskParam = 1
   else
-    Result := True;
+    Result := StartupChoiceIsExplicit;
+  { (A line of this file that starts with a bracket would be read as a section tag.) }
+  Log(Format('Writing the start-at-sign-in entries: %d (on before %d, explicit %d)', [
+    Ord(Result), Ord(AutostartWasOn), Ord(StartupChoiceIsExplicit)]));
 end;
 
 { Ask a running Eye Tracker to quit through its local control socket and wait
@@ -358,7 +378,10 @@ begin
 end;
 
 { Append the installation folder to the user's PATH unless it is already there.
-  The value is read and written unexpanded, so %VARIABLES% in it survive. }
+  The value is read and written unexpanded, so %VARIABLES% in it survive. A Path
+  value that exists but is not a string (REG_MULTI_SZ or REG_BINARY, written by
+  some other tool) cannot be read: it is left alone rather than replaced by a
+  value holding only this folder, which would lose every other entry. }
 procedure AddAppToPath;
 var
   PathList, Others, Folder: String;
@@ -366,7 +389,14 @@ var
 begin
   Folder := ExpandConstant('{app}');
   if not RegQueryStringValue(HKCU, EnvironmentKey, 'Path', PathList) then
+  begin
+    if RegValueExists(HKCU, EnvironmentKey, 'Path') then
+    begin
+      Log('The user PATH is not a string value; not adding ' + Folder + ' to it');
+      Exit;
+    end;
     PathList := '';
+  end;
   Others := PathWithout(PathList, Folder, Found);
   if Found then
     Exit;
@@ -376,7 +406,8 @@ begin
     Log('Could not add ' + Folder + ' to the user PATH');
 end;
 
-{ Remove the installation folder from the user's PATH, leaving the rest as it is. }
+{ Remove the installation folder from the user's PATH, leaving the rest as it is
+  (a Path value that is not a string is never touched: the read fails). }
 procedure RemoveAppFromPath;
 var
   PathList, Kept, Folder: String;
@@ -417,10 +448,12 @@ begin
     AutostartWasOn := IsUpgrade and AutostartEnabledFor(ExpandConstant('{app}'))
   else if CurStep = ssPostInstall then
   begin
-    if AutostartWasOn and not WizardIsTaskSelected('startup') and
-       ((not WizardSilent and StartupPageSynced) or (StartupTaskParam = 0)) then
+    if AutostartWasOn and not WizardIsTaskSelected('startup') and StartupChoiceIsExplicit then
+    begin
       { The user unticked a box that showed start-at-login as on, or passed !startup. }
+      Log('Start at sign-in was turned off: removing its entries');
       RemoveAutostartIfOurs;
+    end;
     { Upgrades restore the earlier choice (UsePreviousTasks); unticking it removes
       the entry an earlier installation added. }
     if WizardIsTaskSelected('addtopath') then

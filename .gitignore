@@ -36,3 +36,5 @@ _site/
 
 # Local design-checker state
 .impeccable/
+PRODUCT.md
+DESIGN.md

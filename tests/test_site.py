@@ -110,11 +110,16 @@ def test_dates_are_localised(built: Path) -> None:
     assert "1 Ekim 2026" in (built / "tr" / "index.html").read_text(encoding="utf-8")
 
 
-def test_turkish_page_uses_turkish_demo(built: Path) -> None:
-    demo = (built / "assets" / "demo-tr.svg").read_text(encoding="utf-8")
-    assert "Sağa bakınca" in demo
-    assert "Looking right" not in demo
-    assert "assets/demo-tr.svg" in (built / "tr" / "index.html").read_text(encoding="utf-8")
+def test_hero_demo_speaks_the_page_language(built: Path) -> None:
+    """The display-arrangement demo's status messages are translated."""
+    english = (built / "index.html").read_text(encoding="utf-8")
+    turkish = (built / "tr" / "index.html").read_text(encoding="utf-8")
+    for html in (english, turkish):
+        for name in ("look", "away", "pick"):
+            assert f'data-msg-{name}="' in html
+    assert "Looking at display" in english
+    assert "Looking at display" not in turkish
+    assert "ekrana bakıyorsunuz" in turkish
 
 
 def test_without_release_data_links_fall_back_to_the_releases_page(

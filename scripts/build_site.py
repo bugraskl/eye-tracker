@@ -41,18 +41,7 @@ ASSETS: dict[str, str] = {
 
 #: Files copied from the repository's assets/ folder: source → published name.
 REPO_ASSETS = {
-    "demo.svg": "demo.svg",
     "hero.png": "og.png",
-}
-
-#: The demo animation's captions for the Turkish page (assets/demo-tr.svg).
-DEMO_CAPTIONS_TR = {
-    "Looking right → cursor and keyboard focus on the right screen": (
-        "Sağa bakınca → imleç ve klavye odağı sağ ekranda"
-    ),
-    "Looking left → cursor and keyboard focus jump to the left screen": (
-        "Sola bakınca → imleç ve klavye odağı sol ekrana geçer"
-    ),
 }
 
 MONTHS = {
@@ -136,21 +125,10 @@ def build(release: dict[str, Any], out: Path) -> list[Path]:
             shutil.copy2(source, target)
     for name, published in REPO_ASSETS.items():
         shutil.copy2(ROOT / "assets" / name, out / "assets" / published)
-    _write_turkish_demo(out / "assets" / "demo-tr.svg")
     _write_icons(out / "assets")
     # GitHub Pages: serve files as they are (no Jekyll processing).
     (out / ".nojekyll").write_text("", encoding="utf-8")
     return pages
-
-
-def _write_turkish_demo(target: Path) -> None:
-    """The demo animation with Turkish captions (the English file stays the source)."""
-    svg = (ROOT / "assets" / "demo.svg").read_text(encoding="utf-8")
-    for english, turkish in DEMO_CAPTIONS_TR.items():
-        if english not in svg:
-            raise SystemExit(f"assets/demo.svg: caption not found: {english!r}")
-        svg = svg.replace(english, turkish)
-    target.write_text(svg, encoding="utf-8", newline="\n")
 
 
 def _write_icons(folder: Path) -> None:

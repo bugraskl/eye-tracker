@@ -66,7 +66,7 @@ Off by default. Pane focus follows only on the monitor the cursor is already on,
 1500 ms after a monitor switch, and the mouse grace of the switching settings applies too. A pane
 takes part when it is at least `precision` times the calibration's gaze error and at least
 `min_pane_px` wide (panes side by side) or tall (stacked panes): with the defaults and a gaze error
-of 120 px that is 300 px.
+of 120 px that is 300 px. Supported terminals and the full rules: [split-pane focus](panes.md).
 
 | Key | Default | Allowed | Description |
 |---|---|---|---|

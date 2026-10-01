@@ -46,6 +46,7 @@ bile göndermez.
 | 🧠 | **Baş pozu + iris füzyonu** | Sadece baş yönü değil; iki iris dahil 478 yüz noktası. Gözlükle de çalışır. |
 | 🛡️ | **Yanlışlıkla geçiş yok** | Bekleme süresi, çerçeve kenarında histerezis, yazma ve fare bekleme süreleri; telefona veya masaya kısa bakışlar yok sayılır. |
 | 📖 | **Okumayı anlar** | Diğer ekrandaki bir belgeden mi kopyalıyorsunuz? Siz okurken odak editörünüzde kalır. |
+| 🪟 | **Bölünmüş panel odağı** (deneysel) | Varsayılan olarak kapalı. Bir tmux veya WezTerm penceresinin başka bir paneline bakın, klavye odağı o panele geçsin; kalibrasyonunuzun doğruluğuna göre fazla küçük paneller hesaba katılmaz ([ayrıntılar](docs/panes.md), İngilizce). |
 | 🎯 | **Kullandıkça öğrenir** | Fareyi bir yere götürüp her durdurduğunuzda kalibrasyon biraz daha iyileşir. |
 | 🚶 | **Uzaklaşınca kilit** | 45 sn boyunca yüz ve girdi yoksa kilit ve/veya ekranları kapatma; son saniyelerde 10 sn'lik bir geri sayımla duyurulur. Döndüğünüzde ekranlar açılır. Kurulum yardımcısı tamamlanana kadar yalnızca bildirim gösterir. |
 | 🙈 | **Gizlilik modu** | Tek kısayolla kamera tamamen bırakılır; webcam ışığı söner. Siz kapatana kadar yeniden başlatmadan veya güncellemeden sonra da açık kalır. |
@@ -294,7 +295,7 @@ yerleştirin; yerini değiştirirseniz yeniden kalibre edin.
 
 ## Yol haritası
 
-- Terminal ve editörler için bölünmüş panel odağı
+- tmux ve WezTerm dışında da bölünmüş panel odağı: Windows Terminal, VS Code ve Cursor, JetBrains IDE'leri
 - İmzalı ve notarize edilmiş derlemeler
 - Intel macOS derlemeleri
 - Arayüz çevirileri

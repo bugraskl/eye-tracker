@@ -73,7 +73,8 @@ def section_notes() -> dict[str, str]:
             "mouse grace of the switching settings applies too. A pane takes part when it is "
             "at least `precision` times the calibration's gaze error and at least "
             "`min_pane_px` wide (panes side by side) or tall (stacked panes): with the defaults "
-            f"and a gaze error of 120 px that is {pane_example:.0f} px."
+            f"and a gaze error of 120 px that is {pane_example:.0f} px. Supported terminals and "
+            "the full rules: [split-pane focus](panes.md)."
         ),
         "presence": (
             "The countdown is part of the away time: with the defaults it appears after "

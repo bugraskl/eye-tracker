@@ -52,6 +52,10 @@ the model has not memorised.
 | Fair | ≥ 75 % | Works, with an occasional wrong or late switch. Improve the lighting and recalibrate. |
 | Poor | < 75 % | Recalibrate: the camera probably cannot see your eyes well. |
 
+The same held-out predictions also give the gaze error on each monitor, across and down separately:
+the distance, in pixels, that three out of four gaze estimates stay within. Only the experimental
+[split-pane focus](panes.md) uses it, to decide which panes are large enough to be told apart.
+
 ## It keeps getting better
 
 After calibration, Eye Tracker quietly learns from how you use the mouse: when you move the pointer

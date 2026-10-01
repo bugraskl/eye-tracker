@@ -1,0 +1,74 @@
+# Split-pane focus (experimental)
+
+Eye Tracker moves the cursor and the keyboard focus to the monitor you look at. With split-pane
+focus on, it goes one step further: when you look at another pane of the focused terminal window,
+on the monitor you are already working on, that pane gets the keyboard focus. Nothing is typed or
+clicked for you: Eye Tracker asks the terminal itself, through its own command-line tool, to focus
+the pane. The cursor stays where it is.
+
+It is **off by default**. Turn it on with **Follow split panes** in the tray menu, under
+**Settings → Switching → Split panes (experimental)**, or with `panes.enabled` in
+[`settings.json`](configuration.md#split-panes-experimental).
+
+## Supported tools
+
+| Tool | How | Notes |
+|---|---|---|
+| tmux | `tmux list-clients`, `list-panes`, `select-pane` | In Windows Terminal, WezTerm, Alacritty, kitty, GNOME Terminal, Konsole, xterm, iTerm2, Terminal, foot, Ghostty, Tilix and the Xfce terminal. The tmux client running in the focused window is found through the window's processes. On Windows, tmux inside WSL is used when the window runs WSL and exactly one tmux client is attached there. Only the default tmux server is asked. |
+| WezTerm | `wezterm cli --no-auto-start list`, `list-clients`, `activate-pane` | WezTerm's own split panes, in the tab on screen. Never starts a WezTerm server. |
+| Windows Terminal | coming | The setting `panes.windows_terminal` is already there. |
+| VS Code, Cursor, JetBrains IDEs | planned | Editors need purpose-built support (see below). |
+
+Supported platforms: Windows, macOS and Linux on X11. Wayland does not tell applications which
+window has the focus, so split-pane focus is not available there. On macOS the window frame stands
+in for its content area, so panes are placed a title bar's height too high; on all platforms a tab
+bar the terminal draws inside its window shifts tmux panes by its height. Both are small compared
+with the panes split-pane focus takes part in (next section).
+
+Electron and Chromium applications (VS Code, Cursor, the Claude and ChatGPT apps, Chrome, Edge,
+Firefox, Slack, Teams, Discord, Obsidian, and on Windows every window of the class
+`Chrome_WidgetWin_1`) are **never inspected**, not even to ask whether they have panes: asking them
+about their contents can switch them into a slower screen-reader mode. A zoomed pane (tmux `Ctrl+B
+z`, WezTerm's zoom) fills the window, so nothing happens while one is zoomed.
+
+## How it decides
+
+Panes are much smaller than monitors, and the gaze estimate is the same, so split-pane focus is
+deliberately cautious. Everything is measured against how accurate *your* calibration is: when you
+calibrate, Eye Tracker measures its gaze error on each monitor, separately across (x) and down (y),
+on dots it has not learned from (the 75th percentile of the error, see
+[calibration](calibration.md)). Calibrations made with earlier versions get the same measurement
+from their saved samples the first time it is needed.
+
+1. **Same monitor only.** Pane focus is considered only while the gaze is on the monitor the cursor
+   is on, and not until `panes.after_monitor_switch_ms` (1.5 s) after a monitor switch.
+2. **Large enough panes only.** For two panes side by side the new pane must be at least
+   `panes.precision` (2.5) times your horizontal gaze error wide; for stacked panes, that many times
+   your vertical error tall; and never less than `panes.min_pane_px` (240 px). With a horizontal
+   error of 100 px, panes side by side take part from 250 px wide. Smaller panes are simply left
+   alone: a pane the gaze cannot reliably be placed in never gets the focus. Raise the precision
+   for fewer surprises, lower it to include smaller panes.
+3. **Past the divider.** The gaze must be `panes.hysteresis` (half of your gaze error) past the
+   divider between the two panes.
+4. **A steady look.** For `panes.dwell_ms` (0.6 s), at least 80 % of the gaze samples must be on the
+   new pane. A stray sample does not restart the wait.
+5. **Not while you work.** No pane switch for 3 s after you type (`panes.typing_grace_ms`), for the
+   mouse grace of the switching settings after you use the mouse, for 1 s after the previous pane
+   switch, and for the typing grace after you switched panes yourself.
+6. **Reading is not switching.** If you keep typing in one pane while looking at another (reading
+   a log or a man page next to your editor), that other pane becomes a *reading pane*: reading pauses
+   do not move the focus there until 8 s after your last keystroke (`panes.reading_grace_ms`). This
+   is the same rule as for [reading another monitor](../README.md#features).
+
+The panes of the focused window are asked for when it gets the focus and then about every second
+while you look at it. A tool that keeps failing (three times in a row) is left alone until Eye
+Tracker restarts. `eye-tracker ctl status` shows what is going on in its `panes` block: whether
+the feature is on and supported, the tool in use, how many panes there are and how many are large
+enough, the gaze error in use and how many pane switches happened.
+
+## Privacy
+
+tmux and WezTerm are asked through their command-line tools, which talk to the multiplexer over
+its local socket on your computer (inside WSL for tmux there); nothing reaches the network. Only
+pane positions, sizes and ids are read: pane titles, commands, working directories and contents are
+never stored, logged or shown. See [privacy](privacy.md#what-the-app-does-not-do).

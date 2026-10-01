@@ -75,7 +75,14 @@ share a short one.
 - It does not read what you type. Typing is detected from the operating system's idle timer: if the
   timer resets while the mouse did not move, you pressed something.
 - It does not read window contents or titles. To restore focus it remembers opaque window handles in
-  memory for the current session.
+  memory for the current session. To tell a terminal from an editor it reads the window's program
+  name and window class (bundle id on macOS), never its title.
+- With the experimental [split-pane focus](panes.md) on, it asks tmux and WezTerm where their panes
+  are through their own command-line tools (`tmux`, `wezterm cli`). Those talk to the multiplexer
+  over its local socket on your computer (for tmux in WSL, inside WSL); nothing reaches the network.
+  Only pane positions, sizes and ids are read: pane titles, commands, working directories and
+  contents are never stored, logged, traced or shown in `eye-tracker ctl status`. Electron and
+  Chromium apps are never asked anything.
 - It does not identify you. It detects *a* face and where it looks; it does not recognise whose face
   it is.
 

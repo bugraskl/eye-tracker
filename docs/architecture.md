@@ -200,7 +200,8 @@ src/eye_tracker/
   config.py           typed settings with validation and forgiving loading
   vision/             camera, motion gate, worker thread, face backends and models
   gaze/               gaze model, filters, calibration, calibration store, implicit learning
-  engine/             decision, presence, guard, scheduler, input tracking, controller
+  engine/             decision, reading rule, presence, guard, scheduler, input tracking, controller
+  panes/              split-pane focus (experimental): providers, worker thread, decision
   platform/           Windows / macOS / Linux integration, autostart, global hotkeys
   ui/                 tray, settings, calibration window, overlays, wizard
   app.py, cli.py      application wiring and command line
@@ -210,3 +211,5 @@ src/eye_tracker/
 
 `gaze/` and `engine/` (except `controller.py`) import neither Qt nor OpenCV and take the current
 time as an argument, so the logic that decides when to switch or lock is tested deterministically.
+The same holds for `panes/decider.py`; the pane providers run the terminals' own command-line tools
+on the pane worker's thread ([split-pane focus](panes.md)).

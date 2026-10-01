@@ -13,6 +13,7 @@ feature matrix for your machine. Commands on this page are written as `eye-track
 | Cursor follows your gaze | ✅ | ✅ | ✅ | ⚠️ sway / Hyprland exact; others via `ydotool` |
 | Cursor returns to where you left it on a monitor | ✅ | ✅ | ✅ | ❌ lands in the middle² |
 | Keyboard focus follows | ✅ | ✅ needs Accessibility | ✅ | ❌ not allowed by Wayland |
+| Split-pane focus (experimental, tmux and WezTerm)⁴ | ✅ | ✅ | ✅ | ❌ |
 | Learns from your mouse use | ✅ | ✅ | ✅ | ❌² |
 | Walk-away lock | ✅ | ✅ | ✅ | ✅ |
 | Displays off / wake | ✅ | ✅ | ✅ DPMS | ✅ GNOME, KDE, sway, Hyprland |
@@ -30,6 +31,8 @@ to **Settings → Presence & privacy → Pause while these apps run**.
 
 ³ Elsewhere on Wayland, keyboard and mouse use are not reported, so only the camera tells whether
 you are there; see [Wayland](#wayland).
+
+⁴ Off by default. Which terminals, and how small panes are kept out: [split-pane focus](panes.md).
 
 ## Downloads
 

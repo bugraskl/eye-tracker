@@ -10,6 +10,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 - Project website at https://bugraskl.github.io/eye-tracker/ in English and Turkish, rebuilt
   with the download links of every release.
+- Split-pane focus (experimental, off by default): looking at another pane of a tmux or WezTerm
+  window on the monitor you work on gives that pane the keyboard focus, through the tools' own
+  command-line interfaces (tmux also inside WSL). Only panes several times larger than your
+  calibration's gaze error take part; the typing, reading and mouse graces apply, and Electron and
+  Chromium apps are never inspected. Turn it on with **Follow split panes** in the tray menu or in
+  **Settings → Switching**; see [split-pane focus](docs/panes.md).
+- The calibration now measures the gaze error on each monitor across and down; calibrations made
+  with earlier versions get it from their saved samples when it is first needed.
+- `eye-tracker ctl status` reports split-pane focus in a `panes` block, and `--trace` records the
+  pane decisions (pane ids only).
 
 ## [0.1.0] - 2026-10-01
 

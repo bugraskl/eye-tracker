@@ -1852,6 +1852,37 @@ def test_no_notifier_without_nodes() -> None:
     assert linux._open_camera_notifier([]) is None
 
 
+def test_notifier_falls_back_when_the_kernel_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No fanotify (kernel < 5.13, a sandbox): inotify; neither: ``None``, the watcher polls."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    opened: list[tuple[str, list[str]]] = []
+
+    def refused(error: Exception) -> type:
+        class Refused:
+            kind = "refused"
+
+            def __init__(self, paths: list[str]) -> None:
+                raise error
+
+        return Refused
+
+    class Inotify:
+        kind = "inotify"
+
+        def __init__(self, paths: list[str]) -> None:
+            opened.append((self.kind, list(paths)))
+
+    monkeypatch.setattr(linux, "_FanotifyNotifier", refused(OSError(1, "Operation not permitted")))
+    monkeypatch.setattr(linux, "_InotifyNotifier", Inotify)
+    assert isinstance(linux._open_camera_notifier(["/dev/video0"]), Inotify)
+    assert opened == [("inotify", ["/dev/video0"])]
+    # A C library without the wrapper is no reason to fail either.
+    monkeypatch.setattr(linux, "_FanotifyNotifier", refused(AttributeError("fanotify_init")))
+    assert isinstance(linux._open_camera_notifier(["/dev/video0"]), Inotify)
+    monkeypatch.setattr(linux, "_InotifyNotifier", refused(OSError(24, "Too many open files")))
+    assert linux._open_camera_notifier(["/dev/video0"]) is None
+
+
 # ------------------------------------------------------------------ camera: background thread
 class FakeNotifier:
     kind = "fake"

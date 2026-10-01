@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from collections.abc import Callable, Iterator
 from typing import Any, ClassVar
 
@@ -18,6 +19,7 @@ import numpy as np
 import pytest
 from PySide6.QtCore import QEvent, QObject, QPoint, QRectF, Qt, Signal
 from PySide6.QtGui import (
+    QAction,
     QColor,
     QFont,
     QGuiApplication,
@@ -43,6 +45,7 @@ from eye_tracker.types import (
     WorkerStats,
 )
 from eye_tracker.ui import icons, util
+from eye_tracker.ui import tray as tray_module
 from eye_tracker.ui.about import THIRD_PARTY, AboutDialog, system_info
 from eye_tracker.ui.countdown import CountdownToast
 from eye_tracker.ui.curtain import HINT, HINT_NO_KEYBOARD, PrivacyCurtain
@@ -96,6 +99,8 @@ class FakeController(QObject):
     def __init__(self, monitors: tuple[Monitor, ...] = (LEFT, RIGHT)) -> None:
         super().__init__()
         self.settings = Settings()
+        # As after the setup assistant: before it, a walk-away lock only notifies.
+        self.settings.general.first_run_done = True
         self.state = S.TRACKING
         self.paused = False
         self.privacy = False
@@ -448,6 +453,11 @@ def test_controller_accessors_are_defensive() -> None:
 
 
 # ---------------------------------------------------------------------------- tray
+def _label(action: QAction) -> str:
+    """A menu item's text without the hotkey shown after a tab (Windows)."""
+    return action.text().split("\t", 1)[0]
+
+
 def _tray(controller: Any, cleanup: list[Any], **kwargs: Any) -> TrayIcon:
     kwargs.setdefault("autostart", FakeAutostart())
     tray = TrayIcon(controller, **kwargs)
@@ -472,7 +482,7 @@ def test_tray_menu_reflects_state(
     controller.set_state(state)
     assert tray.state is state
     expected_pause = "Resume tracking" if state is S.PAUSED else "Pause tracking"
-    assert tray.action_pause.text() == expected_pause
+    assert _label(tray.action_pause) == expected_pause
     assert tray.action_privacy.isCheckable()
     assert tray.action_privacy.isChecked() == (state is S.PRIVACY)
     assert tray.action_status.text().startswith(state.label)
@@ -481,7 +491,7 @@ def test_tray_menu_reflects_state(
     assert tray.tray.toolTip().startswith(f"Eye Tracker — {state.label}")
     needs = state is S.NEEDS_CALIBRATION
     assert tray.action_calibrate.font().bold() == needs
-    assert tray.action_calibrate.text() == ("Calibrate now…" if needs else "Calibrate…")
+    assert _label(tray.action_calibrate) == ("Calibrate now…" if needs else "Calibrate…")
     busy = state is S.CALIBRATING
     assert tray.action_pause.isEnabled() == (not busy)
     assert tray.action_privacy.isEnabled() == (not busy)
@@ -491,7 +501,7 @@ def test_tray_menu_reflects_state(
 def test_tray_menu_layout(controller: FakeController, cleanup: list[Any]) -> None:
     tray = _tray(controller, cleanup)
     actions = [a for a in tray.menu.actions() if not a.isSeparator()]
-    assert [a.text() for a in actions][1:] == [
+    assert [_label(a) for a in actions][1:] == [
         "Pause tracking",
         "Privacy mode",
         "Calibrate…",
@@ -504,7 +514,7 @@ def test_tray_menu_layout(controller: FakeController, cleanup: list[Any]) -> Non
     ]
     # macOS must not move "About"/"Quit"/"Settings" into an application menu.
     assert all(a.menuRole() == a.MenuRole.NoRole for a in actions)
-    checkable = {a.text() for a in actions if a.isCheckable()}
+    checkable = {_label(a) for a in actions if a.isCheckable()}
     assert checkable == {"Privacy mode", "Show gaze dot", "Start at login"}
 
 
@@ -519,10 +529,10 @@ def test_tray_pause_text_follows_the_paused_flag(
     tray.action_privacy.trigger()
     assert controller.state is S.PRIVACY
     assert tray.action_privacy.isChecked()
-    assert tray.action_pause.text() == "Resume tracking"
+    assert _label(tray.action_pause) == "Resume tracking"
     tray.action_pause.trigger()  # resumes while privacy mode stays on
     assert controller.state is S.PRIVACY  # no state change, but the flag changed
-    assert tray.action_pause.text() == "Pause tracking"
+    assert _label(tray.action_pause) == "Pause tracking"
     tray.action_privacy.trigger()
     assert controller.state is S.TRACKING
     assert not tray.action_privacy.isChecked()
@@ -581,9 +591,9 @@ def test_tray_actions_drive_controller(controller: FakeController, cleanup: list
     assert not tray.action_privacy.isChecked()
 
     tray.action_pause.trigger()
-    assert tray.action_pause.text() == "Resume tracking"
+    assert _label(tray.action_pause) == "Resume tracking"
     tray.action_pause.trigger()
-    assert tray.action_pause.text() == "Pause tracking"
+    assert _label(tray.action_pause) == "Pause tracking"
     tray._on_activated(QSystemTrayIcon.ActivationReason.MiddleClick)
     assert controller.paused
 
@@ -639,7 +649,7 @@ def test_tray_survives_failing_controller(cleanup: list[Any]) -> None:
     tray.action_overlay.trigger()
     assert not tray.action_overlay.isChecked()  # reverted: the setting did not change
     tray.action_pause.trigger()  # logged, not raised
-    assert tray.action_pause.text() == "Pause tracking"
+    assert _label(tray.action_pause) == "Pause tracking"
 
 
 def test_tray_autostart_toggle(controller: FakeController, cleanup: list[Any]) -> None:
@@ -863,7 +873,20 @@ def test_tray_dispose_is_final_and_idempotent(
     assert tray.state is S.TRACKING
 
 
+@pytest.fixture
+def hotkeys_as_shortcuts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Show hotkeys as action shortcuts, as on macOS and Linux."""
+    monkeypatch.setattr(tray_module, "_HOTKEY_AS_TEXT", False)
+
+
+@pytest.fixture
+def hotkeys_as_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Show hotkeys as menu text after a tab, as on Windows."""
+    monkeypatch.setattr(tray_module, "_HOTKEY_AS_TEXT", True)
+
+
 @pytest.mark.skipif(sys.platform == "darwin", reason="macOS shows ⌃⌥ glyphs instead")
+@pytest.mark.usefixtures("hotkeys_as_shortcuts")
 def test_tray_shows_hotkeys_from_settings(controller: FakeController, cleanup: list[Any]) -> None:
     # The defaults differ per OS (Win key on Windows, Shift on Linux); set them.
     controller.settings.hotkeys.toggle_tracking = "ctrl+alt+t"
@@ -875,6 +898,7 @@ def test_tray_shows_hotkeys_from_settings(controller: FakeController, cleanup: l
     assert tray.action_privacy.shortcut().toString(portable) == "Ctrl+Alt+P"
     assert tray.action_calibrate.shortcut().toString(portable) == "Ctrl+Alt+C"
     assert tray.action_pause.shortcutContext() == Qt.ShortcutContext.WidgetShortcut
+    assert tray.action_pause.text() == "Pause tracking"
     assert tray.action_pause.toolTip().endswith("· Ctrl+Alt+T")
     changed = controller.settings.copy()
     changed.hotkeys.enabled = False
@@ -883,6 +907,7 @@ def test_tray_shows_hotkeys_from_settings(controller: FakeController, cleanup: l
     assert "Ctrl" not in tray.action_pause.toolTip()
 
 
+@pytest.mark.usefixtures("hotkeys_as_shortcuts")
 def test_tray_shows_only_registered_hotkeys(controller: FakeController, cleanup: list[Any]) -> None:
     tray = _tray(controller, cleanup)
     # After controller.start(): only what the OS accepted is shown. Here the
@@ -902,6 +927,39 @@ def test_tray_shows_only_registered_hotkeys(controller: FakeController, cleanup:
     tray._on_menu_about_to_show()
     assert tray.action_pause.shortcut().isEmpty()
     assert tray.action_calibrate.shortcut().isEmpty()
+
+
+@pytest.mark.usefixtures("hotkeys_as_text")
+def test_tray_names_hotkeys_like_the_tooltip_on_windows(
+    controller: FakeController, cleanup: list[Any]
+) -> None:
+    """Regression (r2-hotkeys-04): Qt drew the Windows default as "Meta+Ctrl+Alt+T"."""
+    controller.settings.hotkeys.toggle_tracking = "ctrl+alt+meta+t"
+    controller.settings.hotkeys.toggle_privacy = ""
+    controller.settings.hotkeys.recalibrate = "ctrl+shift+alt+c"
+    controller.set_state(S.NEEDS_CALIBRATION)
+    tray = _tray(controller, cleanup)
+    pause_label = format_hotkey(parse_hotkey("ctrl+alt+meta+t"))
+    calibrate_label = format_hotkey(parse_hotkey("ctrl+shift+alt+c"))
+    if sys.platform == "win32":
+        assert pause_label == "Ctrl+Alt+Win+T"
+    # QMenu draws the text after the tab in the shortcut column.
+    assert tray.action_pause.text() == f"Pause tracking\t{pause_label}"
+    assert tray.action_calibrate.text() == f"Calibrate now…\t{calibrate_label}"
+    assert tray.action_privacy.text() == "Privacy mode"
+    assert tray.action_pause.shortcut().isEmpty()  # Qt would render "Meta+Ctrl+Alt+T"
+    assert tray.action_pause.toolTip().endswith(f"· {pause_label}")
+    # The hotkey survives the text changes of the actions...
+    controller.paused = True
+    controller.set_state(S.PAUSED)
+    assert tray.action_pause.text() == f"Resume tracking\t{pause_label}"
+    assert tray.action_calibrate.text() == f"Calibrate…\t{calibrate_label}"
+    # ...and goes away with the hotkey (another app owns it).
+    controller.hotkey_manager = FakeHotkeyManager({"recalibrate": "ctrl+shift+alt+c"})
+    tray._on_menu_about_to_show()
+    assert tray.action_pause.text() == "Resume tracking"
+    assert tray.action_calibrate.text() == f"Calibrate…\t{calibrate_label}"
+    assert "Meta" not in " ".join(action.text() for action in tray.menu.actions())
 
 
 # ------------------------------------------------------------------------ countdown
@@ -951,6 +1009,60 @@ def test_countdown_text_per_presence_action(
     assert toast.isVisible()
     assert toast.title_text() == title
     assert toast.text().startswith(f"{title} — ")
+
+
+@pytest.mark.parametrize("action", ["lock", "lock_and_display_off", "display_off"])
+def test_countdown_announces_a_notification_until_the_setup_is_finished(
+    action: str, controller: FakeController, cleanup: list[Any]
+) -> None:
+    """Regression (r2-docs-02): the walk-away action only notifies before the setup
+    assistant was finished, yet the toast said "Locking in 10 s"."""
+    settings = controller.settings.copy()
+    settings.presence.action = action
+    settings.general.first_run_done = False
+    controller.apply_settings(settings)
+    toast = CountdownToast(controller, clock=FakeClock())
+    cleanup.append(toast)
+    controller.away_warning.emit(7.5)
+    assert toast.action == "notify"
+    assert toast.title_text() == "Marking you as away in 8 s"
+
+    settings = settings.copy()
+    settings.general.first_run_done = True  # the assistant was finished meanwhile
+    controller.apply_settings(settings)
+    assert toast.action == action
+    assert not toast.title_text().startswith("Marking you as away")
+
+
+class _Platform:
+    def __init__(self, **capabilities: bool) -> None:
+        self._capabilities = capabilities
+        self.calls = 0
+
+    def capabilities(self) -> dict[str, bool]:
+        self.calls += 1
+        return dict(self._capabilities)
+
+
+def test_countdown_offers_only_what_can_cancel_it(
+    controller: FakeController, cleanup: list[Any]
+) -> None:
+    """Regression (r2-docs-04): on Wayland outside GNOME keyboard and mouse use is not
+    observed, so only looking at the camera cancels the countdown there."""
+    platform = _Platform(input_idle=False)
+    controller.platform = platform  # type: ignore[attr-defined]
+    toast = CountdownToast(controller, clock=FakeClock())
+    cleanup.append(toast)
+    controller.away_warning.emit(5.0)
+    assert toast.hint_text() == "Look at the camera to cancel"
+    assert toast.text().endswith(" — look at the camera to cancel")
+    assert platform.calls == 1  # asked once, not on every repaint
+
+    supported = _Platform(input_idle=True)
+    controller.platform = supported  # type: ignore[attr-defined]
+    toast = CountdownToast(controller, clock=FakeClock())
+    cleanup.append(toast)
+    assert toast.hint_text() == "Move the mouse or look at the camera to cancel"
 
 
 def test_countdown_is_centred_on_a_monitor(controller: FakeController, cleanup: list[Any]) -> None:
@@ -1322,7 +1434,10 @@ def test_overlay_hides_stale_dot(controller: FakeController, cleanup: list[Any])
     overlay.set_enabled(True)
     overlay.set_gaze(GazePoint(100.0, 100.0, 0.0))
     assert overlay.visible_monitor == 0
-    QTest.qWait(60)
+    # Polled with a generous deadline: a loaded test machine delays the 10 ms timer.
+    deadline = time.monotonic() + 5.0
+    while overlay.visible_monitor is not None and time.monotonic() < deadline:
+        QTest.qWait(10)
     assert overlay.visible_monitor is None
 
 
@@ -1629,7 +1744,7 @@ def test_widgets_follow_the_real_controller(app_dirs: Any, cleanup: list[Any]) -
         # No calibration file in the temporary config dir.
         assert controller.state is S.NEEDS_CALIBRATION
         assert tray.state is S.NEEDS_CALIBRATION
-        assert tray.action_calibrate.text() == "Calibrate now…"
+        assert _label(tray.action_calibrate) == "Calibrate now…"
         assert "not calibrated yet" in tray.action_calibrate.toolTip()
 
         tray._on_menu_about_to_show()  # hotkeys are registered by start()
@@ -1638,12 +1753,12 @@ def test_widgets_follow_the_real_controller(app_dirs: Any, cleanup: list[Any]) -
         tray.action_pause.trigger()
         assert controller.paused
         assert tray.state is S.PAUSED
-        assert tray.action_pause.text() == "Resume tracking"
+        assert _label(tray.action_pause) == "Resume tracking"
         tray.action_privacy.trigger()
         assert controller.privacy
         assert tray.state is S.PRIVACY
         assert tray.action_privacy.isChecked()
-        assert tray.action_pause.text() == "Resume tracking"
+        assert _label(tray.action_pause) == "Resume tracking"
         tray.action_privacy.trigger()
         tray.action_pause.trigger()
         assert tray.state is S.NEEDS_CALIBRATION

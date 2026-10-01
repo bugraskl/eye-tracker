@@ -167,6 +167,173 @@ def test_gui_main_survives_missing_std_streams(monkeypatch: pytest.MonkeyPatch) 
                 stream.close()
 
 
+# --------------------------------------------------------- commands shown to users
+@pytest.fixture
+def package(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Callable[..., Path]:
+    """Pretend to run from a release package whose folder holds these executables.
+
+    The first name is the running one (``sys.executable``).
+    """
+
+    def make(running: str, *others: str, folder_name: str = "Eye Tracker") -> Path:
+        folder = tmp_path / folder_name
+        folder.mkdir(exist_ok=True)
+        for name in (running, *others):
+            (folder / name).write_bytes(b"")
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "executable", str(folder / running))
+        monkeypatch.delenv("APPIMAGE", raising=False)
+        return folder
+
+    return make
+
+
+def test_shown_commands_name_the_console_executable_of_the_windows_package(
+    package: Callable[..., Path],
+) -> None:
+    folder = package("EyeTracker.exe", "eye-tracker-cli.exe")
+    cli_exe, gui_exe = str(folder / "eye-tracker-cli.exe"), str(folder / "EyeTracker.exe")
+    # The windowed app has no console: commands it shows use the console twin.
+    assert cli.cli_command("ctl", "toggle") == [cli_exe, "ctl", "toggle"]
+    assert cli.app_command() == [gui_exe]
+    assert cli.cli_command_text("doctor") == cli.format_command([cli_exe, "doctor"])
+    assert cli._program_name() == "eye-tracker-cli.exe"
+
+    # Run as the console executable: the same commands, and the app is started
+    # with the windowed one (not tied to the terminal).
+    package("eye-tracker-cli.exe")
+    assert cli.cli_command("ctl", "quit") == [cli_exe, "ctl", "quit"]
+    assert cli.app_command() == [gui_exe]
+
+
+def test_shown_commands_use_the_installers_command_on_the_path(
+    package: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The Windows installer adds eye-tracker.exe (a copy of eye-tracker-cli.exe) and
+    puts its folder on the PATH: hints then show the short command the docs use."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    folder = package("EyeTracker.exe", "eye-tracker-cli.exe", "eye-tracker.exe")
+    gui_exe = str(folder / "EyeTracker.exe")
+    on_path: list[str | None] = [str(folder / "eye-tracker.exe")]
+    monkeypatch.setattr(cli.shutil, "which", lambda name: on_path[0])
+    assert cli.cli_command("ctl", "toggle") == ["eye-tracker", "ctl", "toggle"]
+    assert cli._program_name() == "eye-tracker"
+    # The app is still started windowed, never through the console command.
+    assert cli.app_command() == [gui_exe]
+    package("eye-tracker.exe")
+    assert cli.cli_command("doctor") == ["eye-tracker", "doctor"]
+    assert cli.app_command() == [gui_exe]
+
+    # PATH option unticked (or not seen yet by this process): the full path.
+    on_path[0] = None
+    assert cli.cli_command() == [str(folder / "eye-tracker-cli.exe")]
+    # Another copy's eye-tracker on the PATH would control the wrong installation.
+    other = tmp_path / "other" / "eye-tracker.exe"
+    other.parent.mkdir()
+    other.write_bytes(b"")
+    on_path[0] = str(other)
+    assert cli.cli_command() == [str(folder / "eye-tracker-cli.exe")]
+
+
+def test_shown_commands_in_the_macos_and_linux_packages(
+    package: Callable[..., Path], tmp_path: Path
+) -> None:
+    folder = package("eye-tracker-cli", "Eye Tracker")  # Eye Tracker.app/Contents/MacOS
+    assert cli.cli_command() == [str(folder / "eye-tracker-cli")]
+    assert cli.app_command() == [str(folder / "Eye Tracker")]
+
+    tarball = package("eye-tracker", folder_name="eye-tracker")  # one executable for both
+    assert cli.cli_command("doctor") == [str(tarball / "eye-tracker"), "doctor"]
+    assert cli.app_command() == [str(tarball / "eye-tracker")]
+
+
+def test_shown_commands_inside_an_appimage(
+    package: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    package("eye-tracker")  # the bundle inside the image, mounted at a random path
+    image = tmp_path / "Eye_Tracker-x86_64.AppImage"
+    image.write_bytes(b"")
+    monkeypatch.setenv("APPIMAGE", str(image))
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert cli.cli_command("ctl", "toggle") == [str(image), "ctl", "toggle"]
+    assert cli.app_command() == [str(image)]
+    assert cli._program_name() == "Eye_Tracker-x86_64.AppImage"
+    # A stale variable (inherited from another AppImage) naming no file is ignored.
+    monkeypatch.setenv("APPIMAGE", str(tmp_path / "gone.AppImage"))
+    assert cli.cli_command()[0].endswith("eye-tracker")
+
+
+def test_shown_commands_from_source(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    suffix = ".exe" if sys.platform == "win32" else ""
+    python = venv / f"python{suffix}"
+    python.write_bytes(b"")
+    on_path: list[str | None] = [None]
+    monkeypatch.setattr(cli.shutil, "which", lambda name: on_path[0])
+    monkeypatch.setattr(sys, "executable", "")  # an embedded interpreter
+    assert cli.cli_command("doctor") == ["eye-tracker", "doctor"]
+    monkeypatch.setattr(sys, "executable", str(python))
+
+    # No console script: run the package with this interpreter.
+    assert cli.cli_command("doctor") == [str(python), "-m", "eye_tracker", "doctor"]
+    assert cli._program_name() == "python -m eye_tracker"
+
+    script = venv / f"eye-tracker{suffix}"
+    script.write_bytes(b"")
+    # The script of this environment, not on the PATH: its full path.
+    assert cli.cli_command() == [str(script)]
+    assert cli._program_name() == "eye-tracker"
+    # Another installation's eye-tracker on the PATH would control the wrong copy.
+    other = tmp_path / f"other-eye-tracker{suffix}"
+    other.write_bytes(b"")
+    on_path[0] = str(other)
+    assert cli.cli_command() == [str(script)]
+    # This environment's own script on the PATH (an activated venv, uv run).
+    on_path[0] = str(script)
+    assert cli.cli_command("ctl", "toggle") == ["eye-tracker", "ctl", "toggle"]
+    assert cli.app_command() == ["eye-tracker"]
+
+
+def test_shown_commands_keep_the_profile(
+    package: Callable[..., Path], tmp_path: Path, app_dirs: Path
+) -> None:
+    # Each --config-dir profile is its own instance: ctl must address this one.
+    folder = package("eye-tracker")
+    profile = str(app_dirs.resolve())
+    assert cli.cli_command("ctl", "toggle") == [
+        str(folder / "eye-tracker"),
+        "--config-dir",
+        profile,
+        "ctl",
+        "toggle",
+    ]
+    assert cli.app_command() == [str(folder / "eye-tracker"), "--config-dir", profile]
+
+
+def test_help_examples_use_the_program_name(
+    package: Callable[..., Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    package("eye-tracker-cli.exe", "EyeTracker.exe")
+    assert cli.main(["--help"]) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert out.startswith("usage: eye-tracker-cli.exe ")
+    assert "  eye-tracker-cli.exe ctl privacy-toggle  " in out
+    assert "\n  eye-tracker " not in out
+
+
+def test_ctl_says_how_to_start_this_copy(
+    package: Callable[..., Path], env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    folder = package("eye-tracker-cli.exe", "EyeTracker.exe")
+    assert cli.main(["ctl", "toggle"]) == cli.EXIT_NOT_RUNNING
+    expected = cli.format_command(
+        [str(folder / "EyeTracker.exe"), "--config-dir", str(env.resolve())]
+    )
+    assert f"Start it with '{expected}'." in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------- run
 def test_run_is_the_default(run_calls: list[argparse.Namespace], env: Path) -> None:
     assert cli.main([]) == 0

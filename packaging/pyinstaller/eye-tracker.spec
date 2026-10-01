@@ -21,9 +21,13 @@ both are parsed, not imported. Executable names are mirrored in ``entry.py``,
 which picks the entry point, and in ``eye_tracker/platform/autostart.py``, which
 registers the windowed one.
 
-After the build, the release workflow runs the bundle privacy gate:
+After the build, the release workflow (and .github/workflows/bundle.yml, on pull
+requests that change the packaging or the dependencies) runs the bundle privacy gate:
 
     uv run python scripts/check_privacy.py --bundle dist/<DIST_NAME>
+
+The Windows installer additionally installs eye-tracker-cli.exe as eye-tracker.exe
+(packaging/windows/installer.iss), the name the documentation uses on PATH.
 """
 
 import ast
@@ -231,6 +235,27 @@ def hide_foreign_openssl_from_path() -> None:
         os.environ["PATH"] = os.pathsep.join(kept)
 
 
+def _file_name(dest: str) -> str:
+    """Lower-case file name of a TOC destination, whichever separator it uses."""
+    return dest.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _without(entries: list, dropped: set) -> list:
+    """``entries`` minus the BINARY entries whose destination is in ``dropped``.
+
+    Symbolic links that PyInstaller adds on Linux and macOS (``libfoo.so.1`` in
+    the top-level folder, pointing at ``pkg.libs/libfoo.so.1``) go with their
+    target, so no dangling link is left behind.
+    """
+    gone = {dest.replace("\\", "/") for dest in dropped}
+    return [
+        (dest, src, kind)
+        for dest, src, kind in entries
+        if not (kind == "BINARY" and dest.replace("\\", "/") in gone)
+        and not (kind == "SYMLINK" and src.replace("\\", "/") in gone)
+    ]
+
+
 def prune_unreferenced_openssl(entries: list) -> list:
     """Remove OpenSSL libraries that no other bundled binary imports.
 
@@ -241,25 +266,25 @@ def prune_unreferenced_openssl(entries: list) -> list:
     from PyInstaller.depend import bindepend
 
     def is_openssl(dest: str) -> bool:
-        return Path(dest).name.lower().startswith(("libssl", "libcrypto"))
+        return _file_name(dest).startswith(("libssl", "libcrypto"))
 
     def imported_names(src: str) -> set:
         try:
-            return {Path(name).name.lower() for name, _path in bindepend.get_imports(src)}
+            return {_file_name(name) for name, _path in bindepend.get_imports(src)}
         except Exception as exc:  # unreadable binary: keep everything it might need
             log.warning("Cannot read imports of %s: %s", src, exc)
             return {"*"}
 
     others = [e for e in entries if e[2] in {"BINARY", "EXTENSION"} and not is_openssl(e[0])]
     needed = set().union(*(imported_names(src) for _dest, src, _kind in others))
-    candidates = [e for e in entries if is_openssl(e[0])]
+    candidates = [e for e in entries if e[2] == "BINARY" and is_openssl(e[0])]
     keep: set = set()
     # Iterate: a kept libssl would in turn need libcrypto.
     while True:
         newly = {
             e[0]
             for e in candidates
-            if e[0] not in keep and ("*" in needed or Path(e[0]).name.lower() in needed)
+            if e[0] not in keep and ("*" in needed or _file_name(e[0]) in needed)
         }
         if not newly:
             break
@@ -267,10 +292,90 @@ def prune_unreferenced_openssl(entries: list) -> list:
         for dest, src, _kind in candidates:
             if dest in newly:
                 needed |= imported_names(src)
-    removed = [e[0] for e in candidates if e[0] not in keep]
+    removed = {e[0] for e in candidates if e[0] not in keep}
     if removed:
-        log.info("Not bundling unreferenced OpenSSL libraries: %s", ", ".join(removed))
-    return [e for e in entries if not is_openssl(e[0]) or e[0] in keep]
+        log.info("Not bundling unreferenced OpenSSL libraries: %s", ", ".join(sorted(removed)))
+    return _without(entries, removed)
+
+
+def prune_orphaned_libraries(kept: list, removed: list) -> list:
+    """Drop the libraries that only ``removed`` files needed.
+
+    Analysis collects the link-time dependencies of every binary, including the
+    Qt plugins that ``_unwanted`` removes afterwards, so removing a plugin leaves
+    its dependencies behind. On Linux the GTK3 platform theme alone drags in
+    GTK, Pango, Cairo and GIO, whose resolver fails the bundle privacy gate and
+    which loads modules and schemas from the host system at run time.
+
+    A kept library is dropped only when a removed file depends on it (directly
+    or through other bundled libraries) and no kept file does. Every other kept
+    binary counts as needed, including libraries loaded at run time that appear
+    in no import table (OpenCV's FFmpeg DLL on Windows). Python extension
+    modules are never dropped. If the imports of a needed file cannot be read,
+    nothing is dropped.
+
+    The result is the bundle as if the removed files had never been collected:
+    the dependency analysis would not have found a library that only they link.
+    (A library that a hook collects explicitly would also go if only removed
+    files linked it; none of the explicitly collected ones is in that position:
+    OpenSSL is loaded at run time and libxcb-cursor is linked by the xcb plugin.)
+    """
+    from PyInstaller.depend import bindepend
+
+    cache: dict = {}
+
+    def imports(src: str):
+        """Lower-case names of the libraries ``src`` links; ``None`` if unreadable."""
+        if src not in cache:
+            try:
+                cache[src] = {_file_name(name) for name, _path in bindepend.get_imports(src)}
+            except Exception as exc:
+                log.warning("Cannot read imports of %s: %s", src, exc)
+                cache[src] = None
+        return cache[src]
+
+    libraries: dict = {}  # file name -> kept BINARY/EXTENSION entries of that name
+    for entry in kept:
+        if entry[2] in {"BINARY", "EXTENSION"}:
+            libraries.setdefault(_file_name(entry[0]), []).append(entry)
+
+    def reachable(start: list):
+        """Bundled library names reachable from the files ``start``; ``None`` if unknown."""
+        found: set = set()
+        pending = [src for _dest, src, _kind in start]
+        while pending:
+            names = imports(pending.pop())
+            if names is None:
+                return None
+            for name in names - found:
+                if name in libraries:
+                    found.add(name)
+                    pending.extend(src for _dest, src, _kind in libraries[name])
+        return found
+
+    # What the removed files pulled in. An unreadable removed file adds nothing,
+    # which only means that fewer libraries are dropped.
+    suspects: set = set()
+    for entry in removed:
+        if entry[2] in {"BINARY", "EXTENSION"}:
+            suspects |= reachable([entry]) or set()
+    if not suspects:
+        return kept
+    roots = [e for name, group in libraries.items() if name not in suspects for e in group]
+    needed = reachable(roots)
+    if needed is None:
+        log.warning("Keeping every dependency of the removed Qt plugins (unreadable imports)")
+        return kept
+    orphans = {
+        name
+        for name in suspects - needed
+        if all(kind == "BINARY" for _dest, _src, kind in libraries[name])
+    }
+    if orphans:
+        log.info(
+            "Not bundling libraries that only removed plugins need: %s", ", ".join(sorted(orphans))
+        )
+    return _without(kept, {e[0] for name in orphans for e in libraries[name]})
 
 
 def macos_minimum_version(distributions, floor=(12, 0)) -> str:
@@ -327,6 +432,54 @@ def verify_models(models: dict, directory: Path) -> None:
         )
 
 
+def pinned_licences() -> dict:
+    """``LICENCE_TEXTS`` (path below the models -> SHA-256) from ``scripts/fetch_models.py``.
+
+    The models' licence texts must ship with them: Apache-2.0 asks for a copy of
+    the licence, MIT for its copyright and permission notice. Parsed like
+    :func:`pinned_models`, so the spec and ``fetch_models.py --check`` pin the
+    same files.
+    """
+    source = (ROOT / "scripts" / "fetch_models.py").read_text(encoding="utf-8")
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        else:
+            continue
+        if not (isinstance(target, ast.Name) and target.id == "LICENCE_TEXTS"):
+            continue
+        licences = {}
+        for call in value.elts if isinstance(value, ast.Tuple) else ():
+            fields = {
+                keyword.arg: ast.literal_eval(keyword.value)
+                for keyword in getattr(call, "keywords", ())
+                if keyword.arg in ("path", "sha256")
+            }
+            if len(fields) == 2:
+                licences[fields["path"]] = fields["sha256"]
+        if licences:
+            return licences
+    raise SystemExit("eye-tracker.spec: LICENCE_TEXTS not found in scripts/fetch_models.py")
+
+
+def verify_licences(licences: dict, directory: Path) -> None:
+    """Refuse to build without the models' licence texts, or with altered ones."""
+    problems = []
+    for name, expected in sorted(licences.items()):
+        path = directory / name
+        if not path.is_file():
+            problems.append(f"{name} is missing")
+        elif hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            problems.append(f"{name} does not match its pinned SHA-256")
+    if problems:
+        # Committed, never downloaded: only git has the right text.
+        raise SystemExit(
+            "eye-tracker.spec: " + "; ".join(problems) + ". Restore the licence texts from git."
+        )
+
+
 MODELS_DIR = PACKAGE / "vision" / "models"
 MODEL_FILES = pinned_models()
 verify_models(MODEL_FILES, MODELS_DIR)
@@ -334,6 +487,8 @@ verify_models(MODEL_FILES, MODELS_DIR)
 MODEL_NOTICE = "NOTICE.md"
 if not (MODELS_DIR / MODEL_NOTICE).is_file():
     raise SystemExit(f"eye-tracker.spec: {MODELS_DIR / MODEL_NOTICE} is missing")
+MODEL_LICENCES = pinned_licences()
+verify_licences(MODEL_LICENCES, MODELS_DIR)
 
 if IS_WINDOWS:
     hide_foreign_openssl_from_path()
@@ -433,28 +588,62 @@ a = Analysis(  # noqa: F821 - injected by PyInstaller
 )
 
 _bundled = {Path(dest).as_posix() for dest, _src, _kind in a.datas}
-for _model in (*MODEL_FILES, MODEL_NOTICE):
+for _model in (*MODEL_FILES, MODEL_NOTICE, *MODEL_LICENCES):
     if f"eye_tracker/vision/models/{_model}" not in _bundled:
         raise SystemExit(f"eye-tracker.spec: {_model} was not collected")
 
 
 def _unwanted(dest: str) -> bool:
-    """Qt files that the app never loads.
+    """Qt files that the app never loads (and that must not ship).
 
-    * tls / networkinformation: QtNetwork backends for TCP/SSL; only local IPC is used.
+    * tls, networkinformation, networkaccess: QtNetwork's TLS, reachability and
+      HTTP backends; the app only uses local IPC (QLocalServer/QLocalSocket).
     * generic: input plugins for embedded (eglfs) targets, including a UDP (TUIO) listener.
+    * platforms vnc: a VNC server (TCP port 5900, no authentication) that an
+      inherited QT_QPA_PLATFORM=vnc would start; webgl (Qt 5) is an HTTP server.
+    * platforms eglfs, linuxfb, minimalegl, vkkhrdisplay and egldeviceintegrations:
+      full-screen targets without a desktop, where a tray app cannot run; they
+      link libinput, libudev and libgbm from the build machine.
+    * platformthemes gtk3: links GTK, Pango, Cairo and GIO (a DNS resolver) from
+      the build machine, whose GIO modules and schemas then come from the host and
+      break on other distributions. Qt's built-in GNOME/KDE themes and the
+      xdg-desktop-portal theme remain.
     * opengl32sw.dll: 20 MB software OpenGL fallback; the UI is plain raster widgets.
     * translations: Qt's own UI strings; the app installs no QTranslator.
+
+    ``prune_orphaned_libraries`` then removes what only these files linked.
     """
     path = "/" + dest.replace("\\", "/").lower()
-    if path.endswith("/opengl32sw.dll"):
+    name = path.rsplit("/", 1)[-1]
+    if name == "opengl32sw.dll":
         return True
     if "/pyside6/" in path and "/translations/" in path:
         return True
-    return any(f"/plugins/{group}/" in path for group in ("tls", "networkinformation", "generic"))
+    unwanted_groups = (
+        "tls",
+        "networkinformation",
+        "networkaccess",
+        "generic",
+        "egldeviceintegrations",
+    )
+    if any(f"/plugins/{group}/" in path for group in unwanted_groups):
+        return True
+    if "/plugins/platforms/" in path:
+        return any(
+            kind in name
+            for kind in ("vnc", "webgl", "eglfs", "linuxfb", "minimalegl", "vkkhrdisplay")
+        )
+    if "/plugins/platformthemes/" in path:
+        return "gtk" in name
+    return False
 
 
-a.binaries = prune_unreferenced_openssl([e for e in a.binaries if not _unwanted(e[0])])
+_removed_binaries = [entry for entry in a.binaries if _unwanted(entry[0])]
+a.binaries = prune_unreferenced_openssl(
+    prune_orphaned_libraries(
+        [entry for entry in a.binaries if not _unwanted(entry[0])], _removed_binaries
+    )
+)
 a.datas = [entry for entry in a.datas if not _unwanted(entry[0])]
 
 pyz = PYZ(a.pure)  # noqa: F821 - injected by PyInstaller

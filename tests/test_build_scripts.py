@@ -314,6 +314,8 @@ def test_check_mode(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         (r"C:\Users\me\AppData\Local\Programs\Eye Tracker\eyetracker.EXE", True),
         ("/Applications/Eye Tracker.app/Contents/MacOS/Eye Tracker", True),
         (r"C:\portable\EyeTracker\eye-tracker-cli.exe", False),
+        # The installer's copy of the CLI, found through PATH.
+        (r"C:\Users\me\AppData\Local\Programs\Eye Tracker\eye-tracker.exe", False),
         ("/Applications/Eye Tracker.app/Contents/MacOS/eye-tracker-cli", False),
         ("/opt/eye-tracker/eye-tracker", False),
         ("/usr/bin/python3", False),
@@ -448,6 +450,76 @@ def test_installer_upgrades_keep_the_users_autostart_choice() -> None:
     assert code.index("if CurStep = ssInstall then") < code.index("CurStep = ssPostInstall")
 
 
+def _iss_code() -> str:
+    text = _iss_text().replace("\r\n", "\n")
+    return text[text.index("[Code]") :]
+
+
+def _iss_section(name: str) -> list[str]:
+    """The non-comment lines of one section of installer.iss."""
+    text = _iss_text().replace("\r\n", "\n")
+    body = text[text.index(f"\n[{name}]\n") + len(name) + 4 :]
+    body = body[: body.index("\n[")]
+    return [line for line in body.splitlines() if line and not line.startswith(";")]
+
+
+def test_installer_puts_the_command_on_path() -> None:
+    """r2-docs-01: after a default installation "eye-tracker <command>" works in a new
+    terminal, as the documentation writes it; start at sign-in keeps the windowed app."""
+    assert _iss_define("CliCommandExeName") == "eye-tracker.exe"
+    [task] = [line for line in _iss_section("Tasks") if line.startswith('Name: "addtopath"')]
+    assert "unchecked" not in task  # on by default
+    assert 'Description: "{cm:AddToPath}"' in task
+    assert (
+        'Source: "{#BundleDir}\\{#CliExeName}"; DestDir: "{app}"; '
+        'DestName: "{#CliCommandExeName}"; Flags: ignoreversion'
+    ) in _iss_section("Files")
+    assert "ChangesEnvironment=yes" in _iss_section("Setup")
+    for language in ("english", "turkish"):
+        for message in ("AddToPath", "CommandLineGroup"):
+            assert f"{language}.{message}=" in _iss_text()
+    code = _iss_code()
+    for fragment in (
+        # Added (or, when unticked in an upgrade, removed) after the files are in place.
+        "if WizardIsTaskSelected('addtopath') then\n      AddAppToPath\n    else\n"
+        "      RemoveAppFromPath;",
+        # Removed again on uninstall.
+        "QuitRunningApp;\n    RemoveAutostartIfOurs;\n    RemoveAppFromPath;",
+        # Unexpanded in and out, so %VARIABLES% in the user's PATH survive.
+        "RegQueryStringValue(HKCU, EnvironmentKey, 'Path', PathList)",
+        "RegWriteExpandStringValue(HKCU, EnvironmentKey, 'Path', PathList + Folder)",
+        "RegWriteExpandStringValue(HKCU, EnvironmentKey, 'Path', Kept)",
+        "EnvironmentKey = 'Environment';",
+    ):
+        assert fragment in code, fragment
+    # Never added twice.
+    add = code[code.index("procedure AddAppToPath;") : code.index("procedure RemoveAppFromPath;")]
+    assert "if Found then\n    Exit;" in add
+    # The Run value still names the windowed executable.
+    [run_value] = [line for line in _iss_section("Registry") if "ValueType: string" in line]
+    assert 'ValueData: """{app}\\{#AppExeName}"" --background"' in run_value
+    assert "CliCommandExeName" not in run_value
+
+
+def test_installer_restarts_the_app_after_a_silent_upgrade() -> None:
+    """r2-packaging-04: winget's /VERYSILENT upgrade quits the app; it must come back."""
+    run = _iss_section("Run")
+    assert run == [
+        'Filename: "{app}\\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; '
+        "Flags: nowait postinstall skipifsilent",
+        'Filename: "{app}\\{#AppExeName}"; Parameters: "--background"; '
+        "Flags: nowait runasoriginaluser; Check: RelaunchAfterSilentUpgrade",
+    ]
+    code = _iss_code()
+    assert "function RelaunchAfterSilentUpgrade: Boolean;" in code
+    assert "Result := WizardSilent and AppWasRunning;" in code
+    # Only an instance that acknowledged "ctl quit" counts as running.
+    quit_app = code[
+        code.index("procedure QuitRunningApp;") : code.index("function PrepareToInstall")
+    ]
+    assert "(ResultCode <> 0) then\n    Exit;\n  AppWasRunning := True;" in quit_app
+
+
 def _iscc() -> str | None:
     found = shutil.which("iscc") or shutil.which("ISCC")
     if found:
@@ -532,7 +604,7 @@ def _jobs(text: str) -> dict[str, str]:
     return dict(zip(parts[1::2], parts[2::2], strict=True))
 
 
-@pytest.mark.parametrize("name", ["ci.yml", "release.yml"])
+@pytest.mark.parametrize("name", ["ci.yml", "release.yml", "bundle.yml"])
 def test_workflow_actions_are_pinned_to_commits(name: str) -> None:
     """packaging-05: a moved tag must not change what runs with release permissions."""
     uses = re.findall(r"^\s*(?:-\s+)?uses:\s*(.+)$", _workflow(name), flags=re.MULTILINE)
@@ -579,6 +651,108 @@ def test_release_builds_pass_the_bundle_privacy_gate() -> None:
             "build-linux": "Create the AppImage and the tarball",
         }[job]
         assert gate < text.index(packaging_step)
+
+
+def _apt_packages(text: str) -> list[str]:
+    """The packages of the first ``apt-get install`` command in a workflow (or job)."""
+    start = text.index("apt-get install -y --no-install-recommends")
+    lines = text[start:].splitlines()
+    command = []
+    for line in lines:
+        command.append(line.strip().removesuffix("\\"))
+        if not line.rstrip().endswith("\\"):
+            break
+    return " ".join(command).split()[4:]
+
+
+_MACOS_MINIMUM = re.compile(r'^  MACOS_MINIMUM: "(\d+\.\d+)"$', re.MULTILINE)
+
+
+def test_release_checks_the_documented_macos_minimum() -> None:
+    """r2-packaging-02: numpy's macosx_14_0 wheel makes the DMG need macOS 14. The
+    release fails if LSMinimumSystemVersion stops matching what users are told."""
+    text = _workflow("release.yml")
+    [minimum] = _MACOS_MINIMUM.findall(text)
+    assert minimum == "14.0"
+    assert _MACOS_MINIMUM.findall(_workflow("bundle.yml")) == [minimum]
+    jobs = _jobs(text)
+    macos = jobs["build-macos"]
+    assert 'minimum="$(plutil -extract LSMinimumSystemVersion raw "$plist")"' in macos
+    assert 'if [[ "$minimum" != "$MACOS_MINIMUM" ]]; then' in macos
+    assert macos.index("LSMinimumSystemVersion") < macos.index('"$cli" --version')
+    prepare = jobs["prepare"]
+    assert 'mac_min = os.environ["MACOS_MINIMUM"].removesuffix(".0")' in prepare
+    assert "| macOS {mac_min} or later (Apple silicon) |" in prepare
+
+
+def test_release_smoke_tests_the_path_entry_and_the_command() -> None:
+    windows = _jobs(_workflow("release.yml"))["build-windows"]
+    for fragment in (
+        '& "$app\\eye-tracker.exe" --version',
+        'if ((Get-PathCount) -ne 1) { throw "the installer did not add $app to the user PATH" }',
+        'Invoke-Setup "upgrade-no-path" @("/MERGETASKS=!addtopath")',
+        'if ((Get-PathCount) -ne 0) { throw "uninstall left $app on the user PATH" }',
+        '(Get-Autostart $runKey) -notlike "*\\EyeTracker.exe*"',
+    ):
+        assert fragment in windows, fragment
+
+
+def test_bundle_workflow_builds_every_platform_like_the_release() -> None:
+    """r2-packaging-01: a bundle that fails the gate shows up on the pull request."""
+    text = _workflow("bundle.yml")
+    triggers = text[: text.index("\npermissions:")]
+    for path in (
+        "packaging/**",
+        "scripts/check_privacy.py",
+        "scripts/fetch_models.py",
+        "scripts/make_icons.py",
+        "pyproject.toml",
+        "uv.lock",
+        ".github/workflows/bundle.yml",
+    ):
+        assert triggers.count(f'      - "{path}"\n') == 2, path  # pull_request and push
+    release = _jobs(_workflow("release.yml"))
+    for job in ("build-windows", "build-macos", "build-linux"):
+        runs_on = re.search(r"^    runs-on: (\S+)$", release[job], re.MULTILINE)
+        assert runs_on, job
+        assert f"          - os: {runs_on.group(1)}\n" in text, job
+    for bundle in ("dist/EyeTracker", "dist/Eye Tracker.app", "dist/eye-tracker"):
+        assert f"            bundle: {bundle}\n" in text
+    steps = text[text.index("    steps:") :]
+    build = steps.index("pyinstaller packaging/pyinstaller/eye-tracker.spec --noconfirm --clean")
+    gate = steps.index('run: uv run --no-sync python scripts/check_privacy.py --bundle "$BUNDLE"')
+    assert build < gate < steps.index("Smoke-test the frozen CLI")
+    assert "upload-artifact" not in text
+    assert "contents: write" not in text
+    # The same system libraries as the release build, so the same ones get bundled.
+    assert _apt_packages(text) == _apt_packages(release["build-linux"])
+    assert {"libsm6", "libice6", "libxcb-cursor0"} <= set(_apt_packages(text))
+
+
+def test_linux_builds_check_that_gtk_and_gio_stay_out() -> None:
+    check = "-name 'libgtk-3.so*' -o -name 'libgio-2.0.so*'"
+    linux = _jobs(_workflow("release.yml"))["build-linux"]
+    assert check in linux
+    assert linux.index(check) < linux.index("scripts/check_privacy.py --bundle")
+    assert check in _workflow("bundle.yml")
+
+
+def test_bug_report_names_the_command_of_every_package() -> None:
+    text = (REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml").read_text(encoding="utf-8")
+    for fragment in (
+        "`eye-tracker doctor` in a new terminal",
+        # Without the PATH entry: spelled so that PowerShell and cmd both run it.
+        "`.\\eye-tracker.exe doctor` in `%LOCALAPPDATA%\\Programs\\Eye Tracker`",
+        "`.\\eye-tracker-cli.exe doctor`",
+        '`"/Applications/Eye Tracker.app/Contents/MacOS/eye-tracker-cli" doctor`',
+        "`./EyeTracker-*.AppImage doctor`",
+        "`./eye-tracker/eye-tracker doctor`",
+        "`uv run eye-tracker doctor`",
+    ):
+        assert fragment in text, fragment
+    # The template's install types are the release packages plus source installs.
+    for package in ("setup.exe", "portable ZIP", ".dmg", "AppImage", ".tar.gz", "From source"):
+        assert package in text
 
 
 def test_release_notes_explain_macos_permissions_after_updates() -> None:
@@ -807,10 +981,15 @@ _SPEC_HELPERS = (
     "runtime_distributions",
     "linux_system_library",
     "hide_foreign_openssl_from_path",
+    "_file_name",
+    "_without",
     "prune_unreferenced_openssl",
+    "prune_orphaned_libraries",
     "macos_minimum_version",
     "pinned_models",
     "verify_models",
+    "pinned_licences",
+    "verify_licences",
     "_unwanted",
 )
 
@@ -826,6 +1005,7 @@ def spec_helpers() -> dict[str, Any]:
         "log": logging.getLogger("eye-tracker.spec.test"),
         "PROJECT": "eye-tracker",
         "PACKAGE": REPO_ROOT / "src" / "eye_tracker",
+        "ROOT": REPO_ROOT,
     }
     exec(compile(ast.Module(body=body, type_ignores=[]), "eye-tracker.spec", "exec"), namespace)
     missing = [name for name in _SPEC_HELPERS if name not in namespace]
@@ -857,7 +1037,10 @@ def test_spec_ships_the_opencv_models_and_never_mediapipe() -> None:
     excludes = source[source.index("EXCLUDES = [") :]
     assert '\n    "mediapipe",\n' in excludes[: excludes.index("\n]\n")]
     assert 'MODEL_NOTICE = "NOTICE.md"' in source
-    assert "for _model in (*MODEL_FILES, MODEL_NOTICE):" in source
+    # The models' licence texts ship too, checked like the models themselves.
+    assert "MODEL_LICENCES = pinned_licences()\n" in source
+    assert "verify_licences(MODEL_LICENCES, MODELS_DIR)" in source
+    assert "for _model in (*MODEL_FILES, MODEL_NOTICE, *MODEL_LICENCES):" in source
 
 
 def test_spec_refuses_missing_or_modified_models(
@@ -878,6 +1061,29 @@ def test_spec_refuses_missing_or_modified_models(
     (tmp_path / "a.tflite").unlink()
     with pytest.raises(SystemExit, match=r"a\.tflite is missing"):
         spec_helpers["verify_models"](pins, tmp_path)
+
+
+def test_spec_ships_the_licence_texts_that_fetch_models_pins(
+    spec_helpers: dict[str, Any], tmp_path: Path
+) -> None:
+    """The spec reads the licence texts from fetch_models.py and refuses to build
+    without them (Apache-2.0 and MIT both require the text to ship)."""
+    pinned = {text.path: text.sha256 for text in fetch_models.LICENCE_TEXTS}
+    assert spec_helpers["pinned_licences"]() == pinned
+    assert set(pinned) == {"licenses/LICENSE-APACHE-2.0.txt", "licenses/LICENSE-YUNET.txt"}
+    models = REPO_ROOT / "src" / "eye_tracker" / "vision" / "models"
+    spec_helpers["verify_licences"](pinned, models)  # the committed texts are intact
+
+    good, bad = b"licence text", b"altered text"
+    pins = {"licenses/a.txt": hashlib.sha256(good).hexdigest()}
+    (tmp_path / "licenses").mkdir()
+    with pytest.raises(SystemExit, match=r"licenses/a\.txt is missing\. Restore .* from git"):
+        spec_helpers["verify_licences"](pins, tmp_path)
+    (tmp_path / "licenses" / "a.txt").write_bytes(bad)
+    with pytest.raises(SystemExit, match=r"does not match its pinned SHA-256"):
+        spec_helpers["verify_licences"](pins, tmp_path)
+    (tmp_path / "licenses" / "a.txt").write_bytes(good)
+    spec_helpers["verify_licences"](pins, tmp_path)
 
 
 class _FakeDist:
@@ -932,9 +1138,35 @@ def test_macos_minimum_version(
         ("PySide6/opengl32sw.dll", True),
         ("PySide6/translations/qtbase_de.qm", True),
         ("PySide6/Qt/translations/qt_tr.qm", True),
+        ("PySide6/Qt/plugins/networkaccess/libqnetworkaccessbackend.so", True),
+        ("PySide6/Qt/plugins/networkinformation/libqglib.so", True),
+        # r2-packaging-05: network servers selectable with QT_QPA_PLATFORM.
+        ("PySide6/Qt/plugins/platforms/libqvnc.so", True),
+        ("PySide6/Qt/plugins/platforms/libqwebgl.so", True),
+        # Full-screen targets without a desktop (and their libinput/udev/gbm stack).
+        ("PySide6/Qt/plugins/platforms/libqeglfs.so", True),
+        ("PySide6/Qt/plugins/platforms/libqlinuxfb.so", True),
+        ("PySide6/Qt/plugins/platforms/libqminimalegl.so", True),
+        ("PySide6/Qt/plugins/platforms/libqvkkhrdisplay.so", True),
+        ("PySide6/Qt/plugins/egldeviceintegrations/libqeglfs-kms-integration.so", True),
+        ("PySide6/Qt/plugins/generic/libqevdevmouseplugin.so", True),
+        # r2-packaging-01: the GTK3 theme drags in GTK, Pango, Cairo and GIO.
+        ("PySide6/Qt/plugins/platformthemes/libqgtk3.so", True),
+        ("PySide6/Qt/plugins/platformthemes/libqxdgdesktopportal.so", False),
         ("PySide6/plugins/platforms/qwindows.dll", False),
+        ("PySide6/plugins/platforms/qminimal.dll", False),
+        ("PySide6/plugins/platforms/qoffscreen.dll", False),
         ("PySide6/Qt/plugins/platforms/libqxcb.so", False),
+        ("PySide6/Qt/plugins/platforms/libqwayland.so", False),
+        ("PySide6/Qt/plugins/platforms/libqwayland-egl.so", False),
+        ("PySide6/Qt/plugins/platforms/libqoffscreen.so", False),
+        ("PySide6/Qt/plugins/platforms/libqminimal.so", False),
+        ("PySide6/Qt/plugins/xcbglintegrations/libqxcb-glx-integration.so", False),
+        ("PySide6/Qt/plugins/platforminputcontexts/libibusplatforminputcontextplugin.so", False),
+        ("PySide6/Qt/plugins/wayland-decoration-client/libbradient.so", False),
+        ("PySide6/Qt/plugins/platforms/libqcocoa.dylib", False),
         ("PySide6/plugins/imageformats/qico.dll", False),
+        ("PySide6/Qt/lib/libQt6Network.so.6", False),
         ("cv2/cv2.pyd", False),
         ("eye_tracker/vision/models/face_landmarks_detector.tflite", False),
         ("eye_tracker/vision/models/NOTICE.md", False),
@@ -942,6 +1174,127 @@ def test_macos_minimum_version(
 )
 def test_unwanted_qt_files(spec_helpers: dict[str, Any], dest: str, unwanted: bool) -> None:
     assert spec_helpers["_unwanted"](dest) is unwanted
+
+
+def test_spec_removes_every_plugin_the_gate_rejects(spec_helpers: dict[str, Any]) -> None:
+    """The bundle gate's network-plugin rule and the spec's removal list agree."""
+    check_privacy = _load(REPO_ROOT / "scripts" / "check_privacy.py", "check_privacy_build_tests")
+    assert check_privacy.QT_NETWORK_PLUGINS
+    for group, pattern, _reason in check_privacy.QT_NETWORK_PLUGINS:
+        core = pattern.strip("*") or "backend"
+        for dest in (
+            f"PySide6/Qt/plugins/{group}/libq{core}.so",
+            f"PySide6/plugins/{group}/q{core}.dll",
+            f"PySide6/Qt/plugins/{group}/libq{core}.dylib",
+        ):
+            assert check_privacy.network_plugin(f"_internal/{dest}") is not None, dest
+            assert spec_helpers["_unwanted"](dest), dest
+
+
+def _entries(*items: tuple[str, str]) -> list[tuple[str, str, str]]:
+    """TOC entries ``(dest, source, kind)``; the source ends with the dest's file name."""
+    return [(dest, f"/src/{dest}", kind) for dest, kind in items]
+
+
+def _dests(entries: list[tuple[str, str, str]]) -> list[str]:
+    return [dest for dest, _src, _kind in entries]
+
+
+# What ldd reports on Linux: the whole closure of each library, not only DT_NEEDED.
+_LINUX_IMPORTS = {
+    "libqgtk3.so": {
+        "libQt6Gui.so.6",
+        "libQt6Core.so.6",
+        "libgtk-3.so.0",
+        "libgio-2.0.so.0",
+        "libglib-2.0.so.0",
+        "libc.so.6",
+    },
+    "libgtk-3.so.0": {"libgio-2.0.so.0", "libglib-2.0.so.0", "libc.so.6"},
+    "libgio-2.0.so.0": {"libglib-2.0.so.0", "libc.so.6"},
+    "libqxcb.so": {"libQt6XcbQpa.so.6", "libQt6Gui.so.6", "libQt6Core.so.6", "libglib-2.0.so.0"},
+    "libQt6XcbQpa.so.6": {"libQt6Gui.so.6", "libQt6Core.so.6", "libglib-2.0.so.0"},
+    "libQt6Gui.so.6": {"libQt6Core.so.6", "libglib-2.0.so.0"},
+    "libQt6Core.so.6": {"libglib-2.0.so.0"},
+    "QtGui.abi3.so": {"libQt6Gui.so.6", "libQt6Core.so.6", "libglib-2.0.so.0"},
+}
+
+
+def test_prune_drops_what_only_removed_plugins_link(
+    spec_helpers: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r2-packaging-01: removing the GTK3 theme removes GTK and GIO too, but nothing
+    a kept file still links, and nothing loaded at run time."""
+    _fake_imports(monkeypatch, _LINUX_IMPORTS)
+    removed = _entries(("PySide6/Qt/plugins/platformthemes/libqgtk3.so", "BINARY"))
+    kept = [
+        *_entries(
+            ("PySide6/QtGui.abi3.so", "EXTENSION"),
+            ("PySide6/Qt/plugins/platforms/libqxcb.so", "BINARY"),
+            ("PySide6/Qt/lib/libQt6XcbQpa.so.6", "BINARY"),
+            ("PySide6/Qt/lib/libQt6Gui.so.6", "BINARY"),
+            ("PySide6/Qt/lib/libQt6Core.so.6", "BINARY"),
+            ("libglib-2.0.so.0", "BINARY"),
+            ("libgtk-3.so.0", "BINARY"),
+            ("gtk/libgio-2.0.so.0", "BINARY"),
+            # Opened with dlopen()/LoadLibrary, so in no import table (like OpenCV's FFmpeg).
+            ("cv2/opencv_videoio_ffmpeg500_64.dll", "BINARY"),
+            ("eye_tracker/vision/models/NOTICE.md", "DATA"),
+        ),
+        # PyInstaller's links from the top-level folder to libraries in subfolders.
+        ("libQt6Gui.so.6", "PySide6/Qt/lib/libQt6Gui.so.6", "SYMLINK"),
+        ("libgio-2.0.so.0", "gtk/libgio-2.0.so.0", "SYMLINK"),
+    ]
+    pruned = spec_helpers["prune_orphaned_libraries"](kept, removed)
+    assert _dests(pruned) == [
+        "PySide6/QtGui.abi3.so",
+        "PySide6/Qt/plugins/platforms/libqxcb.so",
+        "PySide6/Qt/lib/libQt6XcbQpa.so.6",
+        "PySide6/Qt/lib/libQt6Gui.so.6",
+        "PySide6/Qt/lib/libQt6Core.so.6",
+        "libglib-2.0.so.0",
+        "cv2/opencv_videoio_ffmpeg500_64.dll",
+        "eye_tracker/vision/models/NOTICE.md",
+        "libQt6Gui.so.6",
+    ]
+
+
+def test_prune_never_drops_extension_modules(
+    spec_helpers: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_imports(monkeypatch, {"qtuiotouchplugin.dll": {"QtNetwork.pyd", "Qt6Network.dll"}})
+    removed = _entries(("PySide6/plugins/generic/qtuiotouchplugin.dll", "BINARY"))
+    kept = _entries(("PySide6/QtNetwork.pyd", "EXTENSION"), ("PySide6/Qt6Network.dll", "BINARY"))
+    # Qt6Network.dll is linked by nothing that stays in this toy bundle: it goes;
+    # the extension module stays whatever links it.
+    assert _dests(spec_helpers["prune_orphaned_libraries"](kept, removed)) == [
+        "PySide6/QtNetwork.pyd"
+    ]
+
+
+def test_prune_keeps_everything_when_a_needed_file_is_unreadable(
+    spec_helpers: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_imports(monkeypatch, {"qopensslbackend.dll": {"libssl-3-x64.dll"}})
+    removed = _entries(("PySide6/plugins/tls/qopensslbackend.dll", "BINARY"))
+    kept = _entries(("unreadable.dll", "BINARY"), ("libssl-3-x64.dll", "BINARY"))
+    assert spec_helpers["prune_orphaned_libraries"](kept, removed) == kept
+    # Nothing removed, or nothing it links is bundled: nothing to do either.
+    assert spec_helpers["prune_orphaned_libraries"](kept, []) == kept
+    _fake_imports(monkeypatch, {"qopensslbackend.dll": {"KERNEL32.dll"}})
+    assert spec_helpers["prune_orphaned_libraries"](kept, removed) == kept
+
+
+def test_without_drops_binaries_and_their_links(spec_helpers: dict[str, Any]) -> None:
+    entries = [
+        ("PySide6/Qt/lib/libfoo.so.1", "/src/libfoo.so.1", "BINARY"),
+        ("libfoo.so.1", "PySide6/Qt/lib/libfoo.so.1", "SYMLINK"),
+        ("libbar.so.1", "PySide6/Qt/lib/libbar.so.1", "SYMLINK"),
+        ("data/libfoo.so.1", "/src/data/libfoo.so.1", "DATA"),
+    ]
+    kept = spec_helpers["_without"](entries, {"PySide6\\Qt\\lib\\libfoo.so.1"})
+    assert kept == entries[2:]
+    assert spec_helpers["_file_name"]("PySide6\\Qt\\lib\\LibFoo.so.1") == "libfoo.so.1"
 
 
 def _toc(*names: str) -> list[tuple[str, str, str]]:

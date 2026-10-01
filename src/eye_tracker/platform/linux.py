@@ -25,9 +25,12 @@ Lock detection
 --------------
 logind's ``LockedHint`` is only set by lockers that report it (GNOME Shell,
 KDE, light-locker ...). Tiling-WM lockers (swaylock, i3lock via xss-lock,
-hyprlock, slock ...) never do, so a running locker process counts as "locked"
-as well, and ``loginctl lock-session`` only counts as a successful lock when
-something reacted to it (see :meth:`LinuxPlatform.lock_screen`).
+hyprlock, slock ...) never do, so a running locker process of this user's
+login counts as "locked" as well (setuid lockers such as slock included, see
+:meth:`LinuxPlatform._locker_running`), and ``loginctl lock-session`` only
+counts as a successful lock when something reacted to it (see
+:meth:`LinuxPlatform.lock_screen`). Tiling compositors that pose as GNOME or
+KDE through ``XDG_CURRENT_DESKTOP`` are recognised by their IPC sockets.
 
 Camera use by other apps
 ------------------------
@@ -179,6 +182,16 @@ _LOGIND_LOCK_DESKTOPS = (
     "deepin",
 )
 
+#: Variables set by tiling window managers / compositors for their IPC (sway
+#: also sets ``I3SOCK``). See ``_standalone_compositor``.
+_COMPOSITOR_SOCKET_VARS = (
+    "SWAYSOCK",
+    "I3SOCK",
+    "HYPRLAND_INSTANCE_SIGNATURE",
+    "NIRI_SOCKET",
+    "WAYFIRE_SOCKET",
+)
+
 #: D-Bus errors meaning "this service / method does not exist here" (as opposed
 #: to a timeout or a busy service), in QtDBus error names and gdbus messages.
 _DBUS_MISSING_MARKERS = (
@@ -291,8 +304,20 @@ def _is_gnome_env(env: Mapping[str, str]) -> bool:
     return any("gnome" in token for token in _desktop_tokens(env))
 
 
+def _standalone_compositor(env: Mapping[str, str]) -> bool:
+    """Whether a tiling window manager / compositor runs the session.
+
+    Such sessions often export ``XDG_CURRENT_DESKTOP=GNOME`` (or KDE) so that
+    portals and settings apps work; their own sockets tell the truth, and then
+    no GNOME or KDE lock screen exists to react to logind or report the lock.
+    """
+    return any(env.get(key) for key in _COMPOSITOR_SOCKET_VARS)
+
+
 def _desktop_handles_logind_lock(env: Mapping[str, str]) -> bool:
     """Whether the desktop's own locker reacts to ``loginctl lock-session``."""
+    if _standalone_compositor(env):
+        return False
     if env.get("KDE_FULL_SESSION"):
         return True
     return any(name in token for token in _desktop_tokens(env) for name in _LOGIND_LOCK_DESKTOPS)
@@ -300,7 +325,7 @@ def _desktop_handles_logind_lock(env: Mapping[str, str]) -> bool:
 
 def _locked_hint_authoritative(env: Mapping[str, str]) -> bool:
     """Desktops whose lock screen always reports itself through logind's ``LockedHint``."""
-    return _is_gnome_env(env) or _is_kde_env(env)
+    return (_is_gnome_env(env) or _is_kde_env(env)) and not _standalone_compositor(env)
 
 
 def _lock_commands(session_id: str | None) -> list[list[str]]:
@@ -333,6 +358,17 @@ def _lock_commands(session_id: str | None) -> list[list[str]]:
         ]
     )
     return commands
+
+
+def _lock_method_label(argv: Sequence[str]) -> str:
+    """How ``doctor`` names a :func:`_lock_commands` entry (ASCII, like the report).
+
+    The D-Bus clients are named with the call they make; "gdbus call" alone
+    would not say what it does.
+    """
+    if argv[0] == "gdbus" or argv[0].startswith("qdbus"):
+        return f"{argv[0]} org.freedesktop.ScreenSaver.Lock"
+    return " ".join(argv[:2])
 
 
 def _display_power_commands(env: Mapping[str, str], on: bool) -> list[list[str]]:
@@ -437,6 +473,38 @@ def _read_text(path: str) -> str:
             return fh.read()
     except OSError:
         return ""
+
+
+#: ``/proc/<pid>/loginuid`` of a process that did not come from a login: (uid_t)-1.
+_AUDIT_UID_UNSET = 0xFFFF_FFFF
+
+
+def _login_uid(proc_dir: str) -> int | None:
+    """The audit login UID of a process; ``None`` when unset or unreadable."""
+    text = _read_text(os.path.join(proc_dir, "loginuid")).strip()
+    if not text.isdigit():
+        return None
+    value = int(text)
+    return None if value == _AUDIT_UID_UNSET else value
+
+
+def _belongs_to_user(entry: os.DirEntry[str], own_login: int | None, uid: int | None) -> bool:
+    """Whether the process at ``entry`` belongs to this user (see ``_locker_running``).
+
+    It does when this user owns its ``/proc`` entry, or when its audit login
+    UID is ours (``own_login``, or ``uid`` when this process has none): the
+    latter survives the setuid tricks of slock & co. A login UID that is unset
+    on either side proves nothing, so then only the owner counts.
+    """
+    if uid is None:
+        return True  # no users to tell apart (not a POSIX system: tests)
+    login = _login_uid(entry.path)
+    if login is not None and login == (own_login if own_login is not None else uid):
+        return True
+    try:
+        return entry.stat(follow_symlinks=False).st_uid == uid
+    except OSError:
+        return False  # exited meanwhile
 
 
 def _is_camera_broker(proc_dir: str) -> bool:
@@ -970,6 +1038,11 @@ class _CameraNotifier(Protocol):
 
     kind: str
 
+    @property
+    def alive(self) -> bool:
+        """False once the notifier failed for good (the watcher then polls)."""
+        ...
+
     def wait(self, timeout: float) -> list[_CameraEvent]: ...
 
     def close(self) -> None: ...
@@ -989,6 +1062,7 @@ _IN_CLOSE_WRITE = 0x0000_0008
 _IN_CLOSE_NOWRITE = 0x0000_0010
 _IN_OPEN = 0x0000_0020
 _AT_FDCWD = -100
+_POLLIN = 0x0001  # <poll.h>; ``select.POLLIN`` does not exist on Windows, where tests also run
 #: struct fanotify_event_metadata: event_len, vers, reserved, metadata_len, mask, fd, pid.
 _FAN_EVENT = struct.Struct("=IBBHQii")
 #: struct inotify_event without its trailing name: wd, mask, cookie, len.
@@ -1056,22 +1130,45 @@ class _FdNotifier:
     def __init__(self, fd: int) -> None:
         self._fd = fd
 
+    @property
+    def alive(self) -> bool:
+        """False once the descriptor failed and was closed (see :meth:`wait`)."""
+        return self._fd >= 0
+
     def wait(self, timeout: float) -> list[_CameraEvent]:
+        """Events that arrive within ``timeout`` seconds (possibly none).
+
+        A failing descriptor is closed and reported once as a forced rescan;
+        :attr:`alive` is then ``False`` so the watcher can fall back to polling.
+        """
         if self._fd < 0:
             time.sleep(max(0.0, timeout))
             return []
         try:
-            ready, _, _ = select.select([self._fd], [], [], max(0.0, timeout))
-            if not ready:
+            if not self._readable(timeout):
                 return []
             data = os.read(self._fd, 16384)
         except BlockingIOError:
             return []
         except (OSError, ValueError) as exc:
-            log.debug("%s read failed: %s", self.kind, exc)
+            log.info("Camera %s stopped working (%s); polling the cameras instead", self.kind, exc)
             self.close()
             return [_CameraEvent(opened=False, foreign=None)]  # force a rescan
         return self._parse(data)
+
+    def _readable(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for the descriptor to have data.
+
+        ``poll``, not ``select``: ``select`` cannot watch descriptors numbered
+        ``FD_SETSIZE`` (1024) or higher, which a busy process may hand out.
+        """
+        make_poller = getattr(select, "poll", None)  # absent on Windows (tests)
+        if make_poller is None:
+            ready, _, _ = select.select([self._fd], [], [], max(0.0, timeout))
+            return bool(ready)
+        poller = make_poller()
+        poller.register(self._fd, _POLLIN)
+        return bool(poller.poll(max(0, math.ceil(timeout * 1000))))
 
     def close(self) -> None:
         fd, self._fd = self._fd, -1
@@ -1179,8 +1276,9 @@ class _CameraWatcher:
     daemon thread keeps the answer fresh while somebody keeps asking and ends
     itself ``idle_stop_s`` after the last question. It rescans when notified of
     an open or close of a camera node (plus a slow safety rescan) or, without
-    notifications, every ``poll_s``. ``threaded=False`` scans inline at most
-    every ``poll_s`` instead (tests).
+    notifications (or once the notifier failed), every ``poll_s``. The first
+    question after the thread (re)started briefly waits for its first scan.
+    ``threaded=False`` scans inline at most every ``poll_s`` instead (tests).
 
     **Refused opens.** When a notifier attributes to another process the close
     of a read-write descriptor of a camera node while we hold a camera
@@ -1204,6 +1302,9 @@ class _CameraWatcher:
     max_cooldown_s = 1800.0
     #: Upper bound for one wait, so stop requests and idleness are noticed.
     max_wait_s = 1.0
+    #: How long the first query after a (re)start waits for a fresh scan. A
+    #: ``/proc`` scan takes milliseconds; this only bounds a pathological one.
+    first_scan_wait_s = 0.5
 
     def __init__(
         self,
@@ -1223,6 +1324,8 @@ class _CameraWatcher:
         self._notifier_factory = notifier_factory
         self._lock = threading.Lock()
         self._wakeup = threading.Event()
+        #: Set by every finished scan; replaced by a fresh one when the thread starts.
+        self._scanned = threading.Event()
         self._thread: threading.Thread | None = None
         self._stopping = False
         self._last_query = -math.inf
@@ -1235,14 +1338,25 @@ class _CameraWatcher:
 
     # ------------------------------------------------------------- public API
     def query(self) -> bool | None:
-        """Latest answer; ``None`` until the first scan finished."""
+        """Latest answer; ``None`` when no scan could tell yet.
+
+        The first question after the thread ended (nobody asked for
+        ``idle_stop_s``, e.g. while tracking was paused or the screen locked)
+        waits up to ``first_scan_wait_s`` for the new thread's first scan: the
+        answer from before the pause may be hours old, and the controller asks
+        exactly then to decide whether the camera may be reopened.
+        """
         now = self._clock()
+        started = False
         with self._lock:
             self._last_query = now
             due = now >= self._next_scan_at
             if self._threaded:
-                self._ensure_thread_locked()
-        if due and not self._threaded:
+                started = self._ensure_thread_locked()
+            scanned = self._scanned
+        if started:
+            scanned.wait(self.first_scan_wait_s)
+        elif due and not self._threaded:
             self.rescan()
         with self._lock:
             return self._state_locked(self._clock())
@@ -1280,16 +1394,24 @@ class _CameraWatcher:
             thread.join(timeout)
 
     # -------------------------------------------------------------- internals
-    def _ensure_thread_locked(self) -> None:
+    def _ensure_thread_locked(self) -> bool:
+        """Start the watcher thread unless it runs; ``True`` when it was started."""
         if self._thread is not None or self._stopping:
-            return
+            return False
         # Nothing watched the nodes since the previous thread ended: the new one
-        # must set up its notifier and rescan at once, not at the old deadline.
+        # must set up its notifier and rescan at once, not at the old deadline,
+        # and the old answer no longer counts (``None`` until that scan is done).
         self._next_scan_at = -math.inf
-        self._thread = threading.Thread(target=self._run, name="camera-watch", daemon=True)
+        self._holders = None
+        self._scanned = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, args=(self._scanned,), name="camera-watch", daemon=True
+        )
         self._thread.start()
+        return True
 
-    def _run(self) -> None:
+    def _run(self, scanned: threading.Event) -> None:
+        """The watcher thread; ``scanned`` is the event its first scan sets."""
         notifier: _CameraNotifier | None = None
         watched: frozenset[str] | None = None
         try:
@@ -1320,6 +1442,15 @@ class _CameraWatcher:
                     self._wakeup.wait(timeout)
                     continue
                 self.handle_events(notifier.wait(timeout))
+                if not notifier.alive:
+                    # Poll from now on (poll_s, not the slow safety rescan). The
+                    # device set stays "watched", so a notifier that keeps failing
+                    # is not re-created in a loop; the next device change or
+                    # thread restart tries again.
+                    notifier.close()
+                    notifier = None
+                    with self._lock:
+                        self._next_scan_at = min(self._next_scan_at, self._clock() + self.poll_s)
         except Exception:
             log.debug("camera watcher stopped by an error", exc_info=True)
         finally:
@@ -1328,6 +1459,9 @@ class _CameraWatcher:
             with self._lock:
                 if self._thread is threading.current_thread():
                     self._thread = None
+            # A thread that died before its first scan must not keep a query
+            # waiting for it. (Its own event: a successor has a new one.)
+            scanned.set()
 
     def _rescan_with(self, devices: set[str] | None) -> None:
         try:
@@ -1341,6 +1475,7 @@ class _CameraWatcher:
             self._next_scan_at = max(self._next_scan_at, now + self.poll_s)
             if holders and self._contention_until is not None:
                 self._contention_confirmed = True
+            self._scanned.set()
 
     def _state_locked(self, now: float) -> bool | None:
         self._settle_contention_locked(now)
@@ -1593,6 +1728,12 @@ class LinuxPlatform(PlatformServices):
         ``lock`` hook). Outside desktops known to listen, it only counts once
         ``LockedHint`` is set or a locker process appeared; otherwise the other
         lockers are tried, and ``False`` tells the caller nothing locked.
+
+        On GNOME and KDE, whose lock screens always set ``LockedHint``, every
+        locker's success is checked that way: GNOME Shell ignores lock requests
+        when locking is disabled by policy (``disable-lock-screen``), while
+        ``loginctl`` and the D-Bus calls still report success. Only a hint that
+        cannot be read at all falls back to trusting the desktop.
         """
         try:
             used = self._lock_with_tools()
@@ -1607,13 +1748,39 @@ class LinuxPlatform(PlatformServices):
             self._locked_cache = None  # the next poll must see the new state
         return True
 
+    def lock_methods(self) -> list[str]:
+        """The screen-lock tools installed here, in the order :meth:`lock_screen` tries them.
+
+        Shown by ``doctor``. Being installed is not proof that a tool locks this
+        session: ``loginctl lock-session`` exists on every systemd system, but on
+        a bare i3 or sway session nothing listens to logind's ``Lock`` signal.
+        Whether one works is only known when it is tried; :meth:`lock_screen`
+        checks that and reports failure. Never raises.
+        """
+        try:
+            handled = _desktop_handles_logind_lock(os.environ)
+            methods: list[str] = []
+            for argv in _lock_commands(None):
+                if shutil.which(argv[0]) is None:
+                    continue
+                label = _lock_method_label(argv)
+                if argv[0] == "loginctl" and not handled:
+                    label += " (works only if a locker such as xss-lock listens to logind)"
+                methods.append(label)
+            return methods
+        except Exception:
+            log.debug("Listing the lock tools failed", exc_info=True)
+            return []
+
     def _lock_with_tools(self) -> str | None:
         session = self._session_id()
-        unconfirmed: str | None = None  # loginctl ran, but no locker reacted in time
+        # Where LockedHint is authoritative, any locker's "success" can be checked.
+        verify_all = session is not None and _locked_hint_authoritative(os.environ)
+        unconfirmed: str | None = None  # a locker ran, but the screen did not lock in time
         for argv in _lock_commands(session):
             if shutil.which(argv[0]) is None:
                 continue
-            if unconfirmed is not None and self._locker_running():
+            if unconfirmed is not None and self._lock_evident(session):
                 return unconfirmed  # a slow locker reacted after all: do not stack another
             result = self._run(argv, _ACTION_TIMEOUT_S)
             if result is None:
@@ -1627,30 +1794,65 @@ class LinuxPlatform(PlatformServices):
                     (result.stderr or "").strip()[:200],
                 )
                 continue
-            if argv[0] == "loginctl" and not self._logind_lock_took_effect(session):
+            if argv[0] == "loginctl":
+                confirmed = self._logind_lock_took_effect(session)
+            else:
+                confirmed = not verify_all or self._lock_confirmed(session, trust_unknown=True)
+            if not confirmed:
                 log.info(
-                    "loginctl lock-session: no screen locker reacted within %.0f s; "
-                    "trying other lockers",
+                    "%s: the screen did not lock within %.0f s; trying other lockers",
+                    name,
                     _LOCK_CONFIRM_S,
                 )
-                unconfirmed = name
+                if unconfirmed is None:
+                    unconfirmed = name
                 continue
             return name
+        # The last attempt may have been answered just after its wait.
+        if unconfirmed is not None and self._lock_evident(session):
+            return unconfirmed
         return None
 
     def _logind_lock_took_effect(self, session: str | None) -> bool:
         """Whether something handled logind's ``Lock`` signal (see :meth:`lock_screen`)."""
-        if _desktop_handles_logind_lock(os.environ):
-            return True
+        env = os.environ
+        if not _desktop_handles_logind_lock(env):
+            return self._lock_confirmed(session, trust_unknown=False)
+        if session is not None and _locked_hint_authoritative(env):
+            return self._lock_confirmed(session, trust_unknown=True)
+        # Cinnamon, MATE, Xfce ... listen to logind, but not all of their lock
+        # screens report the hint: nothing reliable to check.
+        return True
+
+    def _lock_confirmed(self, session: str | None, *, trust_unknown: bool) -> bool:
+        """Wait up to ``_LOCK_CONFIRM_S`` for the lock to show (``LockedHint`` or a locker).
+
+        ``trust_unknown``: count it as locked when the hint could not be read
+        at all (no evidence either way) and no locker process appeared.
+        """
         deadline = self._clock() + _LOCK_CONFIRM_S
+        hint_known = False
         while True:
-            if session is not None and self._logind_locked_hint(session) is True:
-                return True
+            if session is not None:
+                hint = self._logind_locked_hint(session)
+                if hint is True:
+                    return True
+                hint_known = hint_known or hint is not None
             if self._locker_running():
                 return True
             if self._clock() >= deadline:
-                return False
+                return trust_unknown and not hint_known
             self._sleep(_LOCK_CONFIRM_POLL_S)
+
+    def _lock_evident(self, session: str | None) -> bool:
+        """Whether the session shows as locked right now (locker process or hint).
+
+        The process scan comes first: without QtDBus the hint costs a
+        ``loginctl`` launch.
+        """
+        if self._locker_running():
+            return True
+        return session is not None and self._logind_locked_hint(session) is True
 
     # ------------------------------------------------------------- lock state
     def is_session_locked(self) -> bool | None:
@@ -1743,17 +1945,35 @@ class LinuxPlatform(PlatformServices):
         return True, None
 
     def _locker_running(self) -> bool | None:
-        """Whether a screen locker of this user runs; ``None`` without ``/proc``."""
-        if not self._proc_root.is_dir():
+        """Whether a screen locker of this user's login runs; ``None`` without ``/proc``.
+
+        Every process is looked at, not only those owned by this user: slock
+        (and other lockers installed setuid root, e.g. swaylock built for
+        shadow passwords, xlock) run as another user or have dropped privileges
+        in a way that makes their ``/proc`` entry root's. ``comm`` is readable
+        for every process, and so is ``loginuid``, which the audit subsystem
+        sets at login and which no setuid changes: a locker counts as ours when
+        we own it or when its login UID is ours (see :func:`_belongs_to_user`).
+        (Not the audit *session* id: an app started by the systemd user manager
+        has a different one than the graphical session its locker runs in.)
+        Without login UIDs (no audit support) only the owner tells, as before.
+        """
+        root = str(self._proc_root)
+        if not os.path.isdir(root):
             return None
+        own_login = _login_uid(os.path.join(root, "self"))
+        uid = _getuid()
         try:
-            processes = self._user_processes()
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if not entry.name.isdigit():
+                        continue
+                    comm = _read_text(os.path.join(entry.path, "comm")).strip()
+                    if comm in _LOCKER_COMMS and _belongs_to_user(entry, own_login, uid):
+                        return True
         except OSError:
             return None
-        return any(
-            _read_text(os.path.join(path, "comm")).strip() in _LOCKER_COMMS
-            for _pid, path in processes
-        )
+        return False
 
     def _session_id(self) -> str | None:
         """The logind session of this desktop.

@@ -36,12 +36,18 @@ def synth_features(
     noise: float = 0.0,
     camera_x: float = 1920.0,
     head_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    *,
+    head_share: float = 0.55,
+    pitch_share: float = 0.8,
 ) -> np.ndarray:
     """8-D features (yaw, pitch, roll, tx, ty, tz, iris_h, iris_v) for gaze ``points``.
 
     ``head_offset`` (cm; right, down, back) moves the user's head away from where
     it was while calibrating: ``(0, 8, 0)`` sits 8 cm lower, ``(0, 0, 12)`` leans
-    back. It does not change the random stream, so equal seeds stay comparable.
+    back. ``head_share`` is the mean share of a gaze shift the head makes (the
+    eyes do the rest), ``pitch_share`` scales it for vertical shifts: changing
+    them models a user who moves the head more or less than while calibrating.
+    None of these change the random stream, so equal seeds stay comparable.
     """
     pts = np.asarray(points, dtype=float)
     n = len(pts)
@@ -53,9 +59,9 @@ def synth_features(
     hz = 65.0 + rng.normal(0, 3.0, n) + dz
     gaze_yaw = np.degrees(np.arctan2(target_x - hx, hz))
     gaze_pitch = np.degrees(np.arctan2(target_y - hy, hz))
-    head_share = np.clip(0.55 + rng.normal(0, 0.12, n), 0.1, 0.95)
-    yaw = head_share * gaze_yaw + rng.normal(0, 2.0, n)
-    pitch = 0.8 * head_share * gaze_pitch + rng.normal(0, 1.5, n)
+    share = np.clip(head_share + rng.normal(0, 0.12, n), 0.1, 0.95)
+    yaw = share * gaze_yaw + rng.normal(0, 2.0, n)
+    pitch = pitch_share * share * gaze_pitch + rng.normal(0, 1.5, n)
     iris_h = 0.5 + 0.42 * np.sin(np.radians(gaze_yaw - yaw))
     iris_v = 0.05 + 0.20 * np.sin(np.radians(gaze_pitch - pitch))
     roll = rng.normal(0, 1.5, n)

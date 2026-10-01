@@ -64,7 +64,7 @@ body:
     id: version
     attributes:
       label: Eye Tracker version
-      description: Shown in About, or run `eye-tracker --version`.
+      description: Shown in About, or run the command-line tool (see below) with `--version`.
       placeholder: "0.1.0"
     validations:
       required: true
@@ -90,12 +90,13 @@ body:
       label: Output of `eye-tracker doctor`
       description: |
         Paste the whole report. It lists versions, monitors, backends, permissions and paths (no images).
-        You can also copy it from **Settings → Diagnostics → Copy**. From a terminal:
+        You can also copy it from **Settings → Diagnostics → Copy report**. From a terminal:
 
-        - Windows installer: `"%LOCALAPPDATA%\Programs\Eye Tracker\eye-tracker-cli.exe" doctor`
-        - Windows portable: `eye-tracker-cli.exe doctor` in the extracted folder
+        - Windows installer: `eye-tracker doctor` in a new terminal (if you unticked the PATH
+          option while installing: `.\eye-tracker.exe doctor` in `%LOCALAPPDATA%\Programs\Eye Tracker`)
+        - Windows portable: `.\eye-tracker-cli.exe doctor` in the extracted folder
         - macOS: `"/Applications/Eye Tracker.app/Contents/MacOS/eye-tracker-cli" doctor`
-        - Linux AppImage: `./EyeTracker-*.AppImage doctor`
+        - Linux AppImage: the AppImage file itself, e.g. `./EyeTracker-*.AppImage doctor`
         - Linux tarball: `./eye-tracker/eye-tracker doctor`
         - From source: `uv run eye-tracker doctor`
 
@@ -109,8 +110,9 @@ body:
     attributes:
       label: Relevant log lines (optional)
       description: |
-        The doctor report shows where the log file is. Start the app with `--log-level DEBUG`
-        for more detail, reproduce the problem, then paste the lines around it.
+        The doctor report shows where the log file is. For more detail, set
+        **Settings → General → Log level** to Debug, reproduce the problem, then paste the
+        lines around it.
       render: text
     validations:
       required: false

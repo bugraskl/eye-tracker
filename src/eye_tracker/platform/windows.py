@@ -772,12 +772,17 @@ class _CameraUser:
 
 @dataclass(frozen=True, slots=True)
 class _Process:
-    """A running process, as far as it matters for camera-session liveness."""
+    """A running process, as listed for the camera-session liveness check.
+
+    Only what every process yields cheaply. The creation time is read later,
+    for the few processes that match a session (see
+    ``WindowsPlatform._process_created``): for processes of other accounts
+    psutil can only get it from a full system snapshot, several milliseconds
+    each, which for a whole listing stalled the GUI thread for about a second.
+    """
 
     pid: int
     name: str  # lower-case executable name
-    #: Creation time as a ``FILETIME`` tick count (``None`` when unreadable).
-    created: int | None
 
 
 def _session_start(values: dict[str, Any]) -> int | None:
@@ -1165,20 +1170,22 @@ class WindowsPlatform(PlatformServices):
 
         The process must match the entry (full executable path, or package
         family) and must have been started before the session was: a copy of
-        the app launched after a crash never touched the camera.
+        the app launched after a crash never touched the camera. The cheap
+        identity checks come first, so the creation time is only read for the
+        handful of processes that can be the app at all.
         """
-        slack = _SESSION_START_SLACK
-        candidates = [p for p in processes if p.created is None or p.created <= user.start + slack]
         api = self._api
         if user.packaged:
             family = user.app.lower()
             return any(
-                (api.process_package_family_name(p.pid) or "").lower() == family for p in candidates
+                (api.process_package_family_name(p.pid) or "").lower() == family
+                and self._started_before(p.pid, user.start)
+                for p in processes
             )
         target = _norm_path(user.executable)
         name = ntpath.basename(target)
-        for process in candidates:
-            if process.name != name:
+        for process in processes:
+            if process.name != name or not self._started_before(process.pid, user.start):
                 continue
             exe = self._process_exe(process.pid)
             # A path we may not read (an elevated process) gets the benefit of the doubt.
@@ -1186,33 +1193,46 @@ class WindowsPlatform(PlatformServices):
                 return True
         return False
 
+    def _started_before(self, pid: int, session_start: int) -> bool:
+        """Whether ``pid`` may have opened a camera session that began at ``session_start``.
+
+        An unreadable creation time gets the benefit of the doubt.
+        """
+        created = self._process_created(pid)
+        return created is None or created <= session_start + _SESSION_START_SLACK
+
     def _processes(self) -> list[_Process] | None:
-        """Running processes with name and creation time; ``None`` if they cannot be listed."""
+        """Running processes (pid and name); ``None`` if they cannot be listed.
+
+        Only the name is requested: it is cheap for every process, whereas
+        asking psutil for the creation time as well costs a full system
+        snapshot per process of another account (see :class:`_Process`).
+        """
         try:
             import psutil
         except Exception:
             return None
         processes: list[_Process] = []
         try:
-            for proc in psutil.process_iter(["name", "create_time"]):
-                info = proc.info
-                name = info.get("name")
-                if not name:
-                    continue
-                created = info.get("create_time")
-                processes.append(
-                    _Process(
-                        pid=int(proc.pid),
-                        name=str(name).lower(),
-                        created=_unix_to_filetime(created)
-                        if isinstance(created, (int, float))
-                        else None,
-                    )
-                )
+            for proc in psutil.process_iter(["name"]):
+                name = proc.info.get("name")
+                if name:
+                    processes.append(_Process(pid=int(proc.pid), name=str(name).lower()))
         except Exception:
             log.debug("Could not list processes", exc_info=True)
             return None
         return processes
+
+    @staticmethod
+    def _process_created(pid: int) -> int | None:
+        """Creation time of ``pid`` as a ``FILETIME`` tick count; ``None`` when unreadable."""
+        try:
+            import psutil
+
+            created = psutil.Process(pid).create_time()
+        except Exception:
+            return None
+        return _unix_to_filetime(created) if isinstance(created, (int, float)) else None
 
     @staticmethod
     def _process_exe(pid: int) -> str | None:

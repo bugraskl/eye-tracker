@@ -7,6 +7,7 @@ a synthetic image written to a temporary directory.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -14,12 +15,13 @@ import cv2
 import numpy as np
 import pytest
 
-from eye_tracker import __version__, diagnostics, paths
+from eye_tracker import __version__, cli, diagnostics, ipc, paths
 from eye_tracker.config import Settings
 from eye_tracker.gaze.calibration import CalibrationSample
 from eye_tracker.gaze.model import GazeModel
 from eye_tracker.gaze.store import CalibrationData, save_calibration
 from eye_tracker.platform.base import PlatformServices
+from eye_tracker.platform.hotkeys import Hotkey, HotkeyManager, parse_hotkey
 from eye_tracker.types import Monitor, Rect, layout_signature, virtual_bounds
 from eye_tracker.vision.backends import MODEL_FILES
 from eye_tracker.vision.camera import CameraError
@@ -111,7 +113,13 @@ def test_collect_report_structure(env: Path) -> None:
     assert report["settings"] == {"file_exists": False, "non_default": {}}
     assert report["calibration"] == {"exists": False}
     assert isinstance(report["autostart"]["command"], str)
-    assert 'Not calibrated yet: run "eye-tracker calibrate".' in report["problems"]
+    # The command is spelled as this copy is run (packages have no "eye-tracker").
+    command = diagnostics._redacted_command(cli.cli_command("calibrate"))
+    assert report["app"]["command_line"] == diagnostics._redacted_command(cli.cli_command())
+    assert (
+        f"Not calibrated yet: choose 'Calibrate...' in the tray menu or run '{command}'."
+        in report["problems"]
+    )
     # The fake offscreen screen is not reported as a one-monitor setup.
     assert not any("Only one monitor" in p for p in report["problems"])
 
@@ -490,6 +498,38 @@ def test_a_stale_accessibility_grant_is_explained() -> None:
     assert problems[0].isascii()
 
 
+class _MacCliServices(_MacLikeServices):
+    """eye-tracker-cli on macOS: the terminal's permission says nothing about the app."""
+
+    def permissions(self) -> dict[str, bool | None]:
+        return {"camera": True, "accessibility": None}
+
+    def accessibility_status(self) -> str:
+        return "unknown"
+
+
+def test_the_macos_cli_explains_why_accessibility_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(diagnostics.sys, "platform", "darwin")
+    monkeypatch.setattr(diagnostics.paths, "is_frozen", lambda: True)
+    macos = tmp_path / "Eye Tracker.app" / "Contents" / "MacOS"
+    monkeypatch.setattr(diagnostics.sys, "executable", str(macos / "eye-tracker-cli"))
+    section = diagnostics._platform_section(_MacCliServices())
+    assert "accessibility" not in section  # unknown: no verdict either way
+    note = section["notes"]["accessibility"]
+    assert "the terminal" in note
+    assert "Settings > Diagnostics" in note
+    assert note.isascii()
+    assert diagnostics._problems({"platform": section}) == []
+
+    # The app itself (or a known permission) needs no such note.
+    monkeypatch.setattr(diagnostics.sys, "executable", str(macos / "Eye Tracker"))
+    assert "notes" not in diagnostics._platform_section(_MacCliServices())
+    monkeypatch.setattr(diagnostics.sys, "executable", str(macos / "eye-tracker-cli"))
+    assert "notes" not in diagnostics._platform_section(_MacLikeServices())
+
+
 class _WaylandServices(PlatformServices):
     name = "fake-linux"
 
@@ -522,10 +562,173 @@ def test_an_installed_mediapipe_is_reported_as_a_problem(
     monkeypatch.setattr(diagnostics.importlib.metadata, "version", version)
     report = diagnostics.collect_report()
     assert report["libraries"]["unwanted"] == {"mediapipe": "0.10.14"}
-    (problem,) = [p for p in report["problems"] if "mediapipe" in p]
+    # (The calibrate hint names this test's --config-dir, which contains "mediapipe".)
+    (problem,) = [p for p in report["problems"] if p.startswith("The mediapipe package")]
     assert "does not use it" in problem
     assert "telemetry" in problem
     assert "pip uninstall mediapipe" in problem
     assert problem.isascii()
     # The text report shows it too.
     assert "mediapipe" in diagnostics.format_report(report)
+
+
+# ------------------------------------------------------------- second review fixes
+@pytest.fixture
+def home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """A fake home directory whose account name is ``alice``."""
+    fake = tmp_path / "home" / "alice"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake))
+    return fake
+
+
+def test_redact_replaces_the_home_directory_anywhere(home: Path) -> None:
+    """Regression (r2-ui-app-03): only a leading home directory was replaced."""
+    quoted = f'"{home / "AppData" / "Zoom.exe"}"'  # Explorer's "Copy as path"
+    assert diagnostics._redact(quoted) == f'"{Path("~") / "AppData" / "Zoom.exe"}"'
+    assert diagnostics._redact(f"see {home}") == "see ~"
+    assert diagnostics._redact(home.as_posix() + "/x.log") == "~/x.log"  # Qt's slashes
+    # A name that merely starts with the account name is someone else's.
+    assert diagnostics._redact(f"{home}2") == f"{home}2"
+    assert diagnostics._redact(f"{home}.old") == f"{home}.old"
+    if sys.platform == "win32":  # case-insensitive file system
+        assert diagnostics._redact(str(home).upper()) == "~"
+    nested = diagnostics._redact_tree({"a": [str(home / "x"), {"b": (str(home),)}], "n": 3})
+    assert nested == {"a": [str(Path("~") / "x"), {"b": ["~"]}], "n": 3}
+
+
+def test_error_texts_do_not_reveal_the_home_directory(home: Path) -> None:
+    def unreadable() -> None:
+        # str() of an OSError shows the file name's repr (doubled backslashes).
+        raise PermissionError(13, "Permission denied", str(home / "cfg" / "settings.json"))
+
+    error = diagnostics._safe(unreadable)["error"]
+    assert error.startswith("PermissionError: [Errno 13] Permission denied")
+    assert "alice" not in error
+    assert "~" in error
+
+
+def test_quoted_app_paths_and_camera_serials_stay_out_of_the_report(env: Path, home: Path) -> None:
+    settings = Settings()
+    zoom = home / "AppData" / "Roaming" / "Zoom" / "bin" / "Zoom.exe"
+    settings.privacy.pause_for_apps = [f'"{zoom}"', "obs64.exe"]
+    settings.camera.device = "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_A1B2C3D4-video-index0"
+    settings.save(paths.settings_file())
+    report = diagnostics.collect_report()
+    non_default = report["settings"]["non_default"]
+    apps = non_default["privacy.pause_for_apps"]
+    assert apps[0].startswith('"~')
+    assert apps[0].endswith('Zoom.exe"')
+    assert apps[1] == "obs64.exe"
+    assert non_default["camera.device"] == "device usb-046d_HD_Pro_Webcam_C920_*-video-index0"
+    text = diagnostics.format_report(report)
+    assert "alice" not in text
+    assert "A1B2C3D4" not in text
+
+
+def test_describe_camera_devices() -> None:
+    assert diagnostics._describe_device("/dev/video2") == "device video2"
+    by_id = "/dev/v4l/by-id/usb-Generic_USB2.0_HD_UVC_WebCam_0x0001-video-index1"
+    assert (
+        diagnostics._describe_device(by_id)
+        == "device usb-Generic_USB2.0_HD_UVC_WebCam_*-video-index1"
+    )
+
+
+class _LiveHotkeys(HotkeyManager):
+    """The app's own manager: it knows what the OS accepted."""
+
+    supported = True
+    name = "live"
+
+    def __init__(self, registered: dict[str, str], errors: dict[str, str]) -> None:
+        super().__init__()
+        self._live = {name: parse_hotkey(text) for name, text in registered.items()}
+        self._errors.update(errors)
+
+    @property
+    def registered(self) -> dict[str, Hotkey]:
+        return dict(self._live)
+
+
+@pytest.fixture
+def fake_hotkeys(monkeypatch: pytest.MonkeyPatch, env: Path) -> None:
+    """Three valid hotkeys, checked by a manager that sees no layout conflict."""
+    from eye_tracker.platform import hotkeys
+
+    monkeypatch.setattr(hotkeys, "create_hotkey_manager", _FakeHotkeyManager)
+    settings = Settings()
+    settings.hotkeys.toggle_tracking = "ctrl+alt+meta+t"
+    settings.hotkeys.toggle_privacy = "ctrl+alt+meta+p"
+    settings.hotkeys.recalibrate = "ctrl+alt+meta+c"
+    settings.save(paths.settings_file())
+
+
+def test_doctor_shows_why_a_hotkey_was_not_registered(env: Path, fake_hotkeys: None) -> None:
+    """Regression (r2-docs-12): doctor never knew what the OS refused."""
+    live = _LiveHotkeys(
+        {"toggle_tracking": "ctrl+alt+meta+t"},
+        {"toggle_privacy": "Ctrl+Alt+Win+P is already used by another application"},
+    )
+    report = diagnostics.collect_report(hotkey_manager=live)
+    assert report["hotkeys"]["registration"] == {
+        "toggle_tracking": "registered",
+        "toggle_privacy": "not registered: Ctrl+Alt+Win+P is already used by another application",
+        "recalibrate": "not registered: reason unknown",
+    }
+    assert (
+        "Hotkey toggle_privacy could not be registered: Ctrl+Alt+Win+P is already used by "
+        "another application." in report["problems"]
+    )
+    text = diagnostics.format_report(report)
+    assert "registration.toggle_tracking" in text
+
+
+def test_doctor_asks_the_running_instance_about_its_hotkeys(env: Path, fake_hotkeys: None) -> None:
+    # Nothing running: nobody can know what the OS would accept.
+    report = diagnostics.collect_report()
+    assert report["hotkeys"]["registration"] == diagnostics._HOTKEYS_NOT_RUNNING
+    assert not any("could not be registered" in p for p in report["problems"])
+
+    status: dict[str, Any] = {"state": "tracking"}
+    server = ipc.InstanceServer(lambda command: json.dumps(status))
+    assert server.listen()
+    try:
+        # An instance that does not report its hotkeys (an older version).
+        report = diagnostics.collect_report()
+        assert report["hotkeys"]["registration"] == diagnostics._HOTKEYS_NOT_REPORTED
+
+        status["hotkeys"] = {
+            "registered": ["toggle_tracking", "recalibrate"],
+            "errors": {"toggle_privacy": "Ctrl+Alt+Win+P is already used by another application"},
+        }
+        report = diagnostics.collect_report()
+        assert report["hotkeys"]["registration"] == {
+            "toggle_tracking": "registered",
+            "toggle_privacy": "not registered: Ctrl+Alt+Win+P is already used by another "
+            "application",
+            "recalibrate": "registered",
+        }
+    finally:
+        server.close()
+
+
+class _LinuxServices(PlatformServices):
+    name = "fake-linux"
+
+    def lock_methods(self) -> list[str]:
+        return ["loginctl lock-session", "xdg-screensaver lock"]
+
+
+def test_linux_report_says_which_lock_tools_exist_and_that_locking_is_untested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (r2-docs-13): "lock yes" read as "locking works"."""
+    monkeypatch.setattr(diagnostics.sys, "platform", "linux")
+    section = diagnostics._platform_section(_LinuxServices())
+    assert section["lock_methods"] == ["loginctl lock-session", "xdg-screensaver lock"]
+    note = section["notes"]["lock"]
+    assert "known when it is tried" in note
+    assert "Could not lock the screen" in note
+    assert note.isascii()
+    # Platforms without the query report the capability alone.
+    assert "lock_methods" not in diagnostics._platform_section(PlatformServices())

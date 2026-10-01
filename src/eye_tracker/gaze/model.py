@@ -38,9 +38,25 @@ Four details keep the model well behaved:
   cubed and could throw the prediction thousands of pixels off.
 * Clipping hides how far outside the calibrated range a frame lies, and the
   clipped polynomial may even bend back onto the screens. :meth:`GazeModel.looks_away`
-  therefore reports gaze-direction features far beyond their calibrated range
-  (the user reads a phone on the desk or turns to a colleague), so such frames
-  are treated as looking away instead of as gaze at the nearest monitor.
+  therefore reports gaze far off every monitor (the user reads a phone on the
+  desk or turns to a colleague), so such frames are treated as looking away
+  instead of as gaze at the nearest monitor.
+
+Looking away is judged from the *combined* gaze direction: a second, purely
+linear ridge fit on the same standardised features, evaluated without clipping
+the gaze-direction features (head position and roll stay clipped, so leaning
+back or sitting lower cannot throw it off). Linear extrapolation is monotone,
+so gaze well below or beside the screens lands well outside them. Head rotation
+and eye-in-head offset are complementary - the same point can be looked at with
+more head and less eye - and a fit on both keeps its estimate on the screens
+when the user shares the work differently than while calibrating, where testing
+each feature against its own calibrated range would call such gaze "away". The
+strong ridge keeps the fit from leaning on either of two nearly collinear
+features. Gaze at a monitor whose calibration dots were all skipped (which
+``calibration.evaluate`` reports) is no longer "away" merely because it lies
+beyond the calibrated range; the clipped model places it on or next to that
+monitor. Models saved before this estimate existed fall back to the per-feature
+range test (see :data:`LOOK_AWAY_EXCESS`).
 """
 
 from __future__ import annotations
@@ -54,7 +70,7 @@ from typing import Any
 
 import numpy as np
 
-from ..types import Rect
+from ..types import Monitor, Rect, nearest_monitor
 
 log = logging.getLogger(__name__)
 
@@ -72,19 +88,35 @@ CLIP_MARGIN = 0.5
 DEFAULT_ALPHAS: tuple[float, ...] = (0.01, 0.1, 1.0, 10.0, 100.0)
 SUPPORTED_DEGREES: tuple[int, ...] = (1, 2, 3)
 
-#: A frame looks away from every monitor when one of its gaze-direction features
-#: lies more than this fraction of its calibrated range beyond that range (see
-#: :meth:`GazeModel.looks_away`). Calibration dots stop 10 % short of the screen
-#: edges, so gaze at an edge lies about 0.125 of the range beyond the calibrated
-#: range; head sway and per-frame noise mostly stay inside the range because it
-#: was measured with them. In synthetic tests (two and three monitors, posture
-#: changes of 8-12 cm included) fewer than 0.3 % of on-screen frames, corners
-#: included, exceed 0.25, while about half of the frames of gaze 40 cm below the
-#: screens and nearly all at 60-80 cm (a phone or papers on the desk) do. Treated
-#: as "no gaze", every such frame restarts the switch dwell, so even partial
-#: detection keeps a glance at the phone from switching monitors. Lower values
-#: catch more of the nearer glances at the cost of occasionally dropping frames
-#: of gaze near the screen edges.
+#: A frame looks away from every monitor when the linear gaze estimate (see the
+#: module docstring) lies more than this fraction of the nearest monitor's
+#: diagonal outside that monitor: about 12 cm beyond the edge of a 24" screen.
+#: In synthetic tests (two, three and stacked monitors; posture changes of
+#: 5-12 cm, and users who turn the head 25 % more or less than while
+#: calibrating) at most 0.1 % of on-screen frames, edges and corners included,
+#: exceed it; the worst case tried - nodding 40 % more while sitting 5 cm
+#: higher - flags up to 5 % of the frames on the taskbar, where the per-feature
+#: test flagged up to 80 %. Over 90 % of the frames of gaze 30 cm below the
+#: screens and practically all at 40-80 cm (a phone or papers on the desk)
+#: exceed it. Treated as "no gaze", every such frame restarts the switch dwell,
+#: so even partial detection keeps a glance at the phone from switching monitors.
+LOOK_AWAY_MARGIN = 0.2
+
+#: Ridge strength of that linear estimate (standardised features, targets
+#: normalised to the desktop). Stronger than the gaze model's usual choice:
+#: head and eye features are nearly collinear during a calibration, and an
+#: even split between them keeps the estimate on the screens when the user
+#: later moves the head more or less, at a negligible cost in slope.
+LOOK_AWAY_ALPHA = 10.0
+
+#: Fallback for models saved without the linear estimate: a frame looks away
+#: when one of its gaze-direction features lies more than this fraction of its
+#: calibrated range beyond that range. Calibration dots stop 10 % short of the
+#: screen edges, so gaze at an edge lies about 0.125 of the range beyond it.
+#: This test is weaker (about half of the frames of gaze 40 cm below the
+#: screens) and flags on-screen gaze once the user moves the head more or less
+#: than while calibrating; recalibrating, or a refit by adaptive learning,
+#: replaces it with the linear estimate.
 LOOK_AWAY_EXCESS = 0.25
 
 # A more complex candidate (higher degree, smaller alpha) must beat the simpler
@@ -121,6 +153,8 @@ class GazeModel:
         self._lo: np.ndarray | None = None
         self._hi: np.ndarray | None = None
         self._coef: np.ndarray | None = None  # (n_terms, 2), in normalised target space
+        # (1 + d, 2): the linear estimate behind looks_away (None: saved without it).
+        self._linear_coef: np.ndarray | None = None
         self._bounds: Rect | None = None
 
     # ---------------------------------------------------------------- properties
@@ -172,7 +206,12 @@ class GazeModel:
         mean, std = _standardisation(X_arr)
         A = _design((X_arr - mean) / std, self.degree, self._nonlinear)
         AtW = A.T * w
-        self._coef = _solve_ridge(AtW @ A, AtW @ _normalise(Y_arr, bounds), self.alpha)
+        lhs, rhs = AtW @ A, AtW @ _normalise(Y_arr, bounds)
+        self._coef = _solve_ridge(lhs, rhs, self.alpha)
+        # Every design starts with the linear columns [1, z], so the linear fit
+        # behind looks_away is the leading block of the same normal equations.
+        k = 1 + X_arr.shape[1]
+        self._linear_coef = _solve_ridge(lhs[:k, :k], rhs[:k], LOOK_AWAY_ALPHA)
         self._mean, self._std = mean, std
         self._lo, self._hi = X_arr.min(axis=0), X_arr.max(axis=0)
         self._bounds = bounds
@@ -210,32 +249,81 @@ class GazeModel:
             excess = np.maximum(np.maximum(self._lo - X_arr, X_arr - self._hi), 0.0) / span
         return excess[0] if arr.ndim == 1 else excess
 
+    @property
+    def has_linear_estimate(self) -> bool:
+        """Whether :meth:`looks_away` can use the combined gaze direction (models
+        fitted by this version; older files fall back to the per-feature test)."""
+        return self._linear_coef is not None
+
     def looks_away(
         self,
         x: np.ndarray,
         features: Sequence[int] | None = None,
         threshold: float = LOOK_AWAY_EXCESS,
+        *,
+        monitors: Sequence[Monitor] | None = None,
+        margin: float = LOOK_AWAY_MARGIN,
     ) -> bool:
         """Whether the feature vector ``x`` ``(d,)`` shows gaze away from every monitor.
 
-        True when one of the gaze-direction ``features`` (indices; default
-        :attr:`nonlinear`) lies more than ``threshold`` of its calibrated range
-        outside that range (see :data:`LOOK_AWAY_EXCESS`). Head position and roll
-        must not take part, or leaning back would count as looking away, so this
-        is False when the gaze-direction features are unknown (``features`` and
-        :attr:`nonlinear` both ``None``, as for models saved before
-        ``nonlinear`` existed): pass the backend's indices for those.
+        With ``monitors`` (the layout the model was calibrated for) and a model
+        that has the linear estimate (:attr:`has_linear_estimate`): True when
+        that estimate of the gaze point lies more than ``margin`` times the
+        nearest monitor's diagonal outside it (see :data:`LOOK_AWAY_MARGIN` and
+        the module docstring). The gaze-direction ``features`` (indices; default
+        :attr:`nonlinear`) extrapolate freely; the others are clipped to their
+        calibrated range, since leaning back is not looking away.
+
+        Otherwise the fallback: True when one of the gaze-direction features
+        lies more than ``threshold`` of its calibrated range outside that range
+        (see :data:`LOOK_AWAY_EXCESS`).
+
+        Either way this is False when the gaze-direction features are unknown
+        (``features`` and :attr:`nonlinear` both ``None``, as for models saved
+        before ``nonlinear`` existed; pass the backend's indices for those), and
+        for non-finite features: a broken frame never reads as "looking away".
         """
         indices = self._nonlinear if features is None else _as_indices(features)
         arr = np.asarray(x, dtype=np.float64)
         if arr.ndim != 1:
             raise ValueError(f"expected one feature vector, got shape {arr.shape}")
+        if monitors and self._linear_coef is not None:
+            _, X_arr = self._features(arr)
+            if not indices:
+                return False
+            _check_indices(indices, X_arr.shape[1])
+            point = self._linear_estimate(X_arr[0], indices)
+            if point is None:
+                return False
+            monitor, distance = nearest_monitor(monitors, *point)
+            return distance > margin * monitor.rect.diagonal
         excess = self.extrapolation(arr)
         if not indices:
             return False
         _check_indices(indices, excess.shape[0])
         # NaN compares False, so a broken feature never reads as "looking away".
         return bool(np.max(excess[list(indices)]) > threshold)
+
+    def _linear_estimate(
+        self, x: np.ndarray, gaze_indices: tuple[int, ...]
+    ) -> tuple[float, float] | None:
+        """The linear gaze estimate for ``x`` ``(d,)`` in global pixels, with only the
+        features other than ``gaze_indices`` clipped (``None`` if not finite)."""
+        assert self._linear_coef is not None
+        assert self._mean is not None
+        assert self._std is not None
+        assert self._bounds is not None
+        if self._lo is not None and self._hi is not None:
+            span = self._hi - self._lo
+            clipped = np.clip(x, self._lo - CLIP_MARGIN * span, self._hi + CLIP_MARGIN * span)
+            free = np.zeros(x.shape[0], dtype=bool)
+            free[list(gaze_indices)] = True
+            x = np.where(free, x, clipped)
+        z = (x - self._mean) / self._std
+        px, py = _denormalise(np.concatenate(([1.0], z)) @ self._linear_coef, self._bounds)
+        if not (math.isfinite(px) and math.isfinite(py)):
+            return None
+        return (float(px), float(py))
 
     def _features(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """``(input as an array, input as an (n, d) matrix)``, with the length checked."""
@@ -273,6 +361,9 @@ class GazeModel:
                     "bounds": self._bounds.to_list(),
                 }
             )
+            if self._linear_coef is not None:
+                # Absent in older files, which then use the per-feature test.
+                out["linear_coef"] = self._linear_coef.tolist()
         return out
 
     @classmethod
@@ -301,6 +392,11 @@ class GazeModel:
             bounds = Rect.from_list(d["bounds"])
             lo = _vector(d["lo"], "lo") if "lo" in d else None
             hi = _vector(d["hi"], "hi") if "hi" in d else None
+            linear = (
+                np.asarray(d["linear_coef"], dtype=np.float64)
+                if d.get("linear_coef") is not None
+                else None
+            )
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             # OverflowError: int(inf) for a bounds value such as 1e400 or Infinity.
             raise ValueError(f"invalid model data: {exc}") from exc
@@ -318,13 +414,17 @@ class GazeModel:
             if lo.shape != (n,) or hi.shape != (n,) or np.any(hi < lo):
                 raise ValueError("model clip range is inconsistent")
             arrays += [lo, hi]
+        if linear is not None:
+            if linear.shape != (1 + n, 2):
+                raise ValueError("model arrays have inconsistent shapes")
+            arrays.append(linear)
         if not all(np.all(np.isfinite(a)) for a in arrays):
             raise ValueError("model contains non-finite numbers")
         if np.any(std <= 0.0) or bounds.w <= 0 or bounds.h <= 0:
             raise ValueError("model scale parameters must be positive")
 
         model._mean, model._std, model._lo, model._hi = mean, std, lo, hi
-        model._coef, model._bounds = coef, bounds
+        model._coef, model._bounds, model._linear_coef = coef, bounds, linear
         return model
 
 

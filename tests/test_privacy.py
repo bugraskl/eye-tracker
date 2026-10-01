@@ -1,17 +1,20 @@
 """Tests for scripts/check_privacy.py, the "no network, no frames on disk" guard.
 
 It checks the source tree and (``--bundle``) the frozen PyInstaller output; the
-bundle tests use small synthetic PE, ELF and Mach-O files built here.
+bundle tests use small synthetic PE, ELF and Mach-O files built here, and
+PyInstaller archives written with PyInstaller's own writers.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import struct
 import subprocess
 import sys
 import textwrap
+import zipfile
 from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
@@ -672,6 +675,12 @@ def test_clean_bundle_passes_with_allowed_networking(tmp_path: Path) -> None:
             ["getaddrinfo", "gethostbyaddr_r", "gethostbyname_r", "getnameinfo"],
         ),
         ("_internal/libpython3.12.so.1.0", [], ["getaddrinfo", "getnameinfo"]),
+        # X session management, linked by Qt's xcb plugin (xtrans and sm_genid use
+        # the resolver; not measured on a runner, so the whole resolver is covered).
+        ("_internal/libSM.so.6", ["libICE.so.6", "libuuid.so.1"], ["getaddrinfo", "gethostbyname"]),
+        ("_internal/libICE.so.6", [], ["getaddrinfo", "getnameinfo", "gethostbyname_r"]),
+        # PySide6's QtNetwork bindings, on Linux, Windows and macOS.
+        ("_internal/PySide6/QtNetwork.abi3.so", ["libQt6Network.so.6", "libQt6Core.so.6"], []),
     ],
 )
 def test_linux_system_libraries_are_allowed(
@@ -680,6 +689,320 @@ def test_linux_system_libraries_are_allowed(
     root = _bundle(tmp_path, {relative: _elf(needed, [*undefined, "malloc"])})
     result = check_privacy.scan_bundle(root)
     assert result.ok, [str(v) for v in result.violations]
+
+
+def test_gio_fails_the_gate(tmp_path: Path) -> None:
+    """r2-packaging-01: GLib's GIO (pulled in by the GTK3 platform theme) resolves
+    host names; the spec keeps it out of the bundle instead of allowing it."""
+    gio = _elf(["libglib-2.0.so.0"], ["getaddrinfo", "getnameinfo", "res_nquery", "malloc"])
+    result = check_privacy.scan_bundle(_bundle(tmp_path, {"_internal/libgio-2.0.so.0": gio}))
+    assert {f.detail for f in result.violations} == {
+        "imports getaddrinfo",
+        "imports getnameinfo",
+        "imports res_nquery",
+    }
+
+
+def test_qt_network_plugins_and_qtnetwork_users_fail(tmp_path: Path) -> None:
+    """r2-packaging-05: Qt's VNC platform plugin (a TCP server), TLS backends and the
+    TUIO listener fail by path, and anything but the QtNetwork bindings that links
+    Qt's network library fails too."""
+    root = _bundle(
+        tmp_path,
+        {
+            "_internal/PySide6/Qt/plugins/platforms/libqvnc.so": _elf(
+                ["libQt6Network.so.6", "libQt6Gui.so.6"]
+            ),
+            "_internal/PySide6/plugins/tls/qschannelbackend.dll": _pe(["Qt6Network.dll"]),
+            "_internal/PySide6/Qt/plugins/generic/libqtuiotouchplugin.so": _elf(
+                ["libQt6Network.so.6"]
+            ),
+            "Contents/Frameworks/PySide6/Qt/plugins/networkinformation/libqscnetworkreachability"
+            ".dylib": _macho(["@rpath/QtNetwork.framework/Versions/A/QtNetwork"]),
+            # Not plugins of a networking kind, but they gained a QtNetwork dependency.
+            "_internal/PySide6/Qt/lib/libQt6Foo.so.6": _elf(["libQt6Network.so.6"]),
+            # Fine: the bindings the app uses for QLocalServer/QLocalSocket...
+            "_internal/PySide6/QtNetwork.pyd": _pe(["Qt6Network.dll", "Qt6Core.dll"]),
+            "Contents/Frameworks/PySide6/QtNetwork.abi3.so": _macho(
+                ["@rpath/QtNetwork.framework/Versions/A/QtNetwork"]
+            ),
+            # ...and plugins that do not touch the network.
+            "_internal/PySide6/Qt/plugins/platforms/libqxcb.so": _elf(["libQt6XcbQpa.so.6"]),
+            "_internal/PySide6/plugins/platforms/qwindows.dll": _pe(["Qt6Gui.dll"]),
+            "_internal/PySide6/Qt/plugins/generic/libqevdevmouseplugin.so": _elf(["libudev.so.1"]),
+        },
+    )
+    result = check_privacy.scan_bundle(root)
+    found = {(f.relative.rsplit("/", 1)[-1], f.rule) for f in result.violations}
+    assert found == {
+        ("libqvnc.so", "network-plugin"),
+        ("libqvnc.so", "network-library"),
+        ("qschannelbackend.dll", "network-plugin"),
+        ("qschannelbackend.dll", "network-library"),
+        ("libqtuiotouchplugin.so", "network-plugin"),
+        ("libqtuiotouchplugin.so", "network-library"),
+        ("libqscnetworkreachability.dylib", "network-plugin"),
+        ("libqscnetworkreachability.dylib", "network-library"),
+        ("libQt6Foo.so.6", "network-library"),
+    }
+    vnc = next(f for f in result.violations if f.rule == "network-plugin" and "vnc" in f.relative)
+    assert "unauthenticated TCP server" in vnc.detail
+    assert {f.relative.rsplit("/", 1)[-1] for f in result.allowed} == {
+        "QtNetwork.pyd",
+        "QtNetwork.abi3.so",
+    }
+
+
+@pytest.mark.parametrize(
+    ("relative", "reason"),
+    [
+        ("_internal/PySide6/Qt/plugins/platforms/libqvnc.so", "VNC"),
+        ("_internal/PySide6/Qt/plugins/platforms/libqwebgl.so", "WebGL"),
+        ("_internal/PySide6/plugins/TLS/qopensslbackend.dll", "TLS"),
+        ("_internal/PySide6/plugins/networkaccess/qnetworkaccessbackend.dll", "QNetworkAccess"),
+        ("_internal/PySide6/Qt/plugins/generic/libqtuiotouchplugin.so", "UDP"),
+        ("_internal/PySide6/Qt/plugins/platforms/libqxcb.so", None),
+        ("_internal/PySide6/Qt/plugins/platformthemes/libqxdgdesktopportal.so", None),
+        ("_internal/PySide6/Qt/plugins/generic/libqevdevkeyboardplugin.so", None),
+        ("_internal/vnc/plugins.txt", None),  # needs a plugin group below "plugins"
+        ("_internal/libqvnc.so", None),
+    ],
+)
+def test_network_plugin(relative: str, reason: str | None) -> None:
+    detail = check_privacy.network_plugin(relative)
+    if reason is None:
+        assert detail is None
+    else:
+        assert detail is not None
+        assert reason in detail
+
+
+@pytest.mark.parametrize(
+    ("module", "package"),
+    [
+        ("requests", "requests"),
+        ("requests.adapters", "requests"),
+        ("sentry_sdk.client", "sentry_sdk"),
+        ("mediapipe.tasks.python", "mediapipe"),
+        ("somepkg._vendor.urllib3.util", "somepkg._vendor.urllib3"),
+        ("posthog", "posthog"),
+        ("google.cloud.storage", "google.cloud"),
+        # The standard library is not reported: it imports these itself.
+        ("http.client", None),
+        ("urllib.request", None),
+        ("socket", None),
+        ("multiprocessing.connection", None),
+        # What the bundle legitimately contains.
+        ("eye_tracker.ipc", None),
+        ("PySide6.QtNetwork", None),
+        ("cv2.dnn", None),
+        ("psutil._pslinux", None),
+        ("platformdirs.windows", None),
+        ("", None),
+    ],
+)
+def test_forbidden_module(module: str, package: str | None) -> None:
+    assert check_privacy.forbidden_module(module) == package
+
+
+def test_package_source_contains_no_telemetry_markers() -> None:
+    """The app's own modules go into the PYZ, whose code the gate now reads: a
+    docstring naming a telemetry endpoint would fail the release, so fail here first."""
+    sources = sorted((REPO_ROOT / "src" / "eye_tracker").rglob("*.py"))
+    assert sources
+    for path in sources:
+        assert check_privacy.telemetry_markers(path.read_bytes()) == [], path
+
+
+# ----------------------------------------------------------------- Python code in bundles
+def _writers() -> ModuleType:
+    """PyInstaller's archive writers (the "build" dependency group)."""
+    return pytest.importorskip("PyInstaller.archive.writers")
+
+
+def _pyz(path: Path, modules: dict[str, str | None]) -> Path:
+    """A PYZ archive written by PyInstaller: module name -> source (None: namespace package)."""
+    entries: list[tuple[str, str, str]] = []
+    code = {}
+    for name, source in modules.items():
+        if source is None:
+            entries.append((name, "-", "PYMODULE"))
+            continue
+        filename = name.replace(".", "/") + ".py"
+        code[name] = compile(source, filename, "exec")
+        entries.append((name, filename, "PYMODULE"))
+    _writers().ZlibArchiveWriter(str(path), entries, code_dict=code)
+    return path
+
+
+def _executable(
+    tmp_path: Path, pyz: Path, extra: Sequence[tuple[str, str, bool, str]] = ()
+) -> bytes:
+    """A PyInstaller-style executable: a PE "bootloader" with a CArchive appended."""
+    script = tmp_path / "entry.py"
+    script.write_text("import eye_tracker.app\n", encoding="utf-8")
+    package = tmp_path / "archive.pkg"
+    entries = [("PYZ.pyz", str(pyz), False, "z"), ("entry", str(script), True, "s"), *extra]
+    _writers().CArchiveWriter(str(package), entries, "python312.dll")
+    return _pe(["KERNEL32.dll"]) + package.read_bytes()
+
+
+_MODULES: dict[str, str | None] = {
+    "eye_tracker.app": "TITLE = 'Eye Tracker'\n",
+    "http.client": "PORT = 80\n",  # standard library: expected, not reported
+    "requests": "",
+    "requests.adapters": "",
+    "somelib.stats": "URL = 'https://api.segment.io/v1/track'\n",
+    "nspkg": None,
+}
+
+
+def test_python_code_inside_the_executables_is_checked(tmp_path: Path) -> None:
+    """r2-packaging-03: the PYZ hides third-party modules and their strings from a
+    byte scan; the gate reads it with PyInstaller's own reader."""
+    exe = _executable(tmp_path, _pyz(tmp_path / "PYZ.pyz", _MODULES))
+    # Compressed: invisible to the plain byte scan.
+    assert check_privacy.telemetry_markers(exe) == []
+    assert check_privacy.has_pyinstaller_archive(exe)
+    # The GUI and the CLI executable embed the same archive.
+    root = _bundle(tmp_path / "dist", {"EyeTracker.exe": exe, "eye-tracker-cli.exe": exe})
+
+    result = check_privacy.scan_bundle(root)
+
+    found = {(f.relative, f.rule, f.detail) for f in result.violations}
+    assert found == {
+        (
+            "EyeTracker.exe",
+            "forbidden-package",
+            "bundles the Python package 'requests' (module 'requests' in PYZ.pyz in "
+            "EyeTracker.exe)",
+        ),
+        (
+            "EyeTracker.exe",
+            "telemetry-endpoint",
+            "module 'somelib.stats' (PYZ.pyz in EyeTracker.exe) contains the telemetry "
+            "marker 'api.segment.io'",
+        ),
+    }
+    # Five modules with code and the entry script, each counted once.
+    assert result.python_modules == 6
+    assert result.binaries == 2
+
+
+def test_one_file_builds_have_their_embedded_files_checked(tmp_path: Path) -> None:
+    library = tmp_path / "libfetch.dll"
+    library.write_bytes(_pe(["WININET.dll"]))
+    base_library = tmp_path / "base_library.zip"
+    with zipfile.ZipFile(base_library, "w") as archive:
+        archive.writestr("urllib3/__init__.pyc", b"\0" * 16)
+    exe = _executable(
+        tmp_path,
+        _pyz(tmp_path / "PYZ.pyz", {"eye_tracker.app": "X = 1\n"}),
+        [
+            ("libfetch.dll", str(library), True, "b"),
+            ("base_library.zip", str(base_library), True, "x"),
+        ],
+    )
+    result = check_privacy.scan_bundle(_bundle(tmp_path / "dist", {"EyeTracker.exe": exe}))
+    assert _summary(result) == {
+        ("EyeTracker.exe/libfetch.dll", "network-library"),
+        ("EyeTracker.exe/base_library.zip", "forbidden-package"),
+    }
+
+
+def test_zip_files_and_standalone_pyz_archives_are_checked(tmp_path: Path) -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("http/client.pyc", b"\0" * 16)
+        archive.writestr("encodings/__init__.pyc", b"\0" * 16)
+        archive.writestr("urllib3/__init__.pyc", b"\0" * 16)
+        archive.writestr("certs/endpoints.txt", b"https://o1.ingest.sentry.io/api/1/")
+    pyz = _pyz(tmp_path / "PYZ-00.pyz", {"posthog.client": "", "eye_tracker.ui": ""})
+    root = _bundle(
+        tmp_path / "dist",
+        {"_internal/base_library.zip": buffer.getvalue(), "_internal/PYZ-00.pyz": pyz.read_bytes()},
+    )
+    result = check_privacy.scan_bundle(root)
+    found = {(f.relative, f.rule, f.detail) for f in result.violations}
+    assert found == {
+        (
+            "_internal/PYZ-00.pyz",
+            "forbidden-package",
+            "bundles the Python package 'posthog' (module 'posthog.client' in PYZ-00.pyz in "
+            "_internal/PYZ-00.pyz)",
+        ),
+        (
+            "_internal/base_library.zip",
+            "forbidden-package",
+            "bundles the Python package 'urllib3' (module 'urllib3' in ZIP in "
+            "_internal/base_library.zip)",
+        ),
+        (
+            "_internal/base_library.zip",
+            "telemetry-endpoint",
+            "data 'certs/endpoints.txt' (ZIP in _internal/base_library.zip) contains the "
+            "telemetry marker 'ingest.sentry.io'",
+        ),
+    }
+    assert result.python_modules == 5
+
+
+def _cookie(
+    archive_length: int, toc_offset: int, toc_length: int, library: bytes = b"python312.dll"
+) -> bytes:
+    """The trailer of a PyInstaller archive (see ``_CARCHIVE_COOKIE``)."""
+    return struct.pack(
+        "!8sIIII64s",
+        b"MEI\014\013\012\013\016",
+        archive_length,
+        toc_offset,
+        toc_length,
+        312,
+        library,
+    )
+
+
+def test_unreadable_archives_fail_the_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A well-formed cookie in front of a table of contents that does not parse.
+    archive = b"\0" * 32 + b"\xff" * 16
+    corrupt_exe = _pe(["KERNEL32.dll"]) + archive + _cookie(len(archive) + 88, 32, 16)
+    assert check_privacy.has_pyinstaller_archive(corrupt_exe)
+    root = _bundle(
+        tmp_path / "dist",
+        {
+            "EyeTracker.exe": corrupt_exe,
+            "_internal/base_library.zip": b"PK\x03\x04 not really a zip file",
+        },
+    )
+    result = check_privacy.scan_bundle(root)
+    assert _summary(result) == {
+        ("EyeTracker.exe", "unreadable-archive"),
+        ("_internal/base_library.zip", "unreadable-archive"),
+    }
+
+    # Without PyInstaller the Python code cannot be read: that fails too.
+    good = _executable(tmp_path, _pyz(tmp_path / "PYZ.pyz", {"eye_tracker.app": ""}))
+    monkeypatch.setitem(sys.modules, "PyInstaller.archive.readers", None)
+    result = check_privacy.scan_bundle(_bundle(tmp_path / "nopyi", {"EyeTracker.exe": good}))
+    [finding] = result.violations
+    assert finding.rule == "unreadable-archive"
+    assert "PyInstaller is not installed" in finding.detail
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        _pe(["KERNEL32.dll"]),
+        # The bootloader's own copy of the magic, without a cookie after it.
+        _pe(["KERNEL32.dll"]) + b"MEI\014\013\012\013\016" + b"\0" * 8,
+        # A cookie without a Python library name.
+        _pe(["KERNEL32.dll"]) + b"\0" * 40 + _cookie(128, 0, 16, library=b""),
+        # A cookie whose archive would start before the file does.
+        b"MEI\014\013\012\013\016" + _cookie(10_000, 0, 16)[8:],
+    ],
+)
+def test_files_without_a_pyinstaller_archive(data: bytes) -> None:
+    assert not check_privacy.has_pyinstaller_archive(data)
 
 
 def test_mediapipe_like_bundle_fails(tmp_path: Path) -> None:
@@ -752,7 +1075,7 @@ def test_bundle_command_line(
     assert check_privacy.main(["--bundle", str(good)]) == 0
     out = capsys.readouterr().out
     assert "_internal/_socket.pyd: allowed WS2_32.dll: CPython" in out
-    assert "OK: 1 native binaries in 1 files" in out
+    assert "OK: 1 native binaries and 0 Python modules in 1 files" in out
 
     assert check_privacy.main(["--bundle", str(bad), "--quiet"]) == 1
     captured = capsys.readouterr()

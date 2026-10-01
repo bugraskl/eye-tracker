@@ -13,15 +13,17 @@ The module has two halves:
   macOS        Carbon ``RegisterEventHotKey`` (no permission prompt needed); the
                events are delivered by the Cocoa run loop that Qt already spins
   Linux/X11    passive key grabs through python-xlib on a dedicated thread
-  Wayland      unsupported: bind ``eye-tracker ctl <command>`` in the desktop's own
-               keyboard settings instead
+  Wayland      unsupported: bind the ``ctl`` commands in the desktop's own keyboard
+               settings instead (the manager's note names them as this copy is run)
   ===========  ==========================================================================
 
 A global hotkey swallows its key system-wide, so combinations that the user types
 text with are refused (:meth:`HotkeyManager.layout_conflict`): on Windows AltGr
-arrives as Ctrl+Alt (Ctrl+Alt+C is 'ć' on a Polish keyboard) and on macOS Option
-alone types characters. Keys follow the keyboard layout on every system, and
-:meth:`HotkeyManager.last_error` explains any refusal in a user-presentable way.
+arrives as Ctrl+Alt (Ctrl+Alt+C is 'ć' on a Polish keyboard), on macOS Option
+alone types characters, and on X11 a keyboard-layout switch such as Alt+Shift
+makes every hotkey containing both keys impossible to press. Keys follow the
+keyboard layout on every system, and :meth:`HotkeyManager.last_error` explains
+any refusal in a user-presentable way.
 
 Callbacks may be invoked on *any* thread (the hotkey thread on Windows/X11, the
 main thread on macOS). They must return quickly and marshal work to the Qt main
@@ -42,9 +44,10 @@ import re
 import sys
 import threading
 import unicodedata
+from array import array
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, ClassVar, Protocol
+from typing import Any, ClassVar, NamedTuple, Protocol
 
 log = logging.getLogger(__name__)
 
@@ -318,14 +321,46 @@ def format_hotkey(hk: Hotkey, macos: bool | None = None) -> str:
     if macos:
         key = _key_label(hk.key, macos=True)
         return "".join(_MAC_MODIFIER_SYMBOLS[m] for m in hk.ordered_modifiers) + key
+    return "+".join([*_modifier_labels(hk.modifiers), _key_label(hk.key)])
+
+
+def _modifier_labels(modifiers: Iterable[str]) -> list[str]:
+    """Windows/Linux labels of ``modifiers`` in canonical order (``["Ctrl", "Alt"]``)."""
     meta = "Win" if sys.platform == "win32" else "Super"
     labels = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "meta": meta}
-    return "+".join([*(labels[m] for m in hk.ordered_modifiers), _key_label(hk.key)])
+    wanted = set(modifiers)
+    return [labels[m] for m in MODIFIERS if m in wanted]
 
 
 def _key_label(key: str, macos: bool = False) -> str:
     """Display name of a canonical key (``"pageup"`` → ``"PgUp"``, ``"t"`` → ``"T"``)."""
     return (_MAC_DISPLAY_NAMES if macos else _DISPLAY_NAMES).get(key, key.upper())
+
+
+def _describe_typed(text: str) -> str:
+    """``text`` (what a key types) quoted for a user-facing message.
+
+    Visible characters are quoted as they are (``'ć'``). Blank and invisible ones,
+    such as the no-break space that Option+Space types on a Mac, and lone combining
+    marks (which would sit on the quote sign) are named instead (``no-break space
+    (U+00A0)``): ``repr()`` would show Python escapes like ``'\\xa0'``, which mean
+    nothing to users.
+    """
+    text = unicodedata.normalize("NFC", text)  # 'a' + combining acute → 'á'
+    if text and all(_is_visible(ch) for ch in text):
+        quote = '"' if "'" in text else "'"
+        return f"{quote}{text}{quote}"
+    names = []
+    for ch in text:
+        name = unicodedata.name(ch, "")
+        code = f"U+{ord(ch):04X}"
+        names.append(f"{name.lower()} ({code})" if name else code)
+    return " + ".join(names) or "nothing"
+
+
+def _is_visible(ch: str) -> bool:
+    """Whether ``ch`` shows up as a glyph of its own when printed between quotes."""
+    return ch.isprintable() and not ch.isspace() and not unicodedata.category(ch).startswith("M")
 
 
 def _as_hotkey(hotkey: Hotkey | str) -> Hotkey:
@@ -387,20 +422,24 @@ class HotkeyManager:
         """Why the latest :meth:`register` of ``name`` failed, or why it stopped working.
 
         The text is a short, user-presentable sentence such as ``"Ctrl+Alt+C is
-        AltGr+C, which types 'ć' on the Polish (Programmers) keyboard layout"``.
+        AltGr+C and types 'ć' on the Polish (Programmers) keyboard layout"``.
         ``None`` if the hotkey is active or ``name`` was never registered.
         """
         return self._errors.get(name)
 
     def layout_conflict(self, hotkey: Hotkey | str) -> str | None:
-        """Why ``hotkey`` would swallow a character the user types, or ``None``.
+        """Why ``hotkey`` clashes with how the user types, or ``None``.
 
         On Windows, Ctrl+Alt is AltGr: a global Ctrl+Alt+C would eat every 'ć' typed
-        on a Polish keyboard. On macOS, Option (+Shift) alone types characters. The
-        native managers check this on every installed (Windows) or the current
-        (macOS) keyboard layout and refuse such registrations; this method lets
-        settings UIs and diagnostics warn before registering. It never changes the
-        keyboard state or the active layout.
+        on a Polish keyboard. On macOS, Option (+Shift) alone types characters. On
+        X11, a keyboard-layout switch such as Alt+Shift (XKB option
+        ``grp:alt_shift_toggle``) means a hotkey containing both keys can never be
+        pressed: the layout changes instead and the rest of the chord reaches other
+        applications (likewise when an XKB option makes Win or Alt a layout or AltGr
+        key). The native managers check this on every installed (Windows),
+        the current (macOS) or the configured (X11) keyboard layout and refuse such
+        registrations; this method lets settings UIs and diagnostics warn before
+        registering. It never changes the keyboard state or the active layout.
 
         Raises:
             ValueError: if ``hotkey`` is a string that is not a valid hotkey.
@@ -1033,10 +1072,12 @@ def _win_altgr_conflict(hotkey: Hotkey, vk: int, probe: _WinLayoutProbe) -> str 
         if typed is None:
             continue
         text, dead = typed
-        what = f"the dead key {text!r}" if dead else repr(text)
+        what = f"the dead key {_describe_typed(text)}" if dead else _describe_typed(text)
         altgr = "+".join(["AltGr", *(["Shift"] if shift else []), _key_label(hotkey.key)])
+        # "is AltGr+, and types" rather than "is AltGr+,, which types": a punctuation
+        # key label must not run into the sentence's own punctuation.
         return (
-            f"{format_hotkey(hotkey, macos=False)} is {altgr}, which types {what} on the "
+            f"{format_hotkey(hotkey, macos=False)} is {altgr} and types {what} on the "
             f"{probe.layout_name(hkl)} keyboard layout"
         )
     return None
@@ -1226,8 +1267,8 @@ class WindowsHotkeyManager(_ThreadedHotkeyManager):
             char = _PUNCTUATION.get(hotkey.key, hotkey.key)
             return self._reject(
                 binding,
-                f"{label}: no key types {char!r} without Shift or AltGr on the current "
-                "keyboard layout",
+                f"{label}: no key types {_describe_typed(char)} without Shift or AltGr on "
+                "the current keyboard layout",
             )
         try:
             conflict = _win_altgr_conflict(hotkey, vk, self._probe())
@@ -1268,7 +1309,12 @@ _EVENT_NOT_HANDLED_ERR = -9874
 _EVENT_HOTKEY_EXISTS_ERR = -9878
 _EVENT_HOTKEY_PRESSED = 5
 # kEventHotKeyExclusive: without it Carbon lets several applications register the
-# same combination, so a combination another app owns could never be reported.
+# same combination and one press fires all of them, so a combination another app
+# owns could never be reported. With it, registering fails with
+# eventHotKeyExistsErr while any other registration of the combination exists
+# (reported as "already in use by another application"), and while we hold it,
+# registrations that other apps make later stay silent until we release it. The
+# defaults (⌃⌥⌘T/P/C) are therefore chosen to be nobody else's default.
 _EVENT_HOTKEY_EXCLUSIVE = 1 << 0
 _UC_KEY_ACTION_DOWN = 0
 _UC_KEY_TRANSLATE_NO_DEAD_KEYS = 1 << 0  # kUCKeyTranslateNoDeadKeysMask
@@ -1860,7 +1906,10 @@ class MacHotkeyManager(_NativeHotkeyManager):
         text = (chars or {}).get(keycode)
         if not text:
             return None
-        return f"{format_hotkey(hotkey, macos=True)} types {text!r} on the current keyboard layout"
+        return (
+            f"{format_hotkey(hotkey, macos=True)} types {_describe_typed(text)} on the "
+            "current keyboard layout"
+        )
 
     def _native_register(self, binding: _Binding) -> bool:
         if not self._on_main_thread("registered"):
@@ -1875,8 +1924,8 @@ class MacHotkeyManager(_NativeHotkeyManager):
             if hotkey.key in _PUNCTUATION:
                 return self._reject(
                     binding,
-                    f"{label}: no key types {_PUNCTUATION[hotkey.key]!r} without modifiers "
-                    "on the current keyboard layout",
+                    f"{label}: no key types {_describe_typed(_PUNCTUATION[hotkey.key])} "
+                    "without modifiers on the current keyboard layout",
                 )
             return self._reject(binding, f"{label}: Mac keyboards have no {_key_label(hotkey.key)}")
         try:
@@ -1950,10 +1999,90 @@ _X_MOD2_MASK = 1 << 4  # NumLock on virtually every keymap
 _X_MOD4_MASK = 1 << 6  # Super
 _X_KEY_PRESS = 2
 _X_KEY_RELEASE = 3
+_X_PROPERTY_NOTIFY = 28
 _X_MAPPING_NOTIFY = 34
 _X_MAPPING_MODIFIER = 0
 _X_MAPPING_KEYBOARD = 1
 _X_GRAB_MODE_ASYNC = 1
+_X_PROPERTY_CHANGE_MASK = 1 << 22
+_X_ANY_PROPERTY_TYPE = 0
+# Root window property in which setxkbmap and the desktops record the XKB rules
+# they applied: "rules\0model\0layout\0variant\0options" (options comma-separated).
+_XKB_RULES_NAMES = "_XKB_RULES_NAMES"
+
+
+class _XkbKeyOption(NamedTuple):
+    """How an XKB option repurposes keys of a hotkey (see :data:`_X_KEY_OPTIONS`)."""
+
+    #: The modifiers that trigger it when held together.
+    modifiers: frozenset[str]
+    #: The key pressed with them, or ``None`` when the modifiers alone trigger it.
+    key: str | None
+    #: What it does, completing "…, which <effect>" in the user-facing message.
+    effect: str
+
+
+_SWITCHES_LAYOUT = "switches the keyboard layout"
+_ACTS_AS_ALTGR = "acts as AltGr"
+
+
+def _xkb_option(effect: str, *modifiers: str, key: str | None = None) -> _XkbKeyOption:
+    """Table entry: ``modifiers`` (+ ``key``) do ``effect`` instead of their usual job."""
+    return _XkbKeyOption(frozenset(modifiers), key, effect)
+
+
+#: XKB options (``setxkbmap -option``, or a desktop's keyboard settings) that take
+#: modifiers of a hotkey for something else, read from xkeyboard-config's
+#: ``symbols/group``, ``symbols/level3`` and ``rules/base``. A grab of such a
+#: hotkey succeeds, yet pressing it does not work as intended, so it is refused
+#: with the reason given here:
+#:
+#: * Pair toggles: with ``grp:alt_shift_toggle`` the second key pressed of Alt and
+#:   Shift sends ``ISO_Next_Group`` instead of its modifier, in either order (Shift
+#:   is ``PC_ALT_LEVEL2`` [Shift_L, ISO_Next_Group], Alt ``TWO_LEVEL`` [NoSymbol,
+#:   ISO_Next_Group]); Ctrl+Shift, Ctrl+Alt and Ctrl+Win toggles work alike. The
+#:   chord cannot be formed: the layout changes and the rest reaches other
+#:   applications (Ctrl+Alt+Shift+T arrives as Ctrl+Alt+T, which opens a terminal).
+#: * Single-key switches (``grp:lalt_toggle``, ``grp:lwin_switch``, the Win and Alt
+#:   ``lv3`` switches, …) turn the (left) key into a layout or AltGr key, so it no
+#:   longer adds its modifier at all.
+#: * Space toggles: the hotkey would fire, but every press also switches the layout.
+#:
+#: Right-hand-only variants (``grp:ralt_rshift_toggle``, ``grp:rctrl_rshift_toggle``,
+#: ``grp:rctrl_ralt_toggle``, ``grp:toggle``, ``grp:rwin_*``, ``lv3:ralt_*``) and
+#: both-keys-of-a-kind toggles (``grp:alts_toggle``, ``grp:ctrls_toggle``,
+#: ``grp:shifts_toggle``) leave the left-hand keys that chords are pressed with
+#: working, so they are not listed.
+_X_KEY_OPTIONS: dict[str, _XkbKeyOption] = {
+    # Pair toggles: the chord cannot be formed.
+    "grp:alt_shift_toggle": _xkb_option(_SWITCHES_LAYOUT, "alt", "shift"),
+    "grp:alt_shift_toggle_bidir": _xkb_option(_SWITCHES_LAYOUT, "alt", "shift"),
+    "grp:lalt_lshift_toggle": _xkb_option(_SWITCHES_LAYOUT, "alt", "shift"),
+    "grp:ctrl_shift_toggle": _xkb_option(_SWITCHES_LAYOUT, "ctrl", "shift"),
+    "grp:ctrl_shift_toggle_bidir": _xkb_option(_SWITCHES_LAYOUT, "ctrl", "shift"),
+    "grp:lctrl_lshift_toggle": _xkb_option(_SWITCHES_LAYOUT, "ctrl", "shift"),
+    "grp:ctrl_alt_toggle": _xkb_option(_SWITCHES_LAYOUT, "ctrl", "alt"),
+    "grp:ctrl_alt_toggle_bidir": _xkb_option(_SWITCHES_LAYOUT, "ctrl", "alt"),
+    "grp:lctrl_lalt_toggle": _xkb_option(_SWITCHES_LAYOUT, "ctrl", "alt"),
+    "grp:lctrl_lwin_toggle": _xkb_option(_SWITCHES_LAYOUT, "ctrl", "meta"),
+    "grp:lctrl_lwin_rctrl_menu": _xkb_option(_SWITCHES_LAYOUT, "ctrl", "meta"),
+    # Single (left) keys that stop being modifiers.
+    "grp:lalt_toggle": _xkb_option(_SWITCHES_LAYOUT, "alt"),
+    "grp:lswitch": _xkb_option(_SWITCHES_LAYOUT, "alt"),
+    "grp:lctrl_toggle": _xkb_option(_SWITCHES_LAYOUT, "ctrl"),
+    "grp:lshift_toggle": _xkb_option(_SWITCHES_LAYOUT, "shift"),
+    "grp:lwin_toggle": _xkb_option(_SWITCHES_LAYOUT, "meta"),
+    "grp:lwin_switch": _xkb_option(_SWITCHES_LAYOUT, "meta"),
+    "grp:win_switch": _xkb_option(_SWITCHES_LAYOUT, "meta"),
+    "lv3:lalt_switch": _xkb_option(_ACTS_AS_ALTGR, "alt"),
+    "lv3:alt_switch": _xkb_option(_ACTS_AS_ALTGR, "alt"),
+    "lv3:lwin_switch": _xkb_option(_ACTS_AS_ALTGR, "meta"),
+    "lv3:win_switch": _xkb_option(_ACTS_AS_ALTGR, "meta"),
+    # Space toggles: every press of the hotkey would also switch the layout.
+    "grp:alt_space_toggle": _xkb_option(_SWITCHES_LAYOUT, "alt", key="space"),
+    "grp:ctrl_space_toggle": _xkb_option(_SWITCHES_LAYOUT, "ctrl", key="space"),
+    "grp:win_space_toggle": _xkb_option(_SWITCHES_LAYOUT, "meta", key="space"),
+}
 
 _X_MODIFIERS = {
     "ctrl": _X_CONTROL_MASK,
@@ -2015,6 +2144,54 @@ def _x11_lock_variants(numlock_mask: int) -> tuple[int, ...]:
     return tuple(variants)
 
 
+def _x11_parse_xkb_options(value: Any) -> tuple[str, ...]:
+    """The XKB options recorded in an ``_XKB_RULES_NAMES`` property value.
+
+    The value is five NUL-separated fields (rules, model, layout, variant,
+    options); python-xlib returns it as ``bytes`` (``str`` or an ``array`` from
+    older versions). Anything malformed yields no options.
+    """
+    if isinstance(value, str):
+        raw = value
+    elif isinstance(value, (bytes, bytearray, memoryview, array)):
+        raw = bytes(value).decode("latin-1")  # ICCCM STRING; option names are ASCII
+    else:
+        return ()
+    fields = raw.split("\0")
+    if len(fields) < 5:
+        return ()
+    return tuple(option.strip() for option in fields[4].split(",") if option.strip())
+
+
+def _x11_read_xkb_options(root: Any, atom: int) -> tuple[str, ...]:
+    """The XKB options of the X server (read-only ``GetProperty`` on the root window)."""
+    prop = root.get_full_property(atom, _X_ANY_PROPERTY_TYPE)
+    return _x11_parse_xkb_options(getattr(prop, "value", None))
+
+
+def _x11_layout_switch_conflict(hotkey: Hotkey, options: Iterable[str]) -> str | None:
+    """Why keys of ``hotkey`` are taken by one of the XKB ``options``, or ``None``.
+
+    See :data:`_X_KEY_OPTIONS`; the first matching option is named, for example
+    ``"Ctrl+Alt+Shift+T includes Alt+Shift, which switches the keyboard layout (XKB
+    option grp:alt_shift_toggle)"``.
+    """
+    for option in options:
+        taken = _X_KEY_OPTIONS.get(option)
+        if taken is None:
+            continue
+        if not taken.modifiers <= hotkey.modifiers or taken.key not in (None, hotkey.key):
+            continue
+        label = format_hotkey(hotkey, macos=False)
+        chord = "+".join(
+            [*_modifier_labels(taken.modifiers), *([_key_label(taken.key)] if taken.key else [])]
+        )
+        # "Alt+Space switches …" rather than "Alt+Space includes Alt+Space, which …".
+        subject = label if chord == label else f"{label} includes {chord}, which"
+        return f"{subject} {taken.effect} (XKB option {option})"
+    return None
+
+
 def _x11_string_to_keysym(name: str) -> int:
     from Xlib import XK
 
@@ -2056,6 +2233,13 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
     After a keyboard mapping change every binding is grabbed again at its new
     keycode; one whose key vanished (``setxkbmap ru``) stays known, is reported
     as inactive and is grabbed again by the next mapping change that restores it.
+
+    A hotkey that contains a configured keyboard-layout switch (Alt+Shift with
+    ``grp:alt_shift_toggle``, see :data:`_X_KEY_OPTIONS`) is refused, because
+    ``XGrabKey`` would accept it although it can never be pressed. The options are
+    read from the root window's ``_XKB_RULES_NAMES`` and followed through
+    ``PropertyNotify`` (root properties change on focus changes at most, which the
+    loop ignores after comparing one atom) and mapping changes.
     """
 
     name: ClassVar[str] = "x11"
@@ -2077,7 +2261,11 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
         self._pipe_lock = threading.Lock()
         self._wake_r = -1
         self._wake_w = -1
+        # XKB options of the server, written by the hotkey thread only (None while it
+        # is not running); an immutable tuple, so other threads may read it as is.
+        self._xkb_options: tuple[str, ...] | None = None
         # Only touched on the hotkey thread:
+        self._rules_atom = 0  # the _XKB_RULES_NAMES atom (0: options not followed)
         self._grabs: dict[int, tuple[int, int]] = {}  # binding id → (keycode, modifier mask)
         self._lookup: dict[tuple[int, int], int] = {}  # (keycode, modifier mask) → binding id
         self._held: set[int] = set()
@@ -2114,6 +2302,7 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
         self._display = display
         self._root = display.screen().root
         self._numlock_mask = self._find_numlock_mask()
+        self._follow_xkb_options()
         return True
 
     def _thread_loop(self) -> None:
@@ -2151,6 +2340,8 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
                 log.debug("Closing the X display failed", exc_info=True)
         self._display = None
         self._root = None
+        self._rules_atom = 0
+        self._xkb_options = None
         self._grabs.clear()
         self._lookup.clear()
         self._held.clear()
@@ -2187,6 +2378,61 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
     def _native_unregister(self, binding: _Binding) -> None:
         self._call_on_thread(lambda: self._ungrab_binding(binding.id), None)
 
+    def layout_conflict(self, hotkey: Hotkey | str) -> str | None:
+        hotkey = _as_hotkey(hotkey)
+        try:
+            return _x11_layout_switch_conflict(hotkey, self._current_xkb_options())
+        except Exception:  # advisory only: never break a settings dialog
+            log.debug("Keyboard layout check for %s failed", hotkey, exc_info=True)
+            return None
+
+    def _current_xkb_options(self) -> tuple[str, ...]:
+        """The server's XKB options, from any thread.
+
+        The hotkey thread keeps them up to date while it runs; otherwise (``doctor``,
+        a settings dialog before the first registration) a short-lived connection
+        reads them.
+        """
+        options = self._xkb_options
+        if options is not None:
+            return options
+        display = self._display_factory(self._display_name)
+        try:
+            atom = int(display.intern_atom(_XKB_RULES_NAMES, only_if_exists=True))
+            return _x11_read_xkb_options(display.screen().root, atom) if atom else ()
+        finally:
+            display.close()
+
+    def _follow_xkb_options(self) -> None:
+        """Read the XKB options and ask for ``PropertyNotify`` when they change.
+
+        Hotkey thread only. Desktops may apply the user's layout switch after this
+        app started (at login), and ``setxkbmap`` writes the property only after
+        the keymap change that sends ``MappingNotify``, so the property itself is
+        watched. Failing that, options are simply not checked.
+        """
+        try:
+            self._rules_atom = int(self._display.intern_atom(_XKB_RULES_NAMES))
+            self._root.change_attributes(event_mask=_X_PROPERTY_CHANGE_MASK)
+        except Exception:
+            log.debug("Cannot follow the XKB layout options", exc_info=True)
+            self._rules_atom = 0
+        self._refresh_xkb_options()
+
+    def _refresh_xkb_options(self) -> bool:
+        """Re-read the XKB options (hotkey thread only); returns whether they changed."""
+        old = self._xkb_options
+        new: tuple[str, ...] = old or ()
+        if self._rules_atom:
+            try:
+                new = _x11_read_xkb_options(self._root, self._rules_atom)
+            except Exception:  # keep what was known: never flip-flop on a failed read
+                log.debug("Reading the XKB layout options failed", exc_info=True)
+        self._xkb_options = new
+        if new != old:
+            log.debug("XKB options: %s", ",".join(new) or "(none)")
+        return new != old
+
     def _keycode_for(self, key: str) -> int:
         keysym = _x11_string_to_keysym(_X_KEYSYM_NAMES[key])
         if not keysym:
@@ -2206,6 +2452,11 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
 
     def _grab_binding(self, binding: _Binding) -> bool:
         label = format_hotkey(binding.hotkey, macos=False)
+        # XGrabKey accepts a chord that the layout switch makes impossible to press;
+        # without this check the hotkey would silently never fire.
+        switch = _x11_layout_switch_conflict(binding.hotkey, self._xkb_options or ())
+        if switch is not None:
+            return self._reject(binding, switch)
         keycode = self._keycode_for(binding.hotkey.key)
         if not keycode:
             return self._reject(
@@ -2284,6 +2535,17 @@ class X11HotkeyManager(_ThreadedHotkeyManager):
         if kind == _X_MAPPING_NOTIFY:
             if event.request in (_X_MAPPING_KEYBOARD, _X_MAPPING_MODIFIER):
                 self._display.refresh_keyboard_mapping(event)
+                self._refresh_xkb_options()
+                self._regrab_all()
+            return
+        if kind == _X_PROPERTY_NOTIFY:
+            # Any root property change arrives here (focus changes, window lists);
+            # only a change of the XKB options matters.
+            if (
+                self._rules_atom
+                and int(getattr(event, "atom", 0)) == self._rules_atom
+                and self._refresh_xkb_options()
+            ):
                 self._regrab_all()
             return
         if kind == _X_KEY_RELEASE:
@@ -2323,16 +2585,36 @@ def _is_wayland_session() -> bool:
     )
 
 
-_WAYLAND_NOTE = (
-    "Wayland does not allow applications to register global hotkeys. Bind "
-    "'eye-tracker ctl toggle', 'eye-tracker ctl privacy-toggle' or "
-    "'eye-tracker ctl calibrate' to shortcuts in your desktop's keyboard settings."
-)
-_XWAYLAND_NOTE = (
-    "Running under Wayland: hotkeys are grabbed through XWayland and may only fire "
-    "while an X11 window has focus. For reliable shortcuts bind 'eye-tracker ctl …' "
-    "commands in your desktop's keyboard settings."
-)
+#: The ``ctl`` commands to bind where global hotkeys are unavailable.
+_CTL_SHORTCUT_ACTIONS = ("toggle", "privacy-toggle", "calibrate")
+
+
+def _ctl_commands() -> str:
+    """``'… ctl toggle', '… ctl privacy-toggle' or '… ctl calibrate'``, spelled as
+    this copy is run: the release packages put no ``eye-tracker`` command on the
+    PATH (an AppImage is called by its file name, the macOS app has
+    ``eye-tracker-cli`` inside it), and a desktop shortcut bound to a command
+    that does not exist fails without a word. Built when a manager is created,
+    because a ``--config-dir`` profile becomes part of the command."""
+    from ..cli import cli_command_text  # the cli module imports nothing from here
+
+    commands = [f"'{cli_command_text('ctl', action)}'" for action in _CTL_SHORTCUT_ACTIONS]
+    return f"{', '.join(commands[:-1])} or {commands[-1]}"
+
+
+def _wayland_note() -> str:
+    return (
+        "Wayland does not allow applications to register global hotkeys. Bind "
+        f"{_ctl_commands()} to shortcuts in your desktop's keyboard settings."
+    )
+
+
+def _xwayland_note() -> str:
+    return (
+        "Running under Wayland: hotkeys are grabbed through XWayland and may only fire "
+        "while an X11 window has focus. For reliable shortcuts bind "
+        f"{_ctl_commands()} in your desktop's keyboard settings."
+    )
 
 
 def create_hotkey_manager() -> HotkeyManager:
@@ -2344,13 +2626,13 @@ def create_hotkey_manager() -> HotkeyManager:
             return MacHotkeyManager()
         if not os.environ.get("DISPLAY"):
             if _is_wayland_session():
-                return HotkeyManager(note=_WAYLAND_NOTE)
+                return HotkeyManager(note=_wayland_note())
             return HotkeyManager(note="No X11 display is available for global hotkeys.")
         try:
             import Xlib  # noqa: F401  (availability probe only)
         except ImportError:
             return HotkeyManager(note="python-xlib is not installed; global hotkeys are off.")
-        note = _XWAYLAND_NOTE if _is_wayland_session() else None
+        note = _xwayland_note() if _is_wayland_session() else None
         return X11HotkeyManager(note=note)
     except Exception as exc:  # defensive: hotkeys are optional
         log.warning("Global hotkeys unavailable: %s", exc)

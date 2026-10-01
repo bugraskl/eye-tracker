@@ -22,17 +22,35 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-CONFIG_VERSION = 1
+#: Format version written into the settings file. Files of every earlier version
+#: keep loading; :func:`_migrate` updates them:
+#:
+#: 1. The first builds.
+#: 2. Today's default hotkeys (see ``_HOTKEY_MODIFIERS``). A version 1 file whose
+#:    three hotkeys are still an earlier build's untouched defaults gets today's
+#:    defaults. The next save writes version 2, so this happens once: hotkeys
+#:    chosen afterwards are kept even if they equal an old default.
+CONFIG_VERSION = 2
 
 #: Vision backend names of earlier versions and what they are called now. The
 #: MediaPipe-runtime backend became the self-contained "facemesh" one (same
 #: landmark model), the OpenCV/YuNet one became "lite".
 LEGACY_BACKENDS: dict[str, str] = {"mediapipe": "facemesh", "opencv": "lite"}
-#: The hotkey defaults of earlier versions (``hotkeys.toggle_tracking``,
-#: ``toggle_privacy``, ``recalibrate``). Ctrl+Alt+letter is AltGr+letter on many
-#: Windows layouts and opens a terminal on Linux desktops, so a file that still
-#: holds all three unchanged gets today's platform defaults instead.
+#: The hotkey defaults of the first builds (``hotkeys.toggle_tracking``,
+#: ``toggle_privacy``, ``recalibrate``) on every platform. Ctrl+Alt+letter is
+#: AltGr+letter on many Windows layouts, opens a terminal on Linux desktops and
+#: is a Rectangle / Magnet shortcut on macOS.
 LEGACY_HOTKEYS: tuple[str, str, str] = ("ctrl+alt+t", "ctrl+alt+p", "ctrl+alt+c")
+#: The Linux (and other X11 desktop) defaults of later version 1 builds. Alt+Shift
+#: and Ctrl+Shift are common keyboard-layout switches there, which make this chord
+#: impossible to press, and JetBrains IDEs use it.
+LEGACY_HOTKEYS_X11: tuple[str, str, str] = (
+    "ctrl+alt+shift+t",
+    "ctrl+alt+shift+p",
+    "ctrl+alt+shift+c",
+)
+#: The first file version that may hold old default hotkeys on purpose.
+_HOTKEY_DEFAULTS_VERSION = 2
 _HOTKEY_FIELDS = ("toggle_tracking", "toggle_privacy", "recalibrate")
 
 
@@ -57,7 +75,11 @@ class GeneralSettings:
         "'auto' picks facemesh.",
     )
     start_paused: bool = _opt(False, doc="Start with tracking paused.")
-    first_run_done: bool = _opt(False, doc="Set after the first-run wizard completes.")
+    first_run_done: bool = _opt(
+        False,
+        doc="Set after the first-run wizard completes. Until then a walk-away action that "
+        "locks or turns the displays off only shows a notification.",
+    )
     notifications: bool = _opt(True, doc="Show tray notifications.")
     log_level: str = _opt(
         "INFO",
@@ -155,13 +177,24 @@ class PresenceSettings:
         doc="What to do when you are away.",
     )
     away_timeout_s: int = _opt(
-        45, lo=5, hi=3600, doc="Seconds without a face (and without input) before acting."
+        45,
+        lo=5,
+        hi=3600,
+        doc="Seconds without a face (and without input) before acting; the countdown runs "
+        "during the last seconds of this time.",
     )
     warning_s: int = _opt(
-        10, lo=0, hi=120, doc="Countdown shown before the action; any input cancels it."
+        10,
+        lo=0,
+        hi=120,
+        doc="Countdown shown before the action (0 = act without a countdown). Being seen "
+        "by the camera cancels it, and so does keyboard or mouse use while "
+        "require_input_idle is on.",
     )
     require_input_idle: bool = _opt(
-        True, doc="Keyboard or mouse activity counts as presence even without a face."
+        True,
+        doc="Keyboard or mouse activity counts as presence even without a face (not on "
+        "Wayland outside GNOME, where the system does not report it).",
     )
     wake_on_return: bool = _opt(
         True, doc="Turn the displays back on when you return (if they were only switched off)."
@@ -173,15 +206,22 @@ class PrivacySettings:
     pause_when_locked: bool = _opt(True, doc="Release the camera while the session is locked.")
     yield_camera: bool = _opt(
         True,
-        doc="Release the camera while another app is using it (Windows and Linux only).",
+        doc="Release the camera while another app is using it (Windows and Linux only). "
+        "Walk-away detection and the shoulder guard pause meanwhile.",
     )
     pause_for_apps: list[str] = field(
         default_factory=list,
-        metadata={"doc": "Process names that pause tracking while running (e.g. 'obs64.exe')."},
+        metadata={
+            "doc": "Process names that pause tracking while running (e.g. 'obs64.exe'). The "
+            "camera is released, so walk-away detection and the shoulder guard pause too."
+        },
     )
     shoulder_guard: bool = _opt(False, doc="React when a second face appears behind you.")
     guard_action: str = _opt(
-        "curtain", choices=("notify", "curtain", "lock"), doc="Shoulder guard reaction."
+        "curtain",
+        choices=("notify", "curtain", "lock"),
+        doc="Shoulder guard reaction. After you unlock a lock it caused, 'lock' covers the "
+        "screens instead of locking again for 5 minutes.",
     )
     guard_delay_s: float = _opt(
         2.0, lo=0.5, hi=30.0, doc="Seconds a second face must be visible before reacting."
@@ -189,8 +229,12 @@ class PrivacySettings:
 
 
 #: Modifiers of the default hotkeys by ``sys.platform``; the keys are T (pause /
-#: resume tracking), P (privacy mode) and C (calibrate) everywhere. Each set was
-#: chosen so that the combinations type no character and are no stock OS shortcut:
+#: resume tracking), P (privacy mode) and C (calibrate) everywhere. A global hotkey
+#: takes its combination away from every other application, so the defaults must
+#: type no character, stay pressable while a keyboard-layout switch is configured,
+#: and be no default shortcut of the system or of the tools this app's users are
+#: likely to run. Ctrl+Alt+Meta (Ctrl+Alt+Win, ⌃⌥⌘, Ctrl+Alt+Super) passes on
+#: every platform; what was checked:
 #:
 #: * Windows reports AltGr as Ctrl+Alt, and the layout tables of the stock Windows
 #:   layouts show Ctrl+Alt(+Shift)+T, P and C typing characters on 19-47 layouts each
@@ -198,13 +242,38 @@ class PrivacySettings:
 #:   Ctrl+Alt+P 'ö' on US-International). No Windows layout uses the Win key as a
 #:   character modifier, and the shell's own Win shortcuts (Game Bar Win+Alt+*,
 #:   Win+Ctrl+*, the Office key Ctrl+Alt+Shift+Win) leave Ctrl+Alt+Win+T/P/C free.
-#: * Linux desktops open a terminal on Ctrl+Alt+T and switch virtual terminals on
-#:   Ctrl+Alt+F1-F12. X11 keeps AltGr a modifier of its own, so Ctrl+Alt+Shift
-#:   never types, and no major desktop binds it to T, P or C.
-#: * macOS has no AltGr, Control+Option+letter types nothing, and macOS binds no
-#:   ⌃⌥+letter shortcut (only VoiceOver, while it runs, uses ⌃⌥ as its prefix).
-_HOTKEY_MODIFIERS: dict[str, str] = {"win32": "ctrl+alt+meta", "darwin": "ctrl+alt"}
-_HOTKEY_MODIFIERS_OTHER = "ctrl+alt+shift"  # Linux/X11 and other Unix desktops
+#: * Linux (X11): AltGr is a modifier of its own (Mod5), so Ctrl+Alt chords never
+#:   type. GNOME, KDE Plasma, Xfce, Cinnamon and MATE open a terminal on Ctrl+Alt+T,
+#:   switch virtual terminals on Ctrl+Alt+F1-F12 and bind Super+letter (Super+P:
+#:   displays), but none binds Ctrl+Alt+Super+T, P or C, and X grabs match the
+#:   modifiers exactly, so Super+P is not Ctrl+Alt+Super+P. Ctrl+Alt+Shift, the
+#:   default of earlier builds, failed twice. With the XKB layout switches that
+#:   bilingual users pick most, Alt+Shift (grp:alt_shift_toggle) and Ctrl+Shift
+#:   (grp:ctrl_shift_toggle), whichever of the pair is pressed second switches the
+#:   layout instead of adding its modifier (xkeyboard-config symbols/group), so the
+#:   chord cannot be formed and arrives as Ctrl+Alt+T (a terminal) or Ctrl+Shift+T.
+#:   And IDEs use it: the JetBrains keymap for Refactor This, Copy Reference and
+#:   Introduce Functional Parameter (Ctrl+Alt+Shift+T/C/P), VS Code for Copy Path
+#:   (Ctrl+Alt+Shift+C). Neither binds Ctrl+Alt+Super. The other usual switches
+#:   (Super+Space, Caps Lock, Shift+Caps Lock) leave the defaults alone; the rare
+#:   ones that do (grp:ctrl_alt_toggle, the Win-key switches) are detected by the
+#:   hotkey manager, which then reports the hotkey as unavailable instead of
+#:   grabbing a chord that cannot be pressed.
+#: * macOS: Control+Option+Command+letter types nothing. Rectangle and Magnet, the
+#:   window managers multi-monitor Mac users run most, take ⌃⌥ with arrows and
+#:   letters by default (⌃⌥T Last Two Thirds, ⌃⌥C Center) and ⌃⌥⌘ only with ←/→
+#:   (previous / next display); Rectangle's Spectacle scheme uses ⌥⌘ (⌥⌘C Center).
+#:   Moom and BetterTouchTool use only the shortcuts their user records. macOS binds
+#:   no ⌃⌥⌘+letter (VoiceOver, while it runs, reads every ⌃⌥ chord as a command of
+#:   its own). Hotkeys are registered exclusively, so a combination that another
+#:   app already holds is reported ("Hotkey unavailable: ⌃⌥⌘T is already in use by
+#:   another application") instead of firing in both apps.
+#:
+#: The table stays per platform so that one platform's defaults can change without
+#: touching the others; :data:`LEGACY_HOTKEYS` and :data:`LEGACY_HOTKEYS_X11` list
+#: what earlier builds used, and :func:`_migrate` moves untouched old files over.
+_HOTKEY_MODIFIERS: dict[str, str] = {"win32": "ctrl+alt+meta", "darwin": "ctrl+alt+meta"}
+_HOTKEY_MODIFIERS_OTHER = "ctrl+alt+meta"  # Linux/X11 and other Unix desktops
 
 
 def _default_hotkey(key: str) -> str:
@@ -353,22 +422,41 @@ def _migrate(data: dict[str, Any]) -> dict[str, Any]:
         data = {**data, "general": {**general, "backend": renamed}}
 
     hotkeys = data.get("hotkeys")
-    if isinstance(hotkeys, dict):
+    if isinstance(hotkeys, dict) and _file_version(data) < _HOTKEY_DEFAULTS_VERSION:
         stored = tuple(hotkeys.get(name) for name in _HOTKEY_FIELDS)
         if all(isinstance(v, str) for v in stored) and (
-            tuple(str(v).strip().lower() for v in stored) == LEGACY_HOTKEYS
+            tuple(str(v).strip().lower() for v in stored) in _earlier_default_hotkeys()
         ):
-            # All three still at the old defaults: the user never chose them.
+            # Written before today's defaults and all three still at an earlier
+            # build's defaults: the user never chose them. A newer file may hold the
+            # same values on purpose, which is why only old files are looked at.
             defaults = HotkeySettings()
             fresh = {name: getattr(defaults, name) for name in _HOTKEY_FIELDS}
-            # On macOS today's defaults are the old ones: nothing to say there.
-            if tuple(fresh.values()) != LEGACY_HOTKEYS:
-                log.info(
-                    "Hotkeys at the defaults of an earlier version; using today's defaults (%s)",
-                    ", ".join(fresh.values()),
-                )
-                data = {**data, "hotkeys": {**hotkeys, **fresh}}
+            log.info(
+                "Hotkeys at the defaults of an earlier version; using today's defaults (%s)",
+                ", ".join(fresh.values()),
+            )
+            data = {**data, "hotkeys": {**hotkeys, **fresh}}
     return data
+
+
+def _file_version(data: dict[str, Any]) -> int:
+    """The format version a settings dict was written with.
+
+    Files have always carried one; a missing or malformed value (a hand-written
+    file) counts as the oldest format.
+    """
+    version = data.get("version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        return 1
+    return version
+
+
+def _earlier_default_hotkeys() -> tuple[tuple[str, str, str], ...]:
+    """The hotkey trios that version 1 builds wrote as defaults on this platform."""
+    if sys.platform in ("win32", "darwin"):
+        return (LEGACY_HOTKEYS,)
+    return (LEGACY_HOTKEYS, LEGACY_HOTKEYS_X11)
 
 
 def _to_dict(obj: Any) -> Any:

@@ -11,24 +11,42 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 ### Added
 
 - Glance-to-switch: the cursor (and optionally keyboard focus) moves to the monitor you look at,
-  using head pose and iris position from any webcam.
+  using head pose and iris position from any webcam. MediaPipe's face-landmark model runs through
+  OpenCV's DNN module; the MediaPipe runtime, which contains a usage logger, is not used.
 - Per-monitor memory: the cursor returns to where you left it on each screen and the last-used
   window on that screen gets keyboard focus, without synthetic clicks.
-- Guards against accidental switches: dwell time, hysteresis at the bezel, typing and mouse grace
-  periods, cooldown, and off-screen glances (phone, desk) are ignored.
+- Guards against accidental switches: dwell time, hysteresis at the bezel, typing, mouse and
+  reading grace periods, and a cooldown. Glances at your phone or desk are recognised from the
+  calibration's estimate of where your head and eyes point, and ignored.
+- Robust face tracking: posture shifts are caught up within the same frame, strongly tilted heads
+  are found, and a poster or a colleague picked up while you were away gives way to you once you
+  are back.
 - Guided calibration for any number of monitors in any arrangement, with a quality grade and
-  cross-validated accuracy.
+  cross-validated accuracy, and one profile per monitor layout, camera and backend.
 - Adaptive learning from natural mouse use and drift alerts that suggest recalibration.
-- Walk-away detection: lock the session and/or switch displays off after a cancellable countdown,
-  and wake the displays when you return.
-- Privacy mode that fully releases the camera (hotkey and tray), automatic pause while the session
-  is locked or another app uses the camera, and an app list that pauses tracking.
-- Shoulder-surfer guard that reacts when a second face appears behind you.
+- Walk-away detection: lock the session and/or switch the displays off after a cancellable
+  countdown, and wake the displays when you return. Until the setup assistant is finished, walking
+  away only shows a notification.
+- Privacy mode that fully releases the camera (hotkey and tray); automatic pause while the session
+  is locked, while another app uses the camera (Windows and Linux) and while apps from a list run.
+- An opt-in shoulder-surfer guard that covers the screens, notifies or locks when a second face
+  appears behind you. Faces are counted, never recognised, and the guard never decides whether you
+  are at the computer.
 - Adaptive frame rate and a motion gate for very low CPU use; Eco, Balanced and Responsive profiles.
-- Global hotkeys on Windows, macOS and X11, plus `eye-tracker ctl` for binding shortcuts on Wayland.
+- Global hotkeys on Windows (Ctrl+Alt+Win+T/P/C), macOS (⌃⌥⌘T/P/C) and X11 (Ctrl+Alt+Super+T/P/C).
+  A combination that would type a character, that a keyboard-layout option makes impossible to
+  press, or that another app owns is reported instead of failing silently. On Wayland,
+  `eye-tracker ctl` commands can be bound to desktop shortcuts.
 - Start at login on Windows, macOS and Linux.
-- `eye-tracker doctor` diagnostics and `eye-tracker bench` performance measurement.
-- Windows installer and portable ZIP, macOS DMG (Apple silicon), Linux AppImage and tarball.
+- `eye-tracker doctor` diagnostics that are safe to paste into a public issue (the home folder is
+  shown as `~`), including hotkey registration, the installed Linux lock tools and the command of
+  your copy; `eye-tracker bench` performance measurement.
+- Windows installer (per user; optionally puts an `eye-tracker` command on the PATH, and restarts
+  the app after a silent upgrade) and portable ZIP, macOS DMG (macOS 14 or later, Apple silicon),
+  Linux AppImage and tarball (without Qt's GTK theme and its VNC, WebGL and framebuffer platform
+  plugins).
+- A privacy gate that fails CI on networking or frame-writing code and scans every bundled native
+  library and Python module of the release builds.
 
 [Unreleased]: https://github.com/bugraskl/eye-tracker/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/bugraskl/eye-tracker/releases/tag/v0.1.0

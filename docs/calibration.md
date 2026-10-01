@@ -16,7 +16,8 @@ monitors. It takes about 15 seconds per monitor and you normally do it once per 
 
 ## Running it
 
-Start it from the tray menu (**Calibrate…**), with the hotkey, or from a terminal:
+Start it from the tray menu (**Calibrate…**), with the hotkey, from **Settings → General →
+Recalibrate…**, or from a terminal ([which command](../README.md#command-line)):
 
 ```bash
 eye-tracker calibrate
@@ -27,11 +28,16 @@ eye-tracker calibrate
    normally do when you look at that spot. Don't hold your head artificially still, and don't
    exaggerate either.
 3. The ring shrinks while your eyes settle, then fills while samples are collected. The next dot
-   follows automatically; the dots walk across each monitor in turn.
+   follows automatically; the dots walk across each monitor in turn. **Space** pauses and resumes
+   the dots, **R** starts over.
 4. At the end you get a grade and the accuracy per monitor. Press **Enter** to save, **R** to retry.
 
-If the hint *"Can't see your face"* appears, check the camera direction and the lighting; the dot
-waits and retries once before it is skipped.
+If *"Can't see your face — check the camera"* appears, the dots pause until your face is visible
+again: check the camera direction and the lighting. After 60 seconds without a face the calibration
+closes. A dot that gets too few usable samples (*"Keep looking at the dot…"*) is tried once more,
+then skipped. While the window waits for a key (the instructions, the result, or paused with
+**Space**), it closes after 2 minutes without one. Walk-away detection is off while the calibration
+is open, which is why it never stays open unattended.
 
 ## Understanding the grade
 
@@ -50,8 +56,11 @@ the model has not memorised.
 
 After calibration, Eye Tracker quietly learns from how you use the mouse: when you move the pointer
 somewhere and stop, you are almost always looking there. These samples refine the calibration over
-time (turn this off under **Settings → Switching → Learn from how I use the mouse**). If the app notices that
-you often correct it by hand, it suggests a recalibration.
+time (turn this off under **Settings → Switching → Learn from how I use the mouse**). **Keep at
+most … samples** limits how many are kept; lowering it (0 forgets them all) applies to every saved
+calibration the next time it is used. If the app notices that you often correct it by hand, it
+suggests a recalibration. On Wayland nothing is learned: apps cannot read the pointer position
+there.
 
 ## When to recalibrate
 
@@ -61,6 +70,8 @@ you often correct it by hand, it suggests a recalibration.
   calibrated.
 - You switched to a different camera or to the other vision backend.
 - The app suggests it.
+- You calibrated with an earlier version and glances at your phone or keyboard still switch
+  monitors: a new calibration enables the current looking-away detection.
 
 ## Tips for tricky setups
 

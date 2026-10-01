@@ -11,7 +11,9 @@ Low CPU use comes from four mechanisms:
 
 * the loop sleeps between frames for the interval chosen by the rate scheduler,
 * a :class:`~eye_tracker.vision.motion.MotionGate` skips inference while the
-  picture is unchanged (a copy of the last observation is emitted instead),
+  picture is unchanged (a copy of the last observation is emitted instead;
+  never of a blink, nor of an observation the backend has not settled on, see
+  ``VisionBackend.settled``),
 * OpenCV's thread pool is capped (see :mod:`eye_tracker.vision.threads`), and
 * the camera is released entirely whenever the worker is inactive.
 
@@ -446,10 +448,15 @@ class VisionWorker:
         last = self._last_obs
         # Never hold a closed-eyes observation: the reopening can be too subtle
         # for the gate, and a repeated blink would suppress gaze for seconds.
+        # Nor one the backend has not settled on (its tracking crop was still
+        # catching up with a moved face): the picture stops changing as soon as
+        # the user sits still again, and the gate would repeat the biased
+        # features for seconds.
         if (
             use_gate
             and last is not None
             and not last.blink
+            and backend.settled
             and not self._gate.should_process(frame, now)
         ):
             self._record_frame(now, read_ms, skipped=True)
@@ -631,8 +638,21 @@ class VisionWorker:
             self._applied_max_faces = cfg.max_faces
 
     def _reset_tracking(self) -> None:
+        """Forget the last frame: the next one is analysed afresh by gate and backend.
+
+        Called whenever the camera was released or replaced. The backend (kept
+        for up to :attr:`IDLE_BACKEND_CLOSE_S`) must forget the face it tracked
+        too: after a pause the picture can be a different one, and a crop left
+        over from before would latch onto whatever face is there now.
+        """
         self._gate.reset()
         self._last_obs = None
+        backend = self._backend
+        if backend is not None:
+            try:
+                backend.reset()
+            except Exception:
+                self._log_throttled("reset", "Vision backend failed to reset", exc=True)
 
     # -------------------------------------------------------------- waiting
     def _go_idle(self) -> None:

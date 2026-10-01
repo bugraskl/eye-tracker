@@ -368,6 +368,61 @@ def test_lock_without_any_locker(plat: linux.LinuxPlatform, tools: FakeTools) ->
     assert tools.calls == []
 
 
+def test_lock_methods_lists_installed_tools_in_the_order_they_are_tried(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
+) -> None:
+    """Regression (r2-docs-13): doctor showed "lock yes" whenever loginctl was installed."""
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "GNOME")
+    tools.install("gdbus", "dm-tool", "loginctl", "qdbus6")
+    assert plat.lock_methods() == [
+        "loginctl lock-session",
+        "dm-tool lock",
+        "qdbus6 org.freedesktop.ScreenSaver.Lock",
+        "gdbus org.freedesktop.ScreenSaver.Lock",
+    ]
+    assert tools.calls == []  # listing runs nothing, not even a session lookup
+    assert all(method.isascii() for method in plat.lock_methods())
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"XDG_CURRENT_DESKTOP": "i3"},
+        {"XDG_CURRENT_DESKTOP": "GNOME", "SWAYSOCK": "/run/user/1000/sway-ipc.sock"},
+    ],
+)
+def test_lock_methods_flags_loginctl_where_nothing_may_listen(
+    monkeypatch: pytest.MonkeyPatch,
+    plat: linux.LinuxPlatform,
+    tools: FakeTools,
+    env: dict[str, str],
+) -> None:
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    tools.install("loginctl", "xdg-screensaver")
+    loginctl, xdg = plat.lock_methods()
+    assert loginctl.startswith("loginctl lock-session (")
+    assert "listens to logind" in loginctl
+    assert xdg == "xdg-screensaver lock"
+
+
+def test_lock_methods_without_any_tool(plat: linux.LinuxPlatform) -> None:
+    assert plat.lock_methods() == []
+
+
+def test_doctor_shows_the_linux_lock_methods(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
+) -> None:
+    from eye_tracker import diagnostics
+
+    monkeypatch.setattr(diagnostics.sys, "platform", "linux")
+    tools.install("loginctl")
+    section = diagnostics._platform_section(plat)
+    assert section["lock_methods"] == plat.lock_methods()
+    assert "known when it is tried" in section["notes"]["lock"]
+
+
 def test_lock_resolves_display_session_without_session_id(
     monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
 ) -> None:
@@ -376,10 +431,12 @@ def test_lock_resolves_display_session_without_session_id(
     tools.install("loginctl")
     tools.respond(["loginctl", "show-user"], (0, "3\n"))
     tools.respond(["loginctl", "lock-session"], (0, ""))
+    tools.respond(["loginctl", "show-session"], (0, "yes\n"))
     assert plat.lock_screen() is True
     assert tools.calls == [
         ["loginctl", "show-user", "1000", "-p", "Display", "--value"],
         ["loginctl", "lock-session", "3"],
+        ["loginctl", "show-session", "3", "-p", "LockedHint", "--value"],  # GNOME confirmed it
     ]
 
 
@@ -395,16 +452,124 @@ def test_lock_falls_back_to_callers_session(
     assert tools.calls[-1] == ["loginctl", "lock-session"]
 
 
-@pytest.mark.parametrize("desktop", ["GNOME", "KDE", "X-Cinnamon", "MATE", "XFCE", "Budgie:GNOME"])
+@pytest.mark.parametrize("desktop", ["X-Cinnamon", "MATE", "XFCE"])
 def test_lock_trusts_loginctl_on_desktops_that_handle_it(
     monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, desktop: str
 ) -> None:
+    # Their lock screens listen to logind but do not all report LockedHint.
     monkeypatch.setenv("XDG_SESSION_ID", "2")
     monkeypatch.setenv("XDG_CURRENT_DESKTOP", desktop)
     tools.install(*_ALL_LOCKERS)
     tools.respond(["loginctl", "lock-session"], (0, ""))
     assert plat.lock_screen() is True
     assert tools.calls == [["loginctl", "lock-session", "2"]]
+
+
+_HINT_QUERY = ["loginctl", "show-session", "2", "-p", "LockedHint", "--value"]
+
+
+@pytest.mark.parametrize("desktop", ["GNOME", "KDE", "Budgie:GNOME"])
+def test_lock_on_gnome_and_kde_is_confirmed_by_locked_hint(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, desktop: str
+) -> None:
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", desktop)
+    tools.install(*_ALL_LOCKERS)
+    tools.respond(["loginctl", "lock-session"], (0, ""))
+    hints = ["no\n"]
+    tools.respond(["loginctl", "show-session"], lambda argv: (0, hints.pop(0) if hints else "yes"))
+    assert plat.lock_screen() is True
+    assert tools.calls == [["loginctl", "lock-session", "2"], _HINT_QUERY, _HINT_QUERY]
+
+
+def test_lock_refused_by_gnome_policy_is_reported(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools, clock: Clock
+) -> None:
+    """disable-lock-screen: gnome-shell ignores every request, yet the tools exit with 0."""
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "ubuntu:GNOME")
+    tools.install("loginctl", "xdg-screensaver", "gdbus")
+    tools.respond(["loginctl", "lock-session"], (0, ""))
+    tools.respond(["xdg-screensaver"], (0, ""))
+    tools.respond(["gdbus"], (0, "()"))
+    tools.respond(["loginctl", "show-session"], (0, "no\n"))
+    started = clock.now
+    # False: the controller warns, and the shoulder guard falls back to its curtain.
+    assert plat.lock_screen() is False
+    locks = [call for call in tools.calls if call[:2] != ["loginctl", "show-session"]]
+    assert [call[0] for call in locks] == ["loginctl", "xdg-screensaver", "gdbus"]
+    # Each claimed success was checked for the bounded confirmation time.
+    assert clock.now - started == pytest.approx(3 * linux._LOCK_CONFIRM_S)
+
+
+def test_lock_on_gnome_confirmed_after_another_locker(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
+) -> None:
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "GNOME")
+    tools.install("loginctl", "xdg-screensaver", "dm-tool")
+    tools.respond(["loginctl", "lock-session"], (0, ""))
+    locked: list[bool] = []
+    tools.respond(["xdg-screensaver"], lambda argv: (locked.append(True) or 0, ""))
+    tools.respond(["loginctl", "show-session"], lambda argv: (0, "yes" if locked else "no"))
+    assert plat.lock_screen() is True
+    assert ["dm-tool", "lock"] not in tools.calls  # no second lock screen on top
+
+
+def test_lock_on_gnome_seen_late_is_not_a_failure(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
+) -> None:
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "KDE")
+    tools.install("loginctl")
+    tools.respond(["loginctl", "lock-session"], (0, ""))
+    hint = ["no"]
+    tools.respond(["loginctl", "show-session"], lambda argv: (0, hint[0]))
+
+    def too_late(session: str | None, *, trust_unknown: bool) -> bool:
+        hint[0] = "yes"  # the lock screen comes up just after the wait
+        return False
+
+    monkeypatch.setattr(plat, "_lock_confirmed", too_late)
+    assert plat.lock_screen() is True
+
+
+def test_lock_on_gnome_without_a_readable_hint_trusts_the_desktop(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, tools: FakeTools
+) -> None:
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "GNOME")
+    tools.install("loginctl", "xdg-screensaver")
+    tools.respond(["loginctl", "lock-session"], (0, ""))
+    tools.respond(["loginctl", "show-session"], (1, "Failed to get session\n"))
+    assert plat.lock_screen() is True
+    assert ["xdg-screensaver", "lock"] not in tools.calls
+
+
+@pytest.mark.parametrize(
+    "socket_var", ["SWAYSOCK", "I3SOCK", "HYPRLAND_INSTANCE_SIGNATURE", "NIRI_SOCKET"]
+)
+def test_compositor_posing_as_gnome_is_not_trusted(
+    monkeypatch: pytest.MonkeyPatch,
+    plat: linux.LinuxPlatform,
+    tools: FakeTools,
+    proc_tree: ProcTree,
+    socket_var: str,
+) -> None:
+    """sway with XDG_CURRENT_DESKTOP=GNOME (for portals) and no swayidle lock hook."""
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    wayland(monkeypatch, "GNOME")
+    monkeypatch.setenv(socket_var, "/run/user/1000/wm.sock")
+    assert not linux._desktop_handles_logind_lock(os.environ)
+    assert not linux._locked_hint_authoritative(os.environ)
+    tools.install("loginctl")
+    tools.respond(["loginctl", "lock-session"], (0, ""))
+    tools.respond(["loginctl", "show-session"], (0, "no\n"))
+    assert plat.lock_screen() is False  # nothing locked: say so
+    # A locker started by hand is noticed, although the hint says "unlocked".
+    proc_tree.process(200, [], comm="swaylock")
+    plat._locked_cache = None
+    assert plat.is_session_locked() is True
 
 
 def test_lock_unconfirmed_loginctl_tries_other_lockers(
@@ -831,10 +996,105 @@ def test_session_locked_ignores_other_users_lockers(
     monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, proc_tree: ProcTree
 ) -> None:
     monkeypatch.setenv("XDG_CURRENT_DESKTOP", "i3")
+    proc_tree.login(1000)
+    proc_tree.process(300, [], comm="i3lock", loginuid=1001)  # another user's login
+    proc_tree.process(301, [], comm="slock", loginuid=linux._AUDIT_UID_UNSET)  # no login
+    owner = os.stat(proc_tree.proc / "300").st_uid
+    monkeypatch.setattr(linux, "_getuid", lambda: owner + 1)  # none of the entries is ours
+    assert plat.is_session_locked() is False
+
+
+def test_session_locked_by_own_locker_outside_a_login(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, proc_tree: ProcTree
+) -> None:
+    """A locker started by a service (no login UID) still counts when we own it."""
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "i3")
+    proc_tree.login(1000)
+    proc_tree.process(300, [], comm="swaylock", loginuid=linux._AUDIT_UID_UNSET)
+    monkeypatch.setattr(linux, "_getuid", lambda: os.stat(proc_tree.proc / "300").st_uid)
+    assert plat.is_session_locked() is True
+
+
+def test_session_locked_by_a_setuid_locker_when_we_have_no_login_uid(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, proc_tree: ProcTree
+) -> None:
+    """Started outside a login ourselves: the locker's login UID is compared with our UID."""
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "i3")
+    proc_tree.login(linux._AUDIT_UID_UNSET)
+    proc_tree.process(400, [], comm="slock")
+    owner = os.stat(proc_tree.proc / "400").st_uid
+    monkeypatch.setattr(linux, "_getuid", lambda: owner + 1)  # root's entry, not ours
+    (proc_tree.proc / "400" / "loginuid").write_text(str(owner + 2))  # another user's
+    assert plat.is_session_locked() is False
+    (proc_tree.proc / "400" / "loginuid").write_text(str(owner + 1))  # ours
+    plat._locked_cache = None
+    assert plat.is_session_locked() is True
+
+
+def test_session_locked_by_a_setuid_locker(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, proc_tree: ProcTree
+) -> None:
+    """xss-lock -- slock: slock runs as 'nobody' and its /proc entry belongs to root."""
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "i3")
+    proc_tree.login(1000)
+    proc_tree.process(100, [], comm="i3", loginuid=1000)
+    proc_tree.process(400, [], comm="slock", loginuid=1000)
+    owner = os.stat(proc_tree.proc / "400").st_uid
+    monkeypatch.setattr(linux, "_getuid", lambda: owner + 1)  # the entry is not ours
+    assert plat.is_session_locked() is True
+
+
+def test_session_locked_without_login_uids_falls_back_to_the_owner(
+    monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform, proc_tree: ProcTree
+) -> None:
+    # A kernel without audit support: no loginuid files at all.
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "i3")
     proc_tree.process(300, [], comm="i3lock")
     owner = os.stat(proc_tree.proc / "300").st_uid
     monkeypatch.setattr(linux, "_getuid", lambda: owner + 1)
     assert plat.is_session_locked() is False
+    monkeypatch.setattr(linux, "_getuid", lambda: owner)
+    plat._locked_cache = None
+    assert plat.is_session_locked() is True
+
+
+def test_lock_confirmed_by_a_setuid_locker(
+    monkeypatch: pytest.MonkeyPatch, clock: Clock, tools: FakeTools, proc_tree: ProcTree
+) -> None:
+    """No second locker (dm-tool: a second unlock) on top of slock."""
+    monkeypatch.setenv("XDG_SESSION_ID", "2")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "i3")
+    proc_tree.login(1000)
+    tools.install("loginctl", "dm-tool")
+    tools.respond(["loginctl", "lock-session"], (0, ""))
+    tools.respond(["loginctl", "show-session"], (0, "no\n"))  # xss-lock never sets it
+
+    def sleep(seconds: float) -> None:
+        clock.advance(seconds)
+        proc_tree.process(4321, [], comm="slock", loginuid=1000)
+
+    platform = linux.LinuxPlatform(
+        proc_root=proc_tree.proc,
+        dev_root=proc_tree.dev,
+        sys_root=proc_tree.sys,
+        clock=clock,
+        sleep=sleep,
+        background_threads=False,
+    )
+    platform._dbus = FakeDBus()  # type: ignore[assignment]
+    monkeypatch.setattr(linux, "_getuid", lambda: 12345)  # slock's entry belongs to root
+    assert platform.lock_screen() is True
+    assert ["dm-tool", "lock"] not in tools.calls
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("1000\n", 1000), ("0", 0), ("4294967295", None), ("", None), ("junk", None)],
+)
+def test_login_uid_parsing(tmp_path: Path, text: str, expected: int | None) -> None:
+    (tmp_path / "loginuid").write_text(text)
+    assert linux._login_uid(str(tmp_path)) == expected
+    assert linux._login_uid(str(tmp_path / "missing")) is None
 
 
 def test_session_locked_without_logind_session_relies_on_lockers(
@@ -1285,13 +1545,26 @@ class ProcTree:
         if physical:
             (entry / "device").mkdir()
 
-    def process(self, pid: int, targets: list[str], comm: str = "app", maps: str = "") -> None:
+    def process(
+        self,
+        pid: int,
+        targets: list[str],
+        comm: str = "app",
+        maps: str = "",
+        loginuid: int | None = None,
+    ) -> None:
         base = self.proc / str(pid)
         (base / "fd").mkdir(parents=True, exist_ok=True)
         for fd, target in enumerate(targets):
             (base / "fd" / str(fd)).write_text(target)
         (base / "comm").write_text(comm + "\n")
         (base / "maps").write_text(maps)
+        if loginuid is not None:
+            (base / "loginuid").write_text(str(loginuid))
+
+    def login(self, loginuid: int) -> None:
+        """This process's audit login UID (``/proc/self/loginuid``)."""
+        (self.proc / "self" / "loginuid").write_text(str(loginuid))
 
     def remove(self, pid: int) -> None:
         shutil.rmtree(self.proc / str(pid))
@@ -1580,12 +1853,24 @@ class FakeNotifier:
         self.events: list[list[linux._CameraEvent]] = []
         self.ready = threading.Event()
         self.closed = False
+        self.broken = False
+        self.waits = 0
+
+    @property
+    def alive(self) -> bool:
+        return not self.broken and not self.closed
 
     def push(self, events: list[linux._CameraEvent]) -> None:
         self.events.append(events)
         self.ready.set()
 
+    def break_down(self) -> None:
+        """Fail like a descriptor that cannot be read any more (see _FdNotifier.wait)."""
+        self.broken = True
+        self.push([linux._CameraEvent(opened=False, foreign=None)])
+
     def wait(self, timeout: float) -> list[linux._CameraEvent]:
+        self.waits += 1
         if self.ready.wait(timeout):
             self.ready.clear()
             return self.events.pop(0) if self.events else []
@@ -1668,6 +1953,75 @@ def test_camera_thread_stops_when_nobody_asks(
     assert _eventually(lambda: bool(notifiers) and notifiers[0].closed)
     platform.camera_in_use_by_other_app()  # asking again restarts it
     assert _eventually(lambda: len(notifiers) == 2)
+
+
+def test_camera_answer_after_an_idle_stop_is_fresh(
+    proc_tree: ProcTree, threaded: tuple[linux.LinuxPlatform, list[FakeNotifier]]
+) -> None:
+    """Resuming after a pause: the forced check must not read the pre-pause answer."""
+    platform, _notifiers = threaded
+    watcher = platform._camera
+    watcher.idle_stop_s = 0.1
+    watcher.first_scan_wait_s = 10.0  # generous for slow CI; it returns once the scan is done
+    proc_tree.device("video0")
+    assert _eventually(lambda: platform.camera_in_use_by_other_app() is False)
+    assert _eventually(lambda: watcher._thread is None)  # paused: nobody asked
+    proc_tree.process(100, ["/dev/video0"])  # a video call started meanwhile
+    assert platform.camera_in_use_by_other_app() is True  # at once, not one poll later
+    proc_tree.remove(100)
+    assert _eventually(lambda: watcher._thread is None)
+    assert platform.camera_in_use_by_other_app() is False  # and the reverse
+
+
+def test_camera_thread_that_dies_early_does_not_stall_the_query(
+    proc_tree: ProcTree, threaded: tuple[linux.LinuxPlatform, list[FakeNotifier]]
+) -> None:
+    platform, _notifiers = threaded
+    watcher = platform._camera
+    watcher.first_scan_wait_s = 30.0
+
+    def broken_devices() -> set[str] | None:
+        raise RuntimeError("sysfs vanished")
+
+    watcher._devices = broken_devices  # type: ignore[method-assign]
+    started = time.monotonic()
+    assert platform.camera_in_use_by_other_app() is None  # unknown, not stale
+    assert time.monotonic() - started < 5.0
+
+
+def test_camera_watcher_polls_once_its_notifier_broke(
+    proc_tree: ProcTree, threaded: tuple[linux.LinuxPlatform, list[FakeNotifier]]
+) -> None:
+    """Not the 30 s safety rescan of a working notifier, and no new notifier per failure."""
+    platform, notifiers = threaded
+    watcher = platform._camera
+    watcher.poll_s = 0.05
+    watcher.safety_rescan_s = 3600.0
+    proc_tree.device("video0")
+    assert _eventually(lambda: platform.camera_in_use_by_other_app() is False)
+    assert _eventually(lambda: bool(notifiers))
+    notifiers[0].break_down()
+    assert _eventually(lambda: notifiers[0].closed)
+    waits = notifiers[0].waits
+    proc_tree.process(100, ["/dev/video0"])  # no event will tell: only polling finds it
+    assert _eventually(lambda: platform.camera_in_use_by_other_app() is True)
+    assert len(notifiers) == 1
+    assert notifiers[0].waits == waits  # the dead notifier is not waited on any more
+
+
+def test_fd_notifier_reports_a_failing_descriptor_once(tmp_path: Path) -> None:
+    class Notifier(linux._FdNotifier):
+        def _parse(self, data: bytes) -> list[linux._CameraEvent]:
+            raise AssertionError("nothing can be read")
+
+    # A write-only file: waiting fails (Windows: select() wants sockets) or reading does.
+    fd = os.open(tmp_path / "node", os.O_WRONLY | os.O_CREAT)
+    notifier = Notifier(fd)
+    assert notifier.alive
+    assert notifier.wait(0.01) == [linux._CameraEvent(opened=False, foreign=None)]
+    assert not notifier.alive  # closed: the watcher polls from now on
+    assert notifier._fd == -1
+    assert notifier.wait(0.0) == []
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fanotify/inotify are Linux APIs")

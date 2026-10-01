@@ -19,6 +19,10 @@ zip file): the archive is verified, only the members the app needs are
 extracted, and each member is verified against its own pinned SHA-256. The
 archive itself is not kept.
 
+The models' licence texts (``licenses/`` next to the models) must ship with
+them. They are committed like the models but never downloaded: ``--check``
+fails when one is missing or altered, the other modes only warn.
+
 This is developer tooling that lives outside ``src/``: the application itself
 never touches the network.
 """
@@ -118,6 +122,42 @@ MODELS: tuple[Model, ...] = (
 )
 
 
+@dataclass(frozen=True)
+class LicenceText:
+    """A licence text that ships next to the models it covers (see NOTICE.md).
+
+    Apache-2.0 requires giving recipients a copy of the licence, and MIT
+    requires its copyright and permission notice in all copies, so a link is not
+    enough. The texts are committed to the repository and only verified.
+    """
+
+    #: Path relative to the model directory.
+    path: str
+    sha256: str
+    #: Where the text comes from.
+    source: str
+    #: Installed model files the licence covers.
+    covers: tuple[str, ...]
+
+
+LICENCE_TEXTS: tuple[LicenceText, ...] = (
+    LicenceText(
+        path="licenses/LICENSE-APACHE-2.0.txt",
+        sha256="cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        source="https://www.apache.org/licenses/LICENSE-2.0.txt",
+        covers=("face_landmarks_detector.tflite", "geometry_pipeline_metadata_landmarks.binarypb"),
+    ),
+    LicenceText(
+        path="licenses/LICENSE-YUNET.txt",
+        sha256="2ad92c7a6eb7aebede4e19f5ec4930c8bd9d614dbb8e75be1f740edae346734c",
+        source=(
+            "https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/LICENSE"
+        ),
+        covers=("face_detection_yunet_2023mar.onnx",),
+    ),
+)
+
+
 class DownloadError(RuntimeError):
     """A model could not be downloaded or failed verification."""
 
@@ -141,6 +181,27 @@ def verify(model: Model, dest: Path) -> str:
         if sha256_file(path) != sha256:
             status = "mismatch"
     return status
+
+
+def verify_licence(text: LicenceText, dest: Path) -> str:
+    """``"ok"``, ``"missing"`` or ``"altered"`` for a licence text in ``dest``."""
+    path = dest / text.path
+    if not path.is_file():
+        return "missing"
+    return "ok" if sha256_file(path) == text.sha256 else "altered"
+
+
+def check_licences(dest: Path) -> int:
+    """Report every licence text's status; returns how many are missing or altered."""
+    problems = 0
+    for text in LICENCE_TEXTS:
+        status = verify_licence(text, dest)
+        if status == "ok":
+            print(f"  licence  {text.path} (sha256 verified)")
+            continue
+        problems += 1
+        print(f"  {status:<8} {text.path}  (restore it from git: it must ship with the models)")
+    return problems
 
 
 def _human_size(n: int) -> str:
@@ -309,10 +370,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         size = _human_size(_installed_size(model, dest))
         print(f"  ok       {_describe(model)} ({size}, verified)")
 
+    licence_problems = check_licences(dest)
     if failures:
         print(f"{failures} model(s) missing or invalid in {dest}", file=sys.stderr)
-        return 1
-    return 0
+    if licence_problems:
+        # Committed files, never downloaded: only --check (CI, release builds)
+        # fails on them; fetching models into another folder merely warns.
+        prefix = "" if args.check else "warning: "
+        print(
+            f"{prefix}{licence_problems} licence text(s) missing or altered in {dest}",
+            file=sys.stderr,
+        )
+    return 1 if failures or (args.check and licence_problems) else 0
 
 
 if __name__ == "__main__":

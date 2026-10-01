@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import plistlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -1023,6 +1024,84 @@ def test_accessibility_never_granted_is_missing_for_packaged_builds(
     fresh = macos.MacPlatform(state_path=state_path)
     fresh._modules["ApplicationServices"] = ax
     assert fresh.accessibility_status() == "missing"
+
+
+def _app_bundle(root: Path, *, plist: bytes | None = None) -> tuple[Path, Path]:
+    """``Eye Tracker.app`` as the spec builds it: ``(app executable, eye-tracker-cli)``."""
+    macos_dir = root / "Eye Tracker.app" / "Contents" / "MacOS"
+    macos_dir.mkdir(parents=True)
+    app = macos_dir / "Eye Tracker"
+    cli = macos_dir / "eye-tracker-cli"
+    app.write_bytes(b"\0" * 300)  # written and signed separately: sizes and mtimes differ
+    cli.write_bytes(b"\0" * 200)
+    if plist is None:
+        plist = plistlib.dumps({"CFBundleExecutable": "Eye Tracker"})
+    (macos_dir.parent / "Info.plist").write_bytes(plist)
+    return app, cli
+
+
+def _run_as(monkeypatch: pytest.MonkeyPatch, executable: Path) -> None:
+    monkeypatch.setattr(macos.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(macos.sys, "executable", str(executable))
+
+
+def test_build_fingerprint_is_the_apps_in_both_executables(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    app, cli = _app_bundle(tmp_path)
+    _run_as(monkeypatch, app)
+    from_app = macos._build_fingerprint()
+    assert from_app is not None
+    assert from_app.endswith(":300:" + str(app.stat().st_mtime_ns))
+    assert macos._runs_helper_executable() is False
+    _run_as(monkeypatch, cli)
+    assert macos._build_fingerprint() == from_app
+    assert macos._runs_helper_executable() is True
+
+
+@pytest.mark.parametrize(
+    "plist",
+    [b"not a plist", plistlib.dumps({"CFBundleExecutable": "../evil"}), plistlib.dumps([])],
+)
+def test_build_fingerprint_without_a_usable_info_plist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, plist: bytes
+) -> None:
+    _app, cli = _app_bundle(tmp_path, plist=plist)
+    _run_as(monkeypatch, cli)
+    fingerprint = macos._build_fingerprint()
+    assert fingerprint is not None
+    assert ":200:" in fingerprint  # its own file, as before
+    assert macos._runs_helper_executable() is True  # still known by its name
+
+
+def test_cli_does_not_judge_or_record_the_apps_accessibility_grant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clock: Clock, state_path: Path
+) -> None:
+    """`eye-tracker-cli doctor` from Terminal: macOS asks about Terminal, not the app."""
+    app, cli = _app_bundle(tmp_path)
+    _run_as(monkeypatch, app)
+    gui = macos.MacPlatform(clock=clock, state_path=state_path)
+    fake = FakeAX()
+    gui._modules["ApplicationServices"] = fake
+    assert gui.accessibility_status() == "granted"
+    recorded = state_path.read_text(encoding="utf-8")
+
+    _run_as(monkeypatch, cli)
+    fake.trusted = False  # Terminal has no Accessibility access
+    doctor = macos.MacPlatform(clock=clock, state_path=state_path)
+    doctor._modules["ApplicationServices"] = fake
+    assert doctor.accessibility_status() == "unknown"  # not "stale", not "missing"
+    assert doctor.permissions()["accessibility"] is None
+    assert state_path.read_text(encoding="utf-8") == recorded
+
+    # Terminal has Accessibility access: not a grant of this (or any) app build.
+    state_path.write_text(json.dumps({"trusted_build": "0.9:1:1"}), encoding="utf-8")
+    fake.trusted = True
+    trusted_terminal = macos.MacPlatform(clock=clock, state_path=state_path)
+    trusted_terminal._modules["ApplicationServices"] = fake
+    assert trusted_terminal.accessibility_status() == "granted"
+    assert trusted_terminal.permissions()["accessibility"] is True
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {"trusted_build": "0.9:1:1"}
 
 
 def test_activation_without_accessibility_fails_on_sonoma(

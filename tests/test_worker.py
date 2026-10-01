@@ -86,6 +86,7 @@ class FakeBackend(VisionBackend):
         self.fail_times = fail_times
         self.process_calls = 0
         self.close_calls = 0
+        self.reset_calls = 0
         self.max_faces_calls: list[int] = []
         self.timestamps: list[float] = []
         self.threads: set[int] = set()
@@ -111,6 +112,10 @@ class FakeBackend(VisionBackend):
     def set_max_faces(self, n: int) -> None:
         self.threads.add(threading.get_ident())
         self.max_faces_calls.append(n)
+
+    def reset(self) -> None:
+        self.threads.add(threading.get_ident())
+        self.reset_calls += 1
 
     def annotate(self, frame_bgr: np.ndarray, observation: Observation) -> np.ndarray:
         out = frame_bgr.copy()
@@ -282,7 +287,7 @@ def test_stop_from_callback_does_not_deadlock() -> None:
     h.worker._on_observation = stop_on_first
     h.worker.start()
     assert wait_until(lambda: not h.worker.is_running)
-    assert wait_until(lambda: h.backends and h.backends[0].close_calls == 1)
+    assert wait_until(lambda: bool(h.backends) and h.backends[0].close_calls == 1)
 
 
 # -------------------------------------------------------------------- pacing
@@ -710,7 +715,12 @@ def test_stats_report_device_and_frame_size() -> None:
 
 def test_worker_caps_opencv_threads(monkeypatch: pytest.MonkeyPatch, harness: Harness) -> None:
     calls: list[int] = []
-    monkeypatch.setattr(worker_mod, "limit_opencv_threads", lambda: calls.append(1) or 1)
+
+    def fake_limit() -> int:
+        calls.append(1)
+        return 1
+
+    monkeypatch.setattr(worker_mod, "limit_opencv_threads", fake_limit)
     harness.worker.start()
     assert harness.recorder.wait_for(lambda: len(harness.recorder.observations) >= 1)
     assert calls == [1]
@@ -757,7 +767,11 @@ def test_stop_during_backend_creation_never_opens_the_camera() -> None:
         release.wait(TIMEOUT)
         return FakeBackend()
 
-    worker = VisionWorker(lambda: sources.append(FakeSource()) or sources[-1], slow_backend, print)
+    def recorded_source() -> FakeSource:
+        sources.append(FakeSource())
+        return sources[-1]
+
+    worker = VisionWorker(recorded_source, slow_backend, print)
     worker.start()
     assert creating.wait(TIMEOUT)
     stopper = threading.Thread(target=worker.stop, args=(TIMEOUT,))
@@ -868,6 +882,87 @@ def test_gate_never_holds_a_blink() -> None:
     assert [o.skipped for o in obs[:4]] == [False, False, False, False]
     assert not obs[3].blink
     assert all(o.skipped for o in obs[4:8])  # eyes open: the gate holds again
+
+
+class UnsettledBackend(FakeBackend):
+    """Reports ``settled = False`` after each of its first ``unsettled`` frames."""
+
+    def __init__(self, unsettled: int) -> None:
+        super().__init__()
+        self.unsettled = unsettled
+
+    @property
+    def settled(self) -> bool:
+        return self.process_calls > self.unsettled
+
+
+def test_gate_never_holds_an_unsettled_observation() -> None:
+    """r2-vision-01: features from a crop still catching up must not be repeated.
+
+    The user sits still right after a posture shift, so the picture stops
+    changing while the backend's tracking crop is still off; the gate used to
+    repeat that biased observation for max_skip_s.
+    """
+    backend = UnsettledBackend(unsettled=3)
+    obs = _run_worker(backend, lambda _n: np.full((48, 64, 3), 100, np.uint8), 8)
+    assert [o.skipped for o in obs[:4]] == [False, False, False, False]
+    assert all(o.skipped for o in obs[4:8])  # settled: the gate holds again
+    assert backend.process_calls == 4
+
+
+def test_backend_is_reset_whenever_the_camera_is_released(harness: Harness) -> None:
+    """A tracked face must not outlive a pause: the next picture may differ."""
+    harness.worker.set_motion_gate(False, 2.0)
+    harness.worker.start()
+    assert harness.recorder.wait_for(lambda: len(harness.recorder.observations) >= 2)
+    backend = harness.backends[0]
+    resets = backend.reset_calls
+    harness.worker.set_active(False)
+    assert wait_until(lambda: backend.reset_calls > resets)
+    assert wait_until(lambda: not harness.worker.stats.camera_open)
+    harness.worker.set_active(True)
+    n = harness.recorder.count()
+    assert harness.recorder.wait_for(lambda: len(harness.recorder.observations) >= n + 2)
+    assert harness.backends == [backend]  # the same backend, but forgetful
+    assert threading.get_ident() not in backend.threads
+    resets = backend.reset_calls
+    harness.worker.reconfigure(source_factory=harness.make_source)  # another camera
+    assert wait_until(lambda: backend.reset_calls > resets)
+
+
+def test_backend_is_reset_when_the_camera_stops_delivering() -> None:
+    h = Harness(die_after=2)
+    h.worker.set_motion_gate(False, 2.0)
+    h.worker.start()
+    try:
+        assert wait_until(lambda: len(h.sources) >= 2)  # died, then reopened
+        assert h.backends[0].reset_calls >= 1
+    finally:
+        h.worker.stop()
+
+
+def test_a_failing_backend_reset_does_not_stop_the_worker() -> None:
+    class BrokenReset(FakeBackend):
+        def reset(self) -> None:
+            super().reset()
+            raise RuntimeError("simulated reset failure")
+
+    backend = BrokenReset()
+    recorder = Recorder()
+    worker = VisionWorker(FakeSource, lambda: backend, recorder.on_observation)
+    worker.set_interval(0.002)
+    worker.set_motion_gate(False, 2.0)
+    worker.start()
+    try:
+        assert recorder.wait_for(lambda: len(recorder.observations) >= 2)
+        worker.set_active(False)
+        assert wait_until(lambda: backend.reset_calls >= 1)
+        worker.set_active(True)
+        n = recorder.count()
+        assert recorder.wait_for(lambda: len(recorder.observations) >= n + 2)
+        assert worker.is_running
+    finally:
+        worker.stop()
 
 
 # ------------------------------------------------------------------ blindness

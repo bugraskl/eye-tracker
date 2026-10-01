@@ -32,6 +32,10 @@ No webcam? Point the app at a video or photo instead:
 uv run eye-tracker --camera path/to/face-video.mp4
 ```
 
+`--camera`, `--backend` and `--trace` only apply when Eye Tracker starts: quit a running instance
+first (tray menu → **Quit Eye Tracker**, or `uv run eye-tracker ctl quit`), otherwise the command
+only hands over to it and says that the options were not applied.
+
 ## Checks
 
 Run everything CI runs before opening a pull request:
@@ -39,17 +43,28 @@ Run everything CI runs before opening a pull request:
 ```bash
 uv run ruff check .
 uv run ruff format --check .
-uv run mypy
+uv run mypy --platform linux     # CI type-checks the package as on all three systems
+uv run mypy --platform win32
+uv run mypy --platform darwin
+uv run mypy scripts packaging/pyinstaller/entry.py
 uv run python scripts/check_privacy.py
+uv run python scripts/fetch_models.py --check
 uv run pytest
 ```
 
+After changing a setting in `src/eye_tracker/config.py`, regenerate the configuration reference
+with `uv run python scripts/gen_config_docs.py` (a test fails while it is out of date). CI also runs
+`shellcheck` on the packaging shell scripts and `desktop-file-validate` on the Linux desktop entry.
+
 After a local PyInstaller build ([docs/building.md](docs/building.md)), also run the bundle privacy
-gate, which scans every bundled native library:
+gate, which scans every bundled native library and every Python module inside the executables:
 
 ```bash
 uv run python scripts/check_privacy.py --bundle dist/EyeTracker
 ```
+
+Pull requests that change `packaging/`, the privacy gate or the dependencies also build the
+bundles on all three platforms in CI (the *Bundle* workflow).
 
 Tests run Qt on the `offscreen` platform, so they work over SSH and on headless CI. Tests that need a
 real face photo are skipped unless `EYE_TRACKER_TEST_FACE` points to one (face photos are never
@@ -59,7 +74,8 @@ committed).
 
 ```
 src/eye_tracker/
-  vision/     camera capture, motion gate, face backends (MediaPipe, OpenCV), worker thread
+  vision/     camera capture, motion gate, face backends (facemesh: MediaPipe's landmark
+              model run with OpenCV DNN; lite: YuNet), worker thread
   gaze/       gaze regression model, smoothing, calibration, implicit learning
   engine/     switching decision, presence, shoulder guard, rate scheduler, controller
   platform/   OS integration (Windows, macOS, Linux), autostart, global hotkeys
@@ -85,8 +101,9 @@ GitHub Actions are pinned to full commit SHAs; Dependabot proposes updates.
 
 ## Reporting bugs
 
-Please use the bug report template and paste the output of `eye-tracker doctor`. It contains your
-OS, camera and monitor layout and feature support, and **no images or personal data**.
+Please use the bug report template and paste the output of `eye-tracker doctor` (the template says
+how to run it with each package). It contains your OS, camera and monitor layout and feature
+support, and **no images or personal data**.
 
 ## Code of conduct
 

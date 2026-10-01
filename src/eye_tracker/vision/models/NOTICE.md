@@ -3,7 +3,7 @@
 Eye Tracker ships three model files. They run entirely inside OpenCV (`cv2.dnn`
 and `cv2.FaceDetectorYN`); no other inference runtime is used and nothing is
 downloaded at run time. `scripts/fetch_models.py` recreates and verifies every
-file from the upstream sources below (`--check` verifies without network
+model file from the upstream sources below (`--check` verifies without network
 access), and `eye_tracker.vision.backends.MODEL_FILES` pins the same checksums.
 
 | File | Size (bytes) | SHA-256 | Licence |
@@ -12,11 +12,28 @@ access), and `eye_tracker.vision.backends.MODEL_FILES` pins the same checksums.
 | `geometry_pipeline_metadata_landmarks.binarypb` | 19 376 | `bdbcda96dfcb7da883da124aaa2c55dee49770d934f0fcc71747f8c21bdc75b4` | Apache-2.0 |
 | `face_detection_yunet_2023mar.onnx` | 232 589 | `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4` | MIT |
 
+The full licence texts ship with the models, in the `licenses` folder next to
+this file. They cover only these model files; Eye Tracker itself is under its
+own licence (`LICENSE` in the source tree).
+
+| Licence text | Covers | SHA-256 |
+| --- | --- | --- |
+| [`licenses/LICENSE-APACHE-2.0.txt`](licenses/LICENSE-APACHE-2.0.txt) | `face_landmarks_detector.tflite`, `geometry_pipeline_metadata_landmarks.binarypb` | `cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30` |
+| [`licenses/LICENSE-YUNET.txt`](licenses/LICENSE-YUNET.txt) | `face_detection_yunet_2023mar.onnx` | `2ad92c7a6eb7aebede4e19f5ec4930c8bd9d614dbb8e75be1f740edae346734c` |
+
+`LICENSE-APACHE-2.0.txt` is the Apache License, Version 2.0, exactly as
+published at <https://www.apache.org/licenses/LICENSE-2.0.txt>.
+`LICENSE-YUNET.txt` reproduces the YuNet model's licence notice (copyright line
+and MIT permission notice) from
+<https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/LICENSE>.
+`scripts/fetch_models.py --check` fails when either text is missing or altered.
+
 ## MediaPipe Face Landmarker (Apache-2.0)
 
-Copyright Google LLC. Licensed under the Apache License, Version 2.0
-(<https://www.apache.org/licenses/LICENSE-2.0>). Model card and documentation:
-<https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker>.
+Copyright Google LLC. Licensed under the Apache License, Version 2.0; a copy of
+the licence is in [`licenses/LICENSE-APACHE-2.0.txt`](licenses/LICENSE-APACHE-2.0.txt)
+(also at <https://www.apache.org/licenses/LICENSE-2.0>). Model card and
+documentation: <https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker>.
 
 Both files are unmodified members of the official `face_landmarker.task` bundle
 (float16, version 1), a stored (uncompressed) zip archive:
@@ -39,8 +56,10 @@ Google servers. Only the model weights and geometry data are redistributed.
 ## YuNet face detector (MIT)
 
 From the OpenCV Zoo, originally trained in libfacedetection.train by Shiqi Yu
-and contributors; licensed under the MIT License
-(<https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/LICENSE>).
+and contributors. Copyright (c) 2020 Shiqi Yu <shiqi.yu@gmail.com>. Licensed
+under the MIT License; the copyright and permission notice are in
+[`licenses/LICENSE-YUNET.txt`](licenses/LICENSE-YUNET.txt) (upstream:
+<https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/LICENSE>).
 
 - Upstream URL: <https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx>
 - Documentation: <https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet>

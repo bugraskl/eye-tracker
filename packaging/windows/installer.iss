@@ -3,6 +3,11 @@
 ; Per-user install into %LOCALAPPDATA%\Programs\Eye Tracker: no administrator rights,
 ; no UAC prompt, nothing written outside the user's profile.
 ;
+; The "addtopath" task (on by default) installs the command-line tool a second time
+; as eye-tracker.exe and adds the installation folder to the user's PATH, so the
+; documented "eye-tracker <command>" works in any new terminal; uninstalling (or
+; unticking the task in an upgrade) removes that PATH entry again.
+;
 ; Build from the repository root after PyInstaller has produced dist\EyeTracker:
 ;
 ;   iscc /DAppVersion=0.1.0 packaging\windows\installer.iss
@@ -34,6 +39,9 @@
 #define AppGuid "F2F98F7C-0EEF-44D5-ADDE-173D9D8BA82B"
 #define AppExeName "EyeTracker.exe"
 #define CliExeName "eye-tracker-cli.exe"
+; The same console program under the name the documentation uses ("eye-tracker
+; doctor"), found through PATH. Start-at-sign-in keeps using the windowed AppExeName.
+#define CliCommandExeName "eye-tracker.exe"
 ; Same ID the app sets at run time (SetCurrentProcessExplicitAppUserModelID), so
 ; notifications and the taskbar group with the Start menu shortcut.
 #define AppUserModelID "io.github.bugraskl.eyetracker"
@@ -97,6 +105,9 @@ SolidCompression=yes
 ; Anything still holding our files after "ctl quit" is released through the Restart Manager.
 CloseApplications=yes
 RestartApplications=no
+; The "addtopath" task edits the user's PATH: tell Explorer (and new terminals) after
+; installing and uninstalling.
+ChangesEnvironment=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -111,10 +122,15 @@ english.ShortcutComment=Glance at a monitor to move your cursor and focus there
 turkish.ShortcutComment=Bir monitöre bakın; imleç ve odak oraya geçsin
 english.RemoveUserData=Also delete your {#AppName} settings, calibration and logs?%n%nChoose No to keep them for a future installation.
 turkish.RemoveUserData={#AppName} ayarlarınız, kalibrasyonunuz ve günlük dosyalarınız da silinsin mi?%n%nİleride yeniden kurmak üzere saklamak için Hayır'ı seçin.
+english.CommandLineGroup=Command line:
+turkish.CommandLineGroup=Komut satırı:
+english.AddToPath=Add the "eye-tracker" command to PATH (for diagnostics and keyboard shortcuts)
+turkish.AddToPath="eye-tracker" komutunu PATH'e ekle (tanılama ve klavye kısayolları için)
 
 [Tasks]
 Name: "startup"; Description: "{cm:StartAtLogin}"; GroupDescription: "{cm:AutostartGroup}"; Flags: unchecked
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "addtopath"; Description: "{cm:AddToPath}"; GroupDescription: "{cm:CommandLineGroup}"
 
 [InstallDelete]
 ; One-folder builds change file names between releases; start from a clean
@@ -123,6 +139,9 @@ Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
 Source: "{#BundleDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Always installed, so "eye-tracker.exe" has one documented place even without the
+; PATH entry. It must sit next to _internal, which a one-folder build loads from.
+Source: "{#BundleDir}\{#CliExeName}"; DestDir: "{app}"; DestName: "{#CliCommandExeName}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; AppUserModelID: "{#AppUserModelID}"; Comment: "{cm:ShortcutComment}"
@@ -137,6 +156,10 @@ Root: HKCU; Subkey: "{#StartupApprovedKey}"; ValueType: none; ValueName: "{#RunV
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; Silent upgrades (winget, /VERYSILENT) skip the checkbox above: restart the app
+; that PrepareToInstall closed, quietly and never elevated, so gaze switching and the
+; walk-away lock do not stay off until the next sign-in.
+Filename: "{app}\{#AppExeName}"; Parameters: "--background"; Flags: nowait runasoriginaluser; Check: RelaunchAfterSilentUpgrade
 
 [UninstallDelete]
 Type: dirifempty; Name: "{app}"
@@ -148,6 +171,8 @@ const
   UserDataDir = '{localappdata}\bugraskl\eye-tracker';
   { "eye-tracker ctl" exit code when no instance is running. }
   CtlNotRunning = 3;
+  { Where Windows keeps the user's own environment variables. }
+  EnvironmentKey = 'Environment';
 
 var
   { An earlier version is installed for this user. }
@@ -156,6 +181,8 @@ var
   AutostartWasOn: Boolean;
   { The Select Tasks page shows the real start-at-login state (upgrades only). }
   StartupPageSynced: Boolean;
+  { This setup asked a running Eye Tracker to quit (see RelaunchAfterSilentUpgrade). }
+  AppWasRunning: Boolean;
 
 function InitializeSetup: Boolean;
 begin
@@ -267,6 +294,7 @@ begin
   if (not Exec(Cli, 'ctl quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)) or
      (ResultCode <> 0) then
     Exit;
+  AppWasRunning := True;
   for Attempt := 1 to 20 do
   begin
     Sleep(500);
@@ -282,6 +310,88 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
   QuitRunningApp;
+end;
+
+{ Check for the [Run] entry that starts the app again after a silent upgrade: an
+  interactive setup offers the "Launch" checkbox instead, and an app that was not
+  running stays closed. }
+function RelaunchAfterSilentUpgrade: Boolean;
+begin
+  Result := WizardSilent and AppWasRunning;
+end;
+
+{ Whether two PATH entries name the same folder (any case, quotes and trailing
+  backslash ignored). Entries using %VARIABLES% are compared as written. }
+function SameFolder(const Entry, Folder: String): Boolean;
+begin
+  Result := CompareText(RemoveBackslashUnlessRoot(RemoveQuotes(Trim(Entry))),
+                        RemoveBackslashUnlessRoot(Folder)) = 0;
+end;
+
+{ PathList without its entries for Folder (Found says whether there were any).
+  Every other entry, empty ones included, is kept as written. }
+function PathWithout(const PathList, Folder: String; var Found: Boolean): String;
+var
+  Rest, Entry: String;
+  Separator: Integer;
+  First: Boolean;
+begin
+  Result := '';
+  Found := False;
+  First := True;
+  Rest := PathList + ';';
+  while Rest <> '' do
+  begin
+    Separator := Pos(';', Rest);
+    Entry := Copy(Rest, 1, Separator - 1);
+    Delete(Rest, 1, Separator);
+    if (Trim(Entry) <> '') and SameFolder(Entry, Folder) then
+      Found := True
+    else
+    begin
+      if not First then
+        Result := Result + ';';
+      Result := Result + Entry;
+      First := False;
+    end;
+  end;
+end;
+
+{ Append the installation folder to the user's PATH unless it is already there.
+  The value is read and written unexpanded, so %VARIABLES% in it survive. }
+procedure AddAppToPath;
+var
+  PathList, Others, Folder: String;
+  Found: Boolean;
+begin
+  Folder := ExpandConstant('{app}');
+  if not RegQueryStringValue(HKCU, EnvironmentKey, 'Path', PathList) then
+    PathList := '';
+  Others := PathWithout(PathList, Folder, Found);
+  if Found then
+    Exit;
+  if (PathList <> '') and (PathList[Length(PathList)] <> ';') then
+    PathList := PathList + ';';
+  if not RegWriteExpandStringValue(HKCU, EnvironmentKey, 'Path', PathList + Folder) then
+    Log('Could not add ' + Folder + ' to the user PATH');
+end;
+
+{ Remove the installation folder from the user's PATH, leaving the rest as it is. }
+procedure RemoveAppFromPath;
+var
+  PathList, Kept, Folder: String;
+  Found: Boolean;
+begin
+  Folder := ExpandConstant('{app}');
+  if not RegQueryStringValue(HKCU, EnvironmentKey, 'Path', PathList) then
+    Exit;
+  Kept := PathWithout(PathList, Folder, Found);
+  if not Found then
+    Exit;
+  if Kept = '' then
+    RegDeleteValue(HKCU, EnvironmentKey, 'Path')
+  else if not RegWriteExpandStringValue(HKCU, EnvironmentKey, 'Path', Kept) then
+    Log('Could not remove ' + Folder + ' from the user PATH');
 end;
 
 { Remove the "start at sign-in" entries if they belong to this installation. A
@@ -305,11 +415,19 @@ begin
   if CurStep = ssInstall then
     { Runs before the [Registry] section, so ShouldWriteAutostart sees the old state. }
     AutostartWasOn := IsUpgrade and AutostartEnabledFor(ExpandConstant('{app}'))
-  else if (CurStep = ssPostInstall) and AutostartWasOn and
-          not WizardIsTaskSelected('startup') and
-          ((not WizardSilent and StartupPageSynced) or (StartupTaskParam = 0)) then
-    { The user unticked a box that showed start-at-login as on, or passed !startup. }
-    RemoveAutostartIfOurs;
+  else if CurStep = ssPostInstall then
+  begin
+    if AutostartWasOn and not WizardIsTaskSelected('startup') and
+       ((not WizardSilent and StartupPageSynced) or (StartupTaskParam = 0)) then
+      { The user unticked a box that showed start-at-login as on, or passed !startup. }
+      RemoveAutostartIfOurs;
+    { Upgrades restore the earlier choice (UsePreviousTasks); unticking it removes
+      the entry an earlier installation added. }
+    if WizardIsTaskSelected('addtopath') then
+      AddAppToPath
+    else
+      RemoveAppFromPath;
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -318,6 +436,7 @@ begin
   begin
     QuitRunningApp;
     RemoveAutostartIfOurs;
+    RemoveAppFromPath;
   end;
 
   if (CurUninstallStep = usPostUninstall) and (not UninstallSilent) and

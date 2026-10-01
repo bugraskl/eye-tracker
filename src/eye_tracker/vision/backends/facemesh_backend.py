@@ -14,10 +14,19 @@ costs one YuNet detection, about 7 ms):
    horizontal, is tracked from the previous frame's landmarks (MediaPipe's rule:
    landmark bounding box, 1.5x its longer side). When there is no previous face,
    when the network's face-presence score drops below 0.5 or when the crop
-   degenerates, YuNet (the lite backend's detector) finds faces and the largest
-   one seeds a new crop.
+   degenerates, YuNet (the lite backend's detector) finds faces and the best
+   one (largest, then most central) seeds a new crop. When the network rejects
+   that seed or accepts it only half-heartedly, it is also tried rotated
+   (YuNet misjudges strong head roll) and the most face-like crop wins; when
+   nothing works, comparable runners-up are tried.
 2. **Landmarks.** The 256x256 crop goes through the network; its 478 points
-   (468 mesh points plus five per iris) are mapped back into the frame.
+   (468 mesh points plus five per iris) are mapped back into the frame. When
+   the face moved noticeably since the crop was chosen, the landmarks are
+   biased towards the old position, so the network runs again on the crop
+   they ask for (and after a large jump on a crop from a fresh YuNet detection)
+   until the crop sits on the face: a still or slowly moving face costs one
+   inference, a posture shift between two frames two to four (see
+   ``FaceMeshBackend._settle``).
 3. **Head pose.** ``cv2.solvePnP`` fits MediaPipe's canonical face mesh to the
    landmarks MediaPipe itself uses for rigid fitting (its Procrustes basis),
    with approximate intrinsics (focal length = longer frame side, principal
@@ -26,7 +35,11 @@ costs one YuNet detection, about 7 ms):
 
 With the shoulder guard on (``max_faces >= 2``) YuNet additionally counts faces
 at :data:`GUARD_DETECT_WIDTH` pixels at most every :data:`GUARD_PERIOD_S`
-seconds, which finds onlookers several metres away.
+seconds, which finds onlookers several metres away. With the guard off it still
+looks every :data:`PRIMARY_CHECK_S` seconds (one 320 px detection, about 0.5 %
+of one core): either way, a clearly stronger face elsewhere in the picture
+takes over as the primary face, so that a poster or a colleague acquired while
+the user was away does not keep the gaze control once the user is back.
 
 Feature vector (:attr:`FaceMeshBackend.feature_names`):
 
@@ -102,9 +115,66 @@ GUARD_DETECT_WIDTH = 480
 GUARD_PERIOD_S = 0.5
 #: YuNet detections below this confidence are ignored (and not counted as faces).
 DETECTION_SCORE = 0.6
-#: A guard detection this much larger (face side) than the tracked face, and
-#: elsewhere in the image, takes over as the primary face.
+#: A face elsewhere in the image whose primary score (see :func:`primary_score`)
+#: is this much higher than the tracked face's takes over as the primary face.
 PRIMARY_SWITCH_RATIO = 1.3
+#: How much less a face at the image corner counts than the same face at the
+#: centre when choosing the primary face (the user usually sits in front of the
+#: camera; posters, TVs and passers-by are usually off to the side). Mild on
+#: purpose: size dominates, centrality decides between similar faces.
+PRIMARY_CENTRE_WEIGHT = 0.3
+#: With the shoulder guard off, YuNet looks for a better primary face this often
+#: (seconds) while a face is tracked, so a face acquired while the user was away
+#: (a poster, a colleague) does not keep the role once the user is back. One
+#: 320 px detection costs about 7 ms, i.e. about 0.5 % of one core at this period.
+PRIMARY_CHECK_S = 1.5
+#: ... and this soon after a face was (re-)acquired, when the user may still be
+#: on the way into the picture.
+PRIMARY_RECHECK_S = 0.5
+#: YuNet's box side divided by the side of the 468-point landmark box, for the
+#: same face (measured 1.10-1.18 at 320 and 480 px input). Converts a tracked
+#: face's size to YuNet's scale when YuNet itself did not report it.
+YUNET_TO_MESH_SIDE = 1.13
+#: When the best detection fails the landmark network (a profile, a hand over the
+#: face), up to this many detections are tried in all ...
+MAX_SEED_CANDIDATES = 3
+#: ... but only those scoring at least this share of the best one. A face much
+#: smaller than the user's is a background face, and the user turning away must
+#: not hand it the gaze control.
+SEED_CANDIDATE_MIN_RATIO = 0.5
+#: YuNet's eye points hardly follow a rolled head at 320 px (a 55° roll reads as
+#: about 5°), and the landmark network rejects crops more than about 40° off, or
+#: worse, fits them with a partly rolled face. A seed that fails, or passes with
+#: a presence logit below ROLL_RETRY_BELOW_LOGIT, is therefore also tried rotated
+#: by this angle either way, and the most face-like crop wins ...
+ROLL_RETRY_DEG = 45.0
+#: ... (aligned faces score a logit of about 12-22, 9 when heavily blurred; such
+#: partial fits about 2-8) ...
+ROLL_RETRY_BELOW_LOGIT = 10.0
+#: ... at most this often (seconds) when it does not help, so a face the network
+#: can never read (a profile) does not cost two extra inferences on every frame.
+ROLL_RETRY_PERIOD_S = 2.0
+#: A crop counts as settled on the face when the landmarks it produced ask for a
+#: crop whose centre is at most this share of its side away ...
+ROI_SETTLE_SHIFT = 0.04
+#: ... and whose side differs by at most this share (still-face jitter stays
+#: below about 0.01 for both).
+ROI_SETTLE_SCALE = 0.035
+#: A crop whose centre is further off than this share of its side (or whose side
+#: is off by more than ROI_SETTLE_SCALE) is re-run within the same frame. It
+#: pulls the landmarks towards where the face was: by up to 10° of pitch and 0.1
+#: of iris travel after a 5-8 cm posture shift between two frames, and upward
+#: jumps show up mostly as a changed side, because the network follows them only
+#: a fraction of the way. Between the two shift limits the bias stays below
+#: about 1.5° and the next frame removes it (the motion gate then does not hold
+#: the observation, see ``VisionBackend.settled``), so a steadily moving head
+#: costs no extra inference.
+ROI_CATCH_UP_SHIFT = 0.08
+#: After this many analysed frames in a row whose crop did not settle, the
+#: result counts as settled anyway. A crop catching up with a jump settles
+#: within a frame or two; one that keeps shifting slightly on a still picture is
+#: jitter, and the motion gate must be able to hold it to keep the CPU use low.
+MAX_UNSETTLED_FRAMES = 3
 #: Mean eye openness (lid gap / eye width) below which the eyes always count as
 #: closed. Open eyes measure roughly 0.2-0.35.
 BLINK_OPENNESS = 0.12
@@ -234,11 +304,19 @@ class BlinkDetector:
         return min(self.absolute, max(self.minimum, self.ratio * baseline))
 
     def update(self, openness: float) -> bool:
-        """Classify one reading (``True`` = closed) and learn from open eyes."""
+        """Classify one reading (``True`` = closed) and learn from open eyes.
+
+        Until the baseline exists every finite reading is learnt, not only those
+        above the absolute threshold: eyes that stay below it (narrow eyes, a
+        monitor below the camera) would otherwise never teach the detector
+        anything and read as closed forever. The median shrugs off the few blinks
+        among them. Afterwards only open eyes are learnt, so a long stretch of
+        closed eyes cannot drag the baseline down.
+        """
         if not math.isfinite(openness):
             return False
         closed = openness < self.threshold
-        if not closed:
+        if not closed or len(self._history) < self.min_samples:
             self._history.append(openness)
         return closed
 
@@ -299,6 +377,35 @@ def roi_from_landmarks(points_px: np.ndarray) -> Roi:
     angle = _eye_line_angle(points_px[_EYE_LINE[0]], points_px[_EYE_LINE[1]])
     side = max(float(x1 - x0), float(y1 - y0)) * ROI_SCALE
     return Roi(float(x0 + x1) / 2.0, float(y0 + y1) / 2.0, side, angle)
+
+
+def crop_settled(
+    used: Roi, wanted: Roi, shift: float = ROI_SETTLE_SHIFT, scale: float = ROI_SETTLE_SCALE
+) -> bool:
+    """True when ``wanted`` (the crop the landmarks ask for) matches ``used``.
+
+    Landmarks from a crop that is centred on the face are trustworthy; when the
+    face sits off-centre in the crop (it moved since the crop was chosen) they
+    are pulled towards the crop centre, and the crop they ask for is off by a
+    noticeable share of its side. ``shift`` and ``scale`` are the tolerated
+    centre offset and side change, as shares of ``used.side`` (see
+    :data:`ROI_SETTLE_SHIFT`).
+    """
+    if not (used.side > 0.0 and all(math.isfinite(v) for v in (wanted.cx, wanted.cy, wanted.side))):
+        return False
+    offset = math.hypot(wanted.cx - used.cx, wanted.cy - used.cy) / used.side
+    return offset <= shift and abs(wanted.side / used.side - 1.0) <= scale
+
+
+def primary_score(side: float, cx: float, cy: float, width: int, height: int) -> float:
+    """How strongly a face of ``side`` pixels centred at ``(cx, cy)`` claims to be the user.
+
+    The face side, reduced by up to :data:`PRIMARY_CENTRE_WEIGHT` the further the
+    face is from the image centre (0 at the centre, the full weight at a corner).
+    """
+    half_w, half_h = width / 2.0, height / 2.0
+    offset = math.hypot((cx - half_w) / half_w, (cy - half_h) / half_h) / math.sqrt(2.0)
+    return side * (1.0 - PRIMARY_CENTRE_WEIGHT * min(offset, 1.0))
 
 
 @dataclass(frozen=True, slots=True)
@@ -578,6 +685,21 @@ def _det_side(face: np.ndarray) -> float:
     return max(float(face[2]), float(face[3]))
 
 
+def _det_centre(face: np.ndarray) -> tuple[float, float]:
+    return float(face[0] + face[2] / 2.0), float(face[1] + face[3] / 2.0)
+
+
+def _det_score(face: np.ndarray, width: int, height: int) -> float:
+    return primary_score(_det_side(face), *_det_centre(face), width, height)
+
+
+def _in_crop(face: np.ndarray, roi: Roi) -> bool:
+    """True when the detection's centre lies inside the (unrotated) crop square."""
+    cx, cy = _det_centre(face)
+    half = roi.side / 2.0
+    return abs(cx - roi.cx) < half and abs(cy - roi.cy) < half
+
+
 def _sigmoid(x: float) -> float:
     if x >= 0:
         return 1.0 / (1.0 + math.exp(-x))
@@ -650,11 +772,19 @@ class FaceMeshBackend(VisionBackend):
         self._blink = BlinkDetector()
         self._max_faces = _clamp_faces(max_faces)
         self._roi: Roi | None = None
+        self._settled = True
+        self._unsettled_frames = 0
         self._frame_size: tuple[int, int] | None = None
         # Other faces (normalised boxes) from the latest shoulder-guard count,
         # reused until the next count is due.
         self._guard_others: list[Box] = []
         self._guard_ts = -math.inf
+        # Primary-face check with the guard off: time of the last one and the
+        # period until the next.
+        self._primary_ts = -math.inf
+        self._primary_period = PRIMARY_CHECK_S
+        # Last time rotated seeds were tried in vain (see ROLL_RETRY_PERIOD_S).
+        self._roll_retry_ts = -math.inf
         self._last: _Drawing | None = None
         self._landmarks: np.ndarray | None = None
         self._closed = False
@@ -675,6 +805,33 @@ class FaceMeshBackend(VisionBackend):
         return self._max_faces
 
     @property
+    def settled(self) -> bool:
+        """``False`` while the tracking crop is still catching up with a moved face.
+
+        A frame re-runs the network within itself only after a large jump (see
+        ``_settle``); after a moderate move, or a jump that a few passes could
+        not quite follow, the crop the landmarks ask for is still off by more
+        than :data:`ROI_SETTLE_SHIFT` / :data:`ROI_SETTLE_SCALE` and the next
+        frame continues from it. The remaining bias is small, but the motion
+        gate must not repeat it for seconds. ``True`` again after
+        :data:`MAX_UNSETTLED_FRAMES` unsettled frames in a row.
+        """
+        return self._settled
+
+    def reset(self) -> None:
+        """Forget the tracked face; the next frame looks for faces afresh.
+
+        The vision worker calls this when the camera was released (pause,
+        privacy mode, a lock) or replaced: the picture may have changed
+        completely meanwhile, and a crop left over from before could latch onto
+        whatever face is there now. The blink baseline is kept, it belongs to
+        the user rather than to a camera session.
+        """
+        self._forget_tracking()
+        self._last = None
+        self._landmarks = None
+
+    @property
     def landmarks(self) -> np.ndarray | None:
         """Normalised ``(478, 2)`` landmarks of the last frame's primary face."""
         return None if self._landmarks is None else self._landmarks.copy()
@@ -689,12 +846,22 @@ class FaceMeshBackend(VisionBackend):
         self._net = None
         self._detector = None
         self._guard_detector = None
-        self._roi = None
+        self._forget_tracking()
         self._last = None
         self._landmarks = None
-        self._guard_others = []
-        self._pose.reset()
         self._blink.reset()
+
+    def _forget_tracking(self) -> None:
+        """Drop everything carried from frame to frame except the blink baseline."""
+        self._roi = None
+        self._settled = True
+        self._unsettled_frames = 0
+        self._guard_others = []
+        self._guard_ts = -math.inf
+        self._primary_ts = -math.inf
+        self._primary_period = PRIMARY_CHECK_S
+        self._roll_retry_ts = -math.inf
+        self._pose.reset()
 
     # ------------------------------------------------------------ analysis
     def process(self, frame_bgr: np.ndarray, timestamp: float) -> Observation:
@@ -705,45 +872,218 @@ class FaceMeshBackend(VisionBackend):
         height, width = frame.shape[:2]
         if (width, height) != self._frame_size:
             self._frame_size = (width, height)
-            self._roi = None
-            self._guard_others = []
-            self._guard_ts = -math.inf
+            self._forget_tracking()
         guard = self._max_faces >= 2
 
+        # YuNet rows found in this very frame, if any search ran (reused below so
+        # that no frame runs the detector twice at the same resolution).
+        detections: list[np.ndarray] | None = None
         # Shoulder guard: a fresh face count on this frame, if one is due.
         counted: list[np.ndarray] | None = None
         if guard and not 0.0 <= timestamp - self._guard_ts < GUARD_PERIOD_S:
-            counted = self._guard_count(frame, timestamp)
+            counted = detections = self._guard_count(frame, timestamp)
 
-        result: tuple[np.ndarray, float] | None = None
-        if self._roi is not None:
-            if counted is not None:
-                self._maybe_switch_primary(counted)
-            result = self._infer(frame, self._roi)
-        detections = counted
-        if result is None:
+        found: tuple[np.ndarray, Roi] | None = None  # landmarks and the crop they came from
+        roi = self._roi
+        tracking = roi is not None
+        if roi is not None:
+            if detections is None and not guard and self._primary_check_due(timestamp):
+                detections = self._detect(frame, DETECT_WIDTH)
+                self._schedule_primary_check(timestamp, PRIMARY_CHECK_S)
+            candidate = None
+            if detections is not None:
+                candidate = self._primary_candidate(roi, detections, width, height)
+            if candidate is not None:
+                # A clearly stronger face elsewhere (the user came back): it takes
+                # over if the network can read it; otherwise (a profile, say)
+                # the tracked face stays rather than being lost to it.
+                result = self._infer(frame, candidate)
+                if result is not None:
+                    self._pose.reset()
+                    found = (result[0], candidate)
+            if found is None:
+                result = self._infer(frame, roi)
+                if result is not None:
+                    found = (result[0], roi)
+        if found is None:
             # Lost (or never had) the face: find one. With the guard on, the
             # search doubles as a fresh face count.
+            tracking = False
             self._pose.reset()
             if detections is None:
                 if guard:
                     detections = counted = self._guard_count(frame, timestamp)
                 else:
                     detections = self._detect(frame, DETECT_WIDTH)
-            if detections:
-                seed = roi_from_detection(max(detections, key=_det_side))
-                if seed.valid(width, height):
-                    result = self._infer(frame, seed)
+            if not guard:
+                # The search chose the primary face; look again soon, the user
+                # may be on the way into the picture.
+                self._schedule_primary_check(timestamp, PRIMARY_RECHECK_S)
+            found = self._acquire(frame, detections, width, height, timestamp)
 
-        if result is None:
+        if found is None:
+            self._note_settled(True)
             return self._without_landmarks(detections or [], timestamp, width, height, started)
-        points, _score = result
+        points, settled = self._settle(frame, *found, detections, reseed=tracking)
+        self._note_settled(settled)
         roi = roi_from_landmarks(points)
         self._roi = roi if roi.valid(width, height) else None
         return self._with_landmarks(points, counted, timestamp, width, height, started)
 
+    def _note_settled(self, settled: bool) -> None:
+        self._unsettled_frames = 0 if settled else self._unsettled_frames + 1
+        self._settled = settled or self._unsettled_frames >= MAX_UNSETTLED_FRAMES
+
+    def _primary_check_due(self, timestamp: float) -> bool:
+        # Written like the guard's check so that a clock jumping backwards (a
+        # new timestamp source) counts as due rather than as "checked recently".
+        return not 0.0 <= timestamp - self._primary_ts < self._primary_period
+
+    def _schedule_primary_check(self, timestamp: float, period: float) -> None:
+        self._primary_ts = timestamp
+        self._primary_period = period
+
+    def _acquire(
+        self,
+        frame: np.ndarray,
+        detections: list[np.ndarray],
+        width: int,
+        height: int,
+        timestamp: float,
+    ) -> tuple[np.ndarray, Roi] | None:
+        """Seed the landmark network from YuNet detections; the first that works wins.
+
+        Candidates go best first (largest, then most central: see
+        :func:`primary_score`). When the network rejects the best one or
+        accepts it only with a low presence logit (:data:`ROLL_RETRY_BELOW_LOGIT`),
+        it is also tried rotated by :data:`ROLL_RETRY_DEG` either way (YuNet
+        misjudges strong head roll) and the most face-like crop wins. When it
+        still fails, comparable runners-up are tried (see
+        :data:`SEED_CANDIDATE_MIN_RATIO`). A frame where the first seed works
+        well costs one inference, as before.
+        """
+        if not detections:
+            return None
+        ranked = sorted(detections, key=lambda d: _det_score(d, width, height), reverse=True)
+        best_score = _det_score(ranked[0], width, height)
+        for index, face in enumerate(ranked[:MAX_SEED_CANDIDATES]):
+            if index and _det_score(face, width, height) < SEED_CANDIDATE_MIN_RATIO * best_score:
+                break
+            seed = roi_from_detection(face)
+            if not seed.valid(width, height):
+                continue
+            result = self._infer(frame, seed)
+            doubtful = result is None or result[1] < ROLL_RETRY_BELOW_LOGIT
+            if (
+                index == 0
+                and doubtful
+                and not 0.0 <= timestamp - self._roll_retry_ts < ROLL_RETRY_PERIOD_S
+            ):
+                rolled = self._better_rolled(
+                    frame, seed, -math.inf if result is None else result[1]
+                )
+                if rolled is not None:
+                    return rolled
+                # Turning the crop did not help: the face is not merely rolled.
+                self._roll_retry_ts = timestamp
+            if result is not None:
+                return result[0], seed
+        return None
+
+    def _better_rolled(
+        self, frame: np.ndarray, seed: Roi, logit_to_beat: float
+    ) -> tuple[np.ndarray, Roi] | None:
+        """``seed`` rolled by :data:`ROLL_RETRY_DEG` either way, if that looks more like a face.
+
+        Both rotations are run; the one with the higher presence logit is
+        returned when it beats ``logit_to_beat`` (the unrotated seed's).
+        Passing the presence threshold is not enough: a crop 50-100° off can
+        pass with a confident, wrongly rolled fit, but measured on rolled photos
+        it scores a logit of about 2-14 against 18-28 for the right orientation.
+        """
+        best: tuple[np.ndarray, Roi] | None = None
+        for turn in (ROLL_RETRY_DEG, -ROLL_RETRY_DEG):
+            crop = Roi(seed.cx, seed.cy, seed.side, seed.angle + turn)
+            result = self._infer(frame, crop)
+            if result is not None and result[1] > logit_to_beat:
+                best, logit_to_beat = (result[0], crop), result[1]
+        return best
+
+    def _settle(
+        self,
+        frame: np.ndarray,
+        points: np.ndarray,
+        used: Roi,
+        detections: list[np.ndarray] | None,
+        *,
+        reseed: bool,
+    ) -> tuple[np.ndarray, bool]:
+        """Re-run the network until its crop sits on the face; returns landmarks and settledness.
+
+        One pass on a crop chosen from the previous frame follows a face that
+        moved by up to about 10 % of the crop almost completely, but after a
+        larger jump (a posture shift between two frames at the idle frame
+        rates) the landmarks stay biased towards the old position, upward jumps
+        especially, while the network still reports a confident face. So:
+
+        1. If the crop the landmarks ask for is close to ``used`` (within
+           :data:`ROI_CATCH_UP_SHIFT` and :data:`ROI_SETTLE_SCALE`), they are
+           final for this frame. This is the steady state, also for a steadily
+           moving head: no extra cost.
+        2. Otherwise one more pass on that crop, which suffices for moderate
+           jumps (about 10 ms).
+        3. Still far off: a large jump, which the network follows only a
+           fraction of the way per pass. With ``reseed`` (tracking), YuNet finds
+           the face independently of the old crop (the detection nearest the
+           wanted crop, about 7 ms unless this frame already ran one) and the
+           network runs on its crop and once more on the crop its landmarks ask
+           for. Without (the face was just found by YuNet), one more plain pass.
+
+        Each step keeps the previous landmarks when the network rejects the new
+        crop. The result counts as settled when the last pass's crop matched
+        within the stricter :data:`ROI_SETTLE_SHIFT`.
+        """
+        height, width = frame.shape[:2]
+        wanted = roi_from_landmarks(points)
+        if crop_settled(used, wanted, shift=ROI_CATCH_UP_SHIFT) or not wanted.valid(width, height):
+            return points, crop_settled(used, wanted)
+        second = self._infer(frame, wanted)
+        if second is None:
+            return points, False
+        points, used = second[0], wanted
+        wanted = roi_from_landmarks(points)
+        if crop_settled(used, wanted, shift=ROI_CATCH_UP_SHIFT) or not wanted.valid(width, height):
+            return points, crop_settled(used, wanted)
+        if reseed:
+            if detections is None:
+                detections = self._detect(frame, DETECT_WIDTH)
+            nearby = [face for face in detections if _in_crop(face, wanted)]
+            if nearby:
+                face = min(
+                    nearby,
+                    key=lambda d: math.hypot(
+                        _det_centre(d)[0] - wanted.cx, _det_centre(d)[1] - wanted.cy
+                    ),
+                )
+                seed = roi_from_detection(face)
+                third = self._infer(frame, seed) if seed.valid(width, height) else None
+                if third is not None:
+                    points, used = third[0], seed
+                    wanted = roi_from_landmarks(points)
+        if wanted.valid(width, height):
+            last = self._infer(frame, wanted)
+            if last is not None:
+                points, used = last[0], wanted
+        return points, crop_settled(used, roi_from_landmarks(points))
+
     def _infer(self, frame: np.ndarray, roi: Roi) -> tuple[np.ndarray, float] | None:
-        """Landmarks (frame pixels) and presence score for a crop, or ``None``."""
+        """Landmarks (frame pixels) and face-presence logit for a crop, or ``None``.
+
+        ``None`` when the presence probability is below
+        :data:`PRESENCE_THRESHOLD`. The logit is returned rather than the
+        probability because it keeps ranking crops where the probability has
+        long saturated at 1.0 (see ``_acquire``).
+        """
         assert self._net is not None
         m = roi.transform()
         crop = cv2.warpAffine(
@@ -756,15 +1096,15 @@ class FaceMeshBackend(VisionBackend):
         blob = cv2.dnn.blobFromImage(crop, 1.0 / 255.0, (INPUT_SIZE, INPUT_SIZE), swapRB=True)
         self._net.setInput(blob)
         raw, flag = self._net.forward(_OUTPUT_NAMES)
-        score = _sigmoid(float(flag.ravel()[0]))
-        if not score >= PRESENCE_THRESHOLD:
+        logit = float(flag.ravel()[0])
+        if not _sigmoid(logit) >= PRESENCE_THRESHOLD:  # also rejects NaN
             return None
         crop_points = raw.reshape(-1, 3)[:_NUM_LANDMARKS, :2].astype(np.float64)
         inverse = cv2.invertAffineTransform(m)
         points = crop_points @ inverse[:, :2].T + inverse[:, 2]
         if not np.all(np.isfinite(points)):
             return None
-        return points, score
+        return points, logit
 
     def _detect(self, frame: np.ndarray, input_width: int) -> list[np.ndarray]:
         """YuNet detections (rows in frame pixels) with score >= DETECTION_SCORE."""
@@ -801,19 +1141,35 @@ class FaceMeshBackend(VisionBackend):
         self._guard_ts = timestamp
         return faces
 
-    def _maybe_switch_primary(self, detections: list[np.ndarray]) -> None:
-        """Hand the primary role to a much larger face elsewhere (the user came back)."""
-        roi = self._roi
-        if roi is None or not detections:
-            return
-        largest = max(detections, key=_det_side)
-        tracked_side = roi.side / ROI_SCALE
-        cx = float(largest[0] + largest[2] / 2.0)
-        cy = float(largest[1] + largest[3] / 2.0)
-        elsewhere = math.hypot(cx - roi.cx, cy - roi.cy) > roi.side / 2.0
-        if elsewhere and _det_side(largest) > PRIMARY_SWITCH_RATIO * tracked_side:
-            self._roi = roi_from_detection(largest)
-            self._pose.reset()
+    @staticmethod
+    def _primary_candidate(
+        roi: Roi, detections: list[np.ndarray], width: int, height: int
+    ) -> Roi | None:
+        """Crop of a clearly stronger face elsewhere than the tracked ``roi``, if any.
+
+        Faces are compared by :func:`primary_score` and must beat the tracked
+        face by :data:`PRIMARY_SWITCH_RATIO`. Like is compared with like: the
+        tracked face's size is YuNet's box for it when this frame's detections
+        include it, and otherwise its landmark box converted to YuNet's scale
+        (:data:`YUNET_TO_MESH_SIDE`). Comparing YuNet's box (about 13 % larger)
+        with the landmark box would let a face only 1.15x the user's take over.
+        """
+        others = [face for face in detections if not _in_crop(face, roi)]
+        if not others:
+            return None
+        tracked = [face for face in detections if _in_crop(face, roi)]
+        if tracked:
+            tracked_score = max(_det_score(face, width, height) for face in tracked)
+        else:
+            mesh_side = roi.side / ROI_SCALE
+            tracked_score = primary_score(
+                mesh_side * YUNET_TO_MESH_SIDE, roi.cx, roi.cy, width, height
+            )
+        best = max(others, key=lambda d: _det_score(d, width, height))
+        if _det_score(best, width, height) <= PRIMARY_SWITCH_RATIO * tracked_score:
+            return None
+        seed = roi_from_detection(best)
+        return seed if seed.valid(width, height) else None
 
     def _other_faces(
         self, counted: list[np.ndarray] | None, primary_px: np.ndarray, width: int, height: int
@@ -851,7 +1207,8 @@ class FaceMeshBackend(VisionBackend):
     ) -> Observation:
         self._roi = None
         self._landmarks = None
-        faces = sorted(detections, key=_det_side, reverse=True)
+        # Best first, in the order the faces were tried as the primary face.
+        faces = sorted(detections, key=lambda d: _det_score(d, width, height), reverse=True)
         boxes = [_det_box(f, width, height) for f in faces]
         self._last = _Drawing(timestamp, None, boxes[1:], None, None, None)
         # YuNet sees a face the landmark network rejects (a profile, heavy

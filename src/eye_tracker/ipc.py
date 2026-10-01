@@ -19,6 +19,15 @@ sockets never touch the network, and the socket is restricted to the current
 user (``QLocalServer.UserAccessOption``). The socket name is predictable, so a
 client also checks that the server that answered runs under the same user
 account before it sends anything (see :func:`_server_is_trusted`).
+
+On Windows that restriction is not enough by itself: pipe names are
+machine-wide and a pipe keeps the security descriptor of whoever created the
+name *first*, so another account that creates our name before we listen would
+decide who may connect. The server therefore refuses to listen on a name that
+already exists while it holds the :class:`InstanceLock`, and it also checks
+the account of every client before reading a request (see
+:func:`_client_is_trusted`). On Unix the socket lives in a directory only this
+user can enter, which already keeps other accounts out.
 """
 
 from __future__ import annotations
@@ -87,6 +96,12 @@ MAX_REQUEST_BYTES = 1024
 MAX_REPLY_BYTES = 64 * 1024
 # Unix socket paths are limited to ~104-108 bytes depending on the OS.
 _MAX_SOCKET_PATH = 100
+#: How long a pipe name that exists before we listen may take to disappear
+#: (Windows): a client still holding a pipe of an instance that just exited
+#: keeps the name alive for a moment. A name that stays belongs to someone else.
+PIPE_NAME_GRACE_S = 1.0
+_PIPE_NAME_POLL_S = 0.1
+_PIPE_PREFIX = "\\\\.\\pipe\\"
 
 ReplyCallable = Callable[[str], None]
 CommandHandler = Callable[[str], str]
@@ -396,6 +411,8 @@ class InstanceServer(QObject):
         self._server: QLocalServer | None = None
         self._connections: set[_Connection] = set()
         self._another_instance = False
+        #: Connections refused by the account check (only the first is logged loudly).
+        self._refused_clients = 0
 
     @property
     def name(self) -> str:
@@ -422,7 +439,8 @@ class InstanceServer(QObject):
         Returns ``False`` if another instance holds the :class:`InstanceLock`
         (see :attr:`another_instance_running`) or the socket cannot be created;
         in the latter case the lock stays held, since this process still is the
-        instance, just one that ``ctl`` cannot reach.
+        instance, just one that ``ctl`` cannot reach. That includes a Windows
+        pipe name some other process created first (see the module docs).
         """
         if self.is_listening:
             return True
@@ -439,6 +457,20 @@ class InstanceServer(QObject):
         if not lock.is_held and _exchange(self._name, None, PROBE_TIMEOUT_MS)[0]:
             self._another_instance = True
             log.info("Another instance is already listening on %s", self._name)
+            return False
+        if _pipe_name_taken(self._name):
+            # Our own instance would have answered the probe or held the lock,
+            # so this is another account's pipe. Qt would happily add instances
+            # to it, and they would carry that account's access rules.
+            from .cli import cli_command_text  # named as this copy is run
+
+            log.warning(
+                "The command channel %s already exists and does not belong to this instance "
+                "(most likely another user account created it); '%s' and "
+                "desktop shortcuts cannot reach this instance",
+                self._name,
+                cli_command_text("ctl"),
+            )
             return False
         server = QLocalServer(self)
         server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
@@ -482,8 +514,18 @@ class InstanceServer(QObject):
             return
         while server.hasPendingConnections():
             socket = server.nextPendingConnection()
-            if socket is not None:
-                self._connections.add(_Connection(self, socket))
+            if socket is None:
+                continue
+            if not _client_is_trusted(socket):
+                # Checked before a byte is read: pause, privacy-on or quit from
+                # another account would switch off the walk-away lock.
+                level = logging.DEBUG if self._refused_clients else logging.WARNING
+                self._refused_clients += 1
+                log.log(level, "Refused a command connection from another user account")
+                socket.abort()
+                socket.deleteLater()
+                continue
+            self._connections.add(_Connection(self, socket))
 
     def _forget(self, connection: _Connection) -> None:
         self._connections.discard(connection)
@@ -694,6 +736,26 @@ def _server_is_trusted(socket: QLocalSocket) -> bool:
     return verdict is not False
 
 
+def _client_is_trusted(socket: QLocalSocket) -> bool:
+    """False when the process that connected to our server runs as another user.
+
+    Only Windows needs this (see the module docs): a pipe name another account
+    created first keeps that account's access rules, so its owner could connect
+    to our instances and pause tracking, switch privacy mode on or quit. Elevated
+    processes of the same user pass. ``True`` when the client cannot be
+    identified, like :func:`_server_is_trusted`, and always on Unix, where the
+    private socket directory is the access check.
+    """
+    if sys.platform != "win32":
+        return True
+    try:
+        verdict = _pipe_client_is_current_user(int(socket.socketDescriptor()))
+    except Exception:
+        log.debug("Could not identify the command client", exc_info=True)
+        verdict = None
+    return verdict is not False
+
+
 def _socket_file_is_current_user(path: str) -> bool | None:
     """Whether the Unix socket file at ``path`` belongs to this user.
 
@@ -741,6 +803,10 @@ def _win_security() -> Any:
         server_pid=bind(
             kernel32, "GetNamedPipeServerProcessId", w.BOOL, w.HANDLE, ctypes.POINTER(w.ULONG)
         ),
+        client_pid=bind(
+            kernel32, "GetNamedPipeClientProcessId", w.BOOL, w.HANDLE, ctypes.POINTER(w.ULONG)
+        ),
+        wait_named_pipe=bind(kernel32, "WaitNamedPipeW", w.BOOL, w.LPCWSTR, w.DWORD),
         open_process=bind(kernel32, "OpenProcess", w.HANDLE, w.DWORD, w.BOOL, w.DWORD),
         close_handle=bind(kernel32, "CloseHandle", w.BOOL, w.HANDLE),
         current_process=bind(kernel32, "GetCurrentProcess", w.HANDLE),
@@ -777,6 +843,69 @@ def _pipe_server_is_current_user(handle: int) -> bool | None:
     if pid.value == os.getpid():
         return True
     return _process_is_current_user(int(pid.value))
+
+
+def _pipe_client_is_current_user(handle: int) -> bool | None:
+    """Whether the process on the client end of pipe ``handle`` runs as this user (Windows).
+
+    The pid is recorded by the pipe file system when the client connects, so
+    the client cannot choose it. A client that exited meanwhile cannot be
+    opened and counts as another account, which only drops a dead connection.
+    """
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes as w
+
+    api = _win_security()
+    if api is None or handle <= 0:
+        return None
+    pid = w.ULONG(0)
+    if not api.client_pid(w.HANDLE(handle), ctypes.byref(pid)):
+        return None
+    if pid.value == os.getpid():
+        return True
+    return _process_is_current_user(int(pid.value))
+
+
+#: ``WaitNamedPipeW`` results (``GetLastError``) that tell whether a pipe name exists.
+_ERROR_FILE_NOT_FOUND = 2
+_ERROR_SEM_TIMEOUT = 121  # the name exists, but no instance is waiting for a client
+_ERROR_PIPE_BUSY = 231
+
+
+def _pipe_name_taken(name: str) -> bool:
+    """Whether a named pipe called ``name`` already exists (Windows; ``False`` elsewhere).
+
+    ``WaitNamedPipeW`` only looks the name up; unlike opening the pipe it
+    neither connects nor uses up an instance. A name that exists is watched
+    for :data:`PIPE_NAME_GRACE_S`, since one whose last server just exited can
+    linger while a client still holds it. Any answer other than "exists" or
+    "not found" counts as free: refusing to listen would cost ``ctl`` for
+    nothing.
+    """
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    api = _win_security()
+    if api is None:
+        return False
+    path = name if name.startswith("\\\\") else _PIPE_PREFIX + name
+    deadline = time.monotonic() + PIPE_NAME_GRACE_S
+    while True:
+        if api.wait_named_pipe(path, 1):
+            exists = True
+        else:
+            error = ctypes.get_last_error()
+            exists = error in (_ERROR_SEM_TIMEOUT, _ERROR_PIPE_BUSY)
+            if not exists and error != _ERROR_FILE_NOT_FOUND:
+                log.debug("WaitNamedPipe(%s) failed with error %d", path, error)
+        if not exists:
+            return False
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(_PIPE_NAME_POLL_S)
 
 
 def _process_is_current_user(pid: int) -> bool | None:

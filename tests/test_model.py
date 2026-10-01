@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from typing import Any
 
 import numpy as np
 import pytest
@@ -185,6 +186,9 @@ def test_round_trip_through_json() -> None:
     assert restored.bounds == virtual_bounds(STACKED)
     assert restored.n_features == 8
     assert np.array_equal(restored.predict(X), model.predict(X))
+    assert restored.has_linear_estimate
+    away = [restored.looks_away(x, GAZE, monitors=STACKED) for x in X[::7]]
+    assert away == [model.looks_away(x, GAZE, monitors=STACKED) for x in X[::7]]
 
 
 def test_unfitted_round_trip() -> None:
@@ -213,6 +217,9 @@ def test_model_without_clip_range_still_loads() -> None:
         (lambda d: d.pop("lo"), "incomplete"),
         (lambda d: d.update(mean="oops"), "invalid model data"),
         (lambda d: d.pop("bounds"), "invalid model data"),
+        (lambda d: d.update(linear_coef=d["linear_coef"][:-1]), "inconsistent shapes"),
+        (lambda d: d.update(linear_coef=[[math.inf, 0.0]] * 9), "non-finite"),
+        (lambda d: d.update(linear_coef="oops"), "invalid model data"),
     ],
 )
 def test_from_dict_rejects_malformed_data(mutate, message: str) -> None:
@@ -515,6 +522,8 @@ def test_looks_away_uses_only_gaze_direction_features() -> None:
 def test_glances_below_the_monitors_look_away(
     monitors: list[Monitor], camera_x: float, seed: int
 ) -> None:
+    # The per-feature fallback (no monitors passed, or a model saved without the
+    # linear estimate); the combined test is checked further below.
     rng = np.random.default_rng(seed)
     X, P, groups = grid_dataset(monitors, rng, noise=1.0, camera_x=camera_x)
     bounds = virtual_bounds(monitors)
@@ -540,3 +549,151 @@ def test_glances_below_the_monitors_look_away(
     everywhere = random_points(monitors, rng, 1500, margin=0.0)
     for offset in ((0.0, 0.0, 0.0), (0.0, 8.0, 0.0), (0.0, -8.0, 0.0), (0.0, 0.0, 12.0)):
         assert away_rate(everywhere, offset) < 0.01, offset
+
+
+# ------------------------------------------------------- looking away: combined direction
+SCREEN = [Monitor(0, "screen", Rect(0, 0, 1000, 500))]
+
+
+def simple_gaze_model() -> tuple[GazeModel, np.ndarray]:
+    """Two gaze-direction features that map linearly onto one 1000x500 screen, and
+    a head position (feature 2) that drifts with the gaze but is noisy."""
+    rng = np.random.default_rng(60)
+    xs, ys = np.meshgrid(np.linspace(100, 900, 20), np.linspace(50, 450, 10))
+    P = np.repeat(np.column_stack([xs.ravel(), ys.ravel()]), 2, axis=0)
+    head = 0.5 * P[:, 0] / 1000 + rng.normal(0, 0.05, len(P))
+    X = np.column_stack([P[:, 0] / 1000, P[:, 1] / 500, head])
+    model = GazeModel(degree=1, alpha=0.0, nonlinear=(0, 1)).fit(X, P, bounds=SCREEN[0].rect)
+    return model, X
+
+
+def gaze_at(x: float, y: float, head: float = 0.25) -> np.ndarray:
+    return np.array([x / 1000, y / 500, head])
+
+
+def test_looks_away_judges_the_combined_gaze_direction() -> None:
+    model, X = simple_gaze_model()
+    assert model.has_linear_estimate
+    diagonal = SCREEN[0].rect.diagonal
+    assert not model.looks_away(gaze_at(500, 250), monitors=SCREEN)
+    assert not model.looks_away(gaze_at(0, 0), monitors=SCREEN)  # a corner
+    assert not model.looks_away(gaze_at(1000 + 0.1 * diagonal, 250), monitors=SCREEN)
+    assert model.looks_away(gaze_at(1000 + 0.4 * diagonal, 250), monitors=SCREEN)
+    assert model.looks_away(gaze_at(500, 500 + 0.4 * diagonal), monitors=SCREEN)  # the desk
+    assert not model.looks_away(gaze_at(500, 500 + 0.4 * diagonal), monitors=SCREEN, margin=0.5)
+    # The head far from where it was: leaning back is not looking away (clipped),
+    # unless the caller declares that feature a gaze direction.
+    assert not model.looks_away(gaze_at(500, 250, head=50.0), monitors=SCREEN)
+    assert model.looks_away(gaze_at(500, 250, head=50.0), [0, 1, 2], monitors=SCREEN)
+    # Broken frames and unknown gaze features never read as "looking away".
+    assert not model.looks_away(gaze_at(math.nan, 250), monitors=SCREEN)
+    assert not model.looks_away(gaze_at(math.inf, 250), monitors=SCREEN)
+    legacy = GazeModel(degree=1, alpha=0.0).fit(X, X[:, :2] * (1000, 500))
+    assert not legacy.looks_away(gaze_at(5000, 250), monitors=SCREEN)
+    assert legacy.looks_away(gaze_at(5000, 250), (0, 1), monitors=SCREEN)
+    with pytest.raises(ValueError, match="out of range"):
+        model.looks_away(gaze_at(500, 250), [3], monitors=SCREEN)
+    with pytest.raises(ValueError, match="expected feature vector"):
+        model.looks_away(np.zeros(2), monitors=SCREEN)
+
+
+def test_models_saved_without_the_linear_estimate_use_the_per_feature_test() -> None:
+    model, _ = simple_gaze_model()
+    data = model.to_dict()
+    del data["linear_coef"]
+    old = GazeModel.from_dict(data)
+    assert not old.has_linear_estimate
+    # 0.15 of the diagonal beside the screen, but 0.3 of the calibrated x range
+    # beyond it: the per-feature test calls that "away", the combined one does not.
+    beside = gaze_at(1000 + 0.15 * SCREEN[0].rect.diagonal, 250)
+    assert old.looks_away(beside, monitors=SCREEN)
+    assert not model.looks_away(beside, monitors=SCREEN)
+    # Without monitors the per-feature test is used as well.
+    assert model.looks_away(beside)
+    data["linear_coef"] = None
+    assert not GazeModel.from_dict(data).has_linear_estimate
+
+
+def taskbar_points(monitors: list[Monitor], rng: np.random.Generator, n: int) -> np.ndarray:
+    """Points in the bottom 40 px of the monitors (the taskbar)."""
+    idx = rng.integers(0, len(monitors), n)
+    return np.array(
+        [
+            (rng.uniform(r.x, r.right), rng.uniform(r.bottom - 40, r.bottom))
+            for r in (monitors[i].rect for i in idx)
+        ]
+    )
+
+
+def edge_points(monitors: list[Monitor], rng: np.random.Generator, n: int) -> np.ndarray:
+    """Points in the outer 3 % of the monitors, corners included."""
+    out = []
+    for _ in range(n):
+        rect = monitors[rng.integers(0, len(monitors))].rect
+        nx, ny = rng.uniform(0, 1, 2)
+        side = rng.integers(0, 4)
+        if side < 2:
+            nx = rng.uniform(0, 0.03) if side == 0 else rng.uniform(0.97, 1.0)
+        else:
+            ny = rng.uniform(0, 0.03) if side == 2 else rng.uniform(0.97, 1.0)
+        out.append(rect.denormalize(nx, ny))
+    return np.array(out)
+
+
+#: Users who share the work between head and eyes differently than while
+#: calibrating, or sit elsewhere (keyword arguments of ``synth_features``).
+ON_SCREEN_CHANGES: dict[str, dict[str, Any]] = {
+    "as calibrated": {},
+    "head turns more": {"head_share": 0.70},
+    "head turns less": {"head_share": 0.40},
+    "nods more, sits higher": {"pitch_share": 0.8 * 1.4, "head_offset": (0.0, -5.0, 0.0)},
+    "sits lower": {"head_offset": (0.0, 8.0, 0.0)},
+    "leans back": {"head_offset": (0.0, 0.0, 12.0)},
+    "moves aside": {"head_offset": (8.0, 0.0, 0.0)},
+}
+
+
+def fitted_on_synthetic_calibration(
+    monitors: list[Monitor], camera_x: float, rng: np.random.Generator
+) -> GazeModel:
+    X, P, groups = grid_dataset(monitors, rng, noise=1.0, camera_x=camera_x)
+    bounds = virtual_bounds(monitors)
+    selection = select_model(X, P, groups, bounds=bounds, nonlinear=GAZE)
+    return GazeModel(selection.degree, selection.alpha, nonlinear=GAZE).fit(X, P, bounds=bounds)
+
+
+@pytest.mark.parametrize(
+    ("monitors", "camera_x", "seed"),
+    [(TWO, 1920.0, 50), (TWO, 1920.0, 51), (THREE, 960.0, 52), (STACKED, 960.0, 53)],
+    ids=["two-a", "two-b", "three", "stacked"],
+)
+def test_combined_look_away_test_keeps_every_screen_reachable(
+    monitors: list[Monitor], camera_x: float, seed: int
+) -> None:
+    """r2-gaze-engine-03: edges, corners and the taskbar stay on screen even when
+    the user moves the head more or less than while calibrating, while glances
+    at the desk are still caught."""
+    rng = np.random.default_rng(seed)
+    model = fitted_on_synthetic_calibration(monitors, camera_x, rng)
+
+    def away_rate(points: np.ndarray, **kwargs: Any) -> float:
+        feats = synth_features(points, rng, 1.0, camera_x, **kwargs)
+        return float(np.mean([model.looks_away(f, monitors=monitors) for f in feats]))
+
+    for name, change in ON_SCREEN_CHANGES.items():
+        for region in (taskbar_points, edge_points):
+            rate = away_rate(region(monitors, rng, 500), **change)
+            assert rate <= 0.01, (name, region.__name__, rate)
+    for cm in (40, 60, 80):
+        assert away_rate(below_points(monitors, rng, 300, cm)) >= 0.95, cm
+
+
+def test_per_feature_test_loses_the_taskbar_when_the_head_eye_split_changes() -> None:
+    """Why the combined test exists: judged feature by feature, a user who nods
+    more than while calibrating looks "away" at the bottom of the screens."""
+    rng = np.random.default_rng(50)
+    model = fitted_on_synthetic_calibration(TWO, 1920.0, rng)
+    change = ON_SCREEN_CHANGES["nods more, sits higher"]
+    feats = synth_features(taskbar_points(TWO, rng, 500), rng, 1.0, **change)
+    assert np.mean([model.looks_away(f) for f in feats]) > 0.05
+    assert np.mean([model.looks_away(f, monitors=TWO) for f in feats]) <= 0.01

@@ -25,6 +25,9 @@ Please include:
 - the output of `eye-tracker doctor` (it contains no camera images or personal data),
 - steps to reproduce and the impact you observed.
 
+For `eye-tracker`, type the command of your package (see
+[the command line](README.md#command-line)).
+
 You can expect an acknowledgement within **72 hours** and a status update at least weekly until the
 issue is resolved. Fixed issues are credited in the release notes unless you prefer otherwise.
 
@@ -46,12 +49,16 @@ use the issue tracker for those.
 - **No network code, checked twice.** `scripts/check_privacy.py` fails CI if any networking API
   (sockets, HTTP clients, Qt network classes, asyncio connections, ctypes loads of network
   libraries) is used under `src/`, or if frame-writing APIs (`imwrite`, `VideoWriter`, `imencode`)
-  appear. `check_privacy.py --bundle` then scans every native library of every release build for
-  telemetry endpoints and networking imports, against a reviewed allow-list with a reason per
-  entry. Telemetry markers are never allow-listed.
+  appear. `check_privacy.py --bundle` then scans every native library and every bundled Python
+  module of every release build (and of pull requests that change the packaging or the
+  dependencies) for telemetry endpoints, networking packages and plugins, and networking imports,
+  against a reviewed allow-list with a reason per entry. Telemetry markers are never allow-listed.
 - **No MediaPipe runtime.** Its native library contains a usage-logging uploader, so the face model
   runs through OpenCV instead (see [docs/privacy.md](docs/privacy.md)).
 - **Frames stay in memory.** Only numeric features (head angles, iris ratios) are stored in the
   calibration file; never images.
 - **Least privilege.** The app runs as the current user, needs no administrator rights, and uses
   OS idle timers instead of keyboard hooks to detect typing.
+- **A private control channel.** `eye-tracker ctl` talks to the running app over a per-user Unix
+  socket or named pipe. On Windows the account of every connecting process is checked, and
+  connections from other accounts are refused before anything is read.

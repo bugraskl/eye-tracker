@@ -55,16 +55,23 @@ needed), and the bundle fails on:
 
 ``telemetry-endpoint``
     Any file containing a known telemetry/usage-logging marker
-    (``play.googleapis.com``, Clearcut, Firebase logging, Sentry, Segment...).
-    Never allow-listed.
+    (``play.googleapis.com``, Clearcut, Firebase logging, Sentry, Segment...),
+    including the zlib-compressed Python code inside the executables (see
+    below) and the members of ZIP files. Never allow-listed.
 ``forbidden-package``
-    A bundled Python distribution that must not ship (``mediapipe``,
-    ``requests``, telemetry SDKs...), found by its ``.dist-info`` folder or
-    package directory.
+    A bundled Python package that must not ship (``mediapipe``, ``requests``,
+    ``urllib3``, telemetry SDKs, any third-party network client...), found by
+    its ``.dist-info`` folder, its package directory, or its modules in the
+    executables' PYZ archive (also when vendored inside another package).
+``network-plugin``
+    A Qt plugin that talks to the network: the TLS, network-information and
+    network-access backends, the TUIO touch listener (UDP), or the VNC/WebGL
+    platform plugins (TCP servers). The spec removes them all.
 ``network-library``
     A binary that links a networking library (``WS2_32``, ``WININET``,
     ``WINHTTP``, ``DNSAPI``... on Windows; ``libcurl``, ``libssl``,
-    ``libresolv``, ``CFNetwork``... elsewhere) and is not on the allow-list.
+    ``libresolv``, ``CFNetwork``... elsewhere) or Qt's own ``QtNetwork``, and
+    is not on the allow-list.
 ``network-symbol``
     An ELF or Mach-O binary that imports host-name resolution or remote
     connection functions (``getaddrinfo``, ``gethostbyname``...; on Linux and
@@ -73,6 +80,19 @@ needed), and the bundle fails on:
     Qt, D-Bus and X11 use them for local (AF_UNIX) connections.
 ``unreadable-binary``
     A native binary whose headers cannot be parsed, so it cannot be verified.
+``unreadable-archive``
+    Python code the gate cannot read: a PyInstaller archive (or ZIP file) that
+    does not parse, or PyInstaller itself is not installed to read it.
+
+PyInstaller stores every pure-Python module (the app's and all third-party
+ones) zlib-compressed in the PYZ archive embedded in each executable, where a
+plain byte scan sees nothing. The gate therefore opens that archive with
+PyInstaller's own reader (``PyInstaller.archive.readers``) and checks every
+module's name and decompressed code; the scripts and bootstrap modules stored
+next to the PYZ, and files embedded in a one-file build, are checked too.
+Standard-library networking modules (``http.client``, ``socket``...) are not
+reported there: the standard library imports them itself, and the source check
+keeps the app's own code away from them.
 
 Some bundled libraries legitimately link networking code without ever using
 it for remote connections (Qt's QLocalSocket lives in QtNetwork, CPython's
@@ -101,13 +121,17 @@ from __future__ import annotations
 import argparse
 import ast
 import fnmatch
+import hashlib
+import io
 import os
 import re
 import struct
 import sys
+import zipfile
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TARGET = REPO_ROOT / "src" / "eye_tracker"
@@ -940,6 +964,31 @@ FORBIDDEN_DISTRIBUTIONS: frozenset[str] = frozenset(
     }
 )
 
+#: Networking modules that do not come with Python: finding one of their
+#: modules in a bundle means a third-party network client (or telemetry SDK)
+#: ships, possibly vendored inside another package.
+THIRD_PARTY_NETWORK_MODULES: frozenset[str] = NETWORK_MODULES - sys.stdlib_module_names
+
+#: Normalised names (see :func:`_library_key`) of Qt's network library on
+#: Windows (``Qt6Network.dll``), Linux (``libQt6Network.so.6``) and macOS
+#: (``QtNetwork.framework/.../QtNetwork``). Linking it is reported like any
+#: other networking library, so a Qt module or plugin that gains networking
+#: fails the gate until it is reviewed.
+QT_NETWORK_LIBRARY_KEYS: frozenset[str] = frozenset(
+    {"qt5network", "qt6network", "libqt5network", "libqt6network", "qtnetwork"}
+)
+
+#: Qt plugins that open network connections or listening sockets, as
+#: ``(plugin group, file-name glob)`` pairs and why. The spec removes them.
+QT_NETWORK_PLUGINS: tuple[tuple[str, str, str], ...] = (
+    ("tls", "*", "a TLS backend (the app makes no remote connections)"),
+    ("networkinformation", "*", "a network-reachability backend"),
+    ("networkaccess", "*", "a QNetworkAccessManager backend"),
+    ("generic", "*tuiotouch*", "the TUIO touch plugin listens on a UDP port"),
+    ("platforms", "*vnc*", "the VNC platform is an unauthenticated TCP server"),
+    ("platforms", "*webgl*", "the WebGL platform is an HTTP/WebSocket server"),
+)
+
 #: Imported functions (ELF / Mach-O) that resolve host names or open remote
 #: connections. Plain ``socket``/``connect`` are omitted on purpose: they are
 #: also how local (AF_UNIX) IPC works.
@@ -1022,6 +1071,11 @@ _WHY_X11 = (
     "X11/XCB client libraries: a TCP connection is only made when the user's $DISPLAY "
     "names another host"
 )
+_WHY_X11_SESSION = (
+    "X session management (libSM/libICE, linked by Qt's xcb platform plugin): ICE "
+    "connects to the session manager named by $SESSION_MANAGER, a local socket on "
+    "desktops; libSM resolves the local host name only to build its client ID"
+)
 
 #: Every bundled binary that may link networking code, and why that is acceptable.
 #: Entries are per file and per indicator, so a new networking dependency of an
@@ -1050,6 +1104,8 @@ BUNDLE_ALLOWLIST: tuple[AllowRule, ...] = (
         "QtCore: Winsock for its event dispatcher, MPR/NETAPI32 to resolve network "
         "drive letters in file paths; it makes no remote connections",
     ),
+    # PySide6's QtNetwork bindings link Qt's network library; nothing else may.
+    _allow("pyside6/qtnetwork.*", {"qt6network", "libqt6network", "qtnetwork"}, _WHY_QT_NETWORK),
     _allow("qt6network.dll", {"ws2_32", "iphlpapi", "dnsapi", "winhttp"}, _WHY_QT_NETWORK),
     _allow(
         "libqt6network.so*",
@@ -1063,6 +1119,8 @@ BUNDLE_ALLOWLIST: tuple[AllowRule, ...] = (
     ),
     _allow("libxcb.so*", _RESOLVER, _WHY_X11),
     _allow("libx11.so*", _RESOLVER, _WHY_X11),
+    _allow("libsm.so*", _RESOLVER, _WHY_X11_SESSION),
+    _allow("libice.so*", _RESOLVER, _WHY_X11_SESSION),
     _allow(
         "libdbus-1.so*",
         _RESOLVER,
@@ -1133,6 +1191,8 @@ class BundleResult:
 
     files: int = 0
     binaries: int = 0
+    #: Distinct Python modules and scripts read from PyInstaller archives and ZIP files.
+    python_modules: int = 0
     violations: list[BundleFinding] = field(default_factory=list)
     allowed: list[BundleFinding] = field(default_factory=list)
 
@@ -1425,7 +1485,9 @@ def network_indicators(binary: NativeBinary) -> list[Indicator]:
     found: list[Indicator] = []
     for library in binary.libraries:
         key = _library_key(library)
-        if binary.format == "pe":
+        if key in QT_NETWORK_LIBRARY_KEYS:
+            flagged = True
+        elif binary.format == "pe":
             flagged = key in WINDOWS_NETWORK_DLLS
         else:
             flagged = key.startswith(POSIX_NETWORK_LIBRARIES) or _is_network_framework(library)
@@ -1447,6 +1509,38 @@ def forbidden_distribution(name: str) -> str | None:
     return distribution if distribution in FORBIDDEN_DISTRIBUTIONS else None
 
 
+def forbidden_module(module: str) -> str | None:
+    """The forbidden package a bundled Python module belongs to, or ``None``.
+
+    ``requests.adapters`` → ``requests``, ``sentry_sdk.client`` → ``sentry_sdk``;
+    a vendored copy counts too (``somepkg._vendor.urllib3.util`` →
+    ``somepkg._vendor.urllib3``). Modules of the standard library are never
+    reported (see the module docstring).
+    """
+    parts = module.split(".")
+    if not parts[0] or parts[0] in sys.stdlib_module_names:
+        return None
+    for index, part in enumerate(parts):
+        if part in THIRD_PARTY_NETWORK_MODULES or forbidden_distribution(part):
+            return ".".join(parts[: index + 1])
+    return next(
+        (sub for sub in NETWORK_SUBMODULES if module == sub or module.startswith(sub + ".")), None
+    )
+
+
+def network_plugin(relative: str) -> str | None:
+    """Why a bundled file is a networking Qt plugin, or ``None`` if it is not one."""
+    parts = PurePosixPath(relative.lower()).parts
+    for index, part in enumerate(parts[:-2]):
+        if part != "plugins":
+            continue
+        group, name = parts[index + 1], parts[-1]
+        for plugin_group, pattern, reason in QT_NETWORK_PLUGINS:
+            if group == plugin_group and fnmatch.fnmatchcase(name, pattern):
+                return f"bundles the Qt plugin {group}/{name}: {reason}"
+    return None
+
+
 def _iter_bundle_files(root: Path) -> Iterator[Path]:
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
@@ -1456,6 +1550,213 @@ def _iter_bundle_files(root: Path) -> Iterator[Path]:
             # that are scanned themselves.
             if not path.is_symlink():
                 yield path
+
+
+# ------------------------------------------------------------- Python code in bundles
+#: The cookie that ends the archive (CArchive/PKG) appended to a PyInstaller
+#: executable: magic, archive length, TOC offset, TOC length, Python version,
+#: Python library name. A PYZ archive starts with ``PYZ\0``.
+_CARCHIVE_MAGIC = b"MEI\014\013\012\013\016"
+_CARCHIVE_COOKIE = struct.Struct("!8sIIII64s")
+_PYZ_MAGIC = b"PYZ\0"
+_ZIP_MAGIC = b"PK\x03\x04"
+
+
+class ArchiveError(ValueError):
+    """Python code in the bundle that cannot be read, and so cannot be verified."""
+
+
+@dataclass(frozen=True)
+class EmbeddedItem:
+    """Something stored inside a bundled file: Python code or an embedded file."""
+
+    container: str  # "PYZ-00.pyz", "PKG" (the executable's archive) or "ZIP"
+    name: str  # dotted module name, script name or file name
+    kind: str  # "module", "script", "binary" (a file extracted at run time) or "data"
+    data: bytes | None  # decompressed contents; None for a namespace package
+
+
+def has_pyinstaller_archive(data: bytes) -> bool:
+    """Whether ``data`` carries a PyInstaller archive (a well-formed cookie).
+
+    The bootloader's code contains the magic bytes too, but only the last
+    occurrence can be the cookie; code signatures appended after it (macOS) do
+    not contain them.
+    """
+    offset = data.rfind(_CARCHIVE_MAGIC)
+    if offset < 0 or offset + _CARCHIVE_COOKIE.size > len(data):
+        return False
+    _magic, length, toc_offset, toc_length, _python, library = _CARCHIVE_COOKIE.unpack_from(
+        data, offset
+    )
+    end = offset + _CARCHIVE_COOKIE.size
+    return bool(library.strip(b"\0")) and 0 < length <= end and toc_offset + toc_length <= length
+
+
+def _archive_readers() -> tuple[Any, Any]:
+    """PyInstaller's ``CArchiveReader`` and ``ZlibArchiveReader`` classes.
+
+    The gate reads the archives with the reader of the PyInstaller that wrote
+    them, so a change of the archive format cannot make it silently blind.
+    """
+    try:
+        from PyInstaller.archive.readers import CArchiveReader
+        from PyInstaller.loader.pyimod01_archive import ZlibArchiveReader
+    except ImportError as exc:  # the release builds always have it (the "build" group)
+        raise ArchiveError(
+            f"PyInstaller is not installed, so the Python code cannot be read ({exc})"
+        ) from exc
+    return CArchiveReader, ZlibArchiveReader
+
+
+def _pyz_items(pyz: Any, container: str) -> Iterator[EmbeddedItem]:
+    for module in sorted(pyz.toc):
+        # raw=True: the decompressed marshal data. String constants (URLs,
+        # host names) appear in it verbatim, so no code object is loaded.
+        yield EmbeddedItem(container, module, "module", pyz.extract(module, raw=True))
+
+
+def read_pyinstaller_archive(path: Path) -> list[EmbeddedItem]:
+    """Everything in the archive of a PyInstaller executable (or a PYZ file).
+
+    Raises :class:`ArchiveError` when it cannot be read.
+    """
+    carchive_reader, zlib_reader = _archive_readers()
+    try:
+        with path.open("rb") as stream:
+            if stream.read(len(_PYZ_MAGIC)) == _PYZ_MAGIC:
+                return list(_pyz_items(zlib_reader(str(path), 0), path.name))
+        archive = carchive_reader(str(path))
+        items: list[EmbeddedItem] = []
+        for name, entry in sorted(archive.toc.items()):
+            typecode = entry[-1]
+            if typecode == "z":  # the PYZ with every pure-Python module
+                items += _pyz_items(archive.open_embedded_archive(name), name)
+            elif typecode in {"m", "M"}:  # bootstrap modules
+                items.append(EmbeddedItem("PKG", name, "module", archive.extract(name)))
+            elif typecode == "s":  # the entry point and run-time hooks
+                items.append(EmbeddedItem("PKG", name, "script", archive.extract(name)))
+            elif typecode in {"b", "x", "l"}:  # files a one-file build extracts at run time
+                items.append(EmbeddedItem("PKG", name, "binary", archive.extract(name)))
+        return items
+    # Any failure of the reader means the code cannot be verified. The PYZ reader
+    # raises SystemExit (not an Exception) when the file vanishes mid-read.
+    except (Exception, SystemExit) as exc:
+        raise ArchiveError(f"PyInstaller archive cannot be read: {exc}") from exc
+
+
+def read_zip(data: bytes) -> list[EmbeddedItem]:
+    """The members of a ZIP file, decompressed (``base_library.zip``...).
+
+    Raises :class:`ArchiveError` when it cannot be read.
+    """
+    items: list[EmbeddedItem] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                stem, _dot, suffix = info.filename.rpartition(".")
+                if suffix in {"py", "pyc"} and stem:
+                    module = stem.replace("/", ".").removesuffix(".__init__")
+                    items.append(EmbeddedItem("ZIP", module, "module", archive.read(info)))
+                else:
+                    items.append(EmbeddedItem("ZIP", info.filename, "data", archive.read(info)))
+    except Exception as exc:  # corrupt, encrypted or unsupported: cannot be verified
+        raise ArchiveError(f"ZIP file cannot be read: {exc}") from exc
+    return items
+
+
+class _BundleScanner:
+    """Collects the findings of one bundle scan."""
+
+    def __init__(self, allowlist: Sequence[AllowRule]) -> None:
+        self.allowlist = allowlist
+        self.result = BundleResult()
+        # Canonical names of forbidden packages already reported (once each).
+        self._reported: set[str] = set()
+        # The GUI and CLI executables embed the same modules: check each once.
+        self._seen: set[bytes] = set()
+
+    def add(self, finding: BundleFinding) -> None:
+        (self.result.allowed if finding.allowed_by else self.result.violations).append(finding)
+
+    def forbidden(self, relative: str, package: str, detail: str) -> None:
+        key = re.sub(r"[-_.]+", "-", package.lower())
+        if key not in self._reported:
+            self._reported.add(key)
+            self.add(BundleFinding(relative, "forbidden-package", detail))
+
+    def scan_file(self, path: Path, relative: str) -> None:
+        """One file of the bundle: its path, its bytes and any archive it carries."""
+        self.result.files += 1
+        for part in PurePosixPath(relative).parts[:-1]:
+            distribution = forbidden_distribution(part)
+            if distribution is not None:
+                self.forbidden(
+                    relative, distribution, f"bundles the '{distribution}' distribution ({part})"
+                )
+        plugin = network_plugin(relative)
+        if plugin is not None:
+            self.add(BundleFinding(relative, "network-plugin", plugin))
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            self.add(BundleFinding(relative, "unreadable-binary", f"cannot be read: {exc}"))
+            return
+        self.scan_data(data, relative)
+        if has_pyinstaller_archive(data) or data.startswith(_PYZ_MAGIC):
+            self.scan_archive(relative, lambda: read_pyinstaller_archive(path))
+        elif data.startswith(_ZIP_MAGIC):
+            self.scan_archive(relative, lambda: read_zip(data))
+
+    def scan_data(self, data: bytes, relative: str) -> None:
+        findings, is_binary = scan_bundle_file(data, relative, self.allowlist)
+        self.result.binaries += is_binary
+        for finding in findings:
+            self.add(finding)
+
+    def scan_archive(self, relative: str, read: Callable[[], list[EmbeddedItem]]) -> None:
+        """Check what ``read`` returns; an archive that cannot be read fails the gate."""
+        try:
+            items = read()
+        except ArchiveError as exc:
+            self.add(BundleFinding(relative, "unreadable-archive", f"cannot be verified: {exc}"))
+            return
+        for item in items:
+            self.scan_item(relative, item)
+
+    def scan_item(self, relative: str, item: EmbeddedItem) -> None:
+        """One module, script or file from an archive inside ``relative``."""
+        where = f"{item.container} in {relative}"
+        if item.kind == "module":
+            package = forbidden_module(item.name)
+            if package is not None:
+                self.forbidden(
+                    relative,
+                    package,
+                    f"bundles the Python package '{package}' (module '{item.name}' in {where})",
+                )
+        data = item.data
+        if data is None:
+            return
+        digest = hashlib.sha256(f"{item.kind}\0{item.name}\0".encode() + data).digest()
+        if digest in self._seen:
+            return
+        self._seen.add(digest)
+        if item.kind == "binary":
+            # A file of a one-file build: checked like a bundled file, and a ZIP
+            # among them (base_library.zip) is opened as well.
+            nested = f"{relative}/{item.name}"
+            self.scan_data(data, nested)
+            if data.startswith(_ZIP_MAGIC):
+                self.scan_archive(nested, lambda: read_zip(data))
+            return
+        if item.kind in {"module", "script"}:
+            self.result.python_modules += 1
+        for marker in telemetry_markers(data):
+            detail = f"{item.kind} '{item.name}' ({where}) contains the telemetry marker '{marker}'"
+            self.add(BundleFinding(relative, "telemetry-endpoint", detail))
 
 
 def scan_bundle_file(
@@ -1482,30 +1783,11 @@ def scan_bundle_file(
 
 def scan_bundle(root: Path, allowlist: Sequence[AllowRule] = BUNDLE_ALLOWLIST) -> BundleResult:
     """Scan a frozen bundle (a folder, a ``.app``, or a single file)."""
-    result = BundleResult()
+    scanner = _BundleScanner(allowlist)
     base = root.parent if root.is_file() else root
-    reported: set[str] = set()
     for path in [root] if root.is_file() else _iter_bundle_files(root):
-        relative = path.relative_to(base).as_posix()
-        result.files += 1
-        for part in PurePosixPath(relative).parts[:-1]:
-            distribution = forbidden_distribution(part)
-            if distribution is not None and distribution not in reported:
-                reported.add(distribution)
-                detail = f"bundles the '{distribution}' distribution ({part})"
-                result.violations.append(BundleFinding(relative, "forbidden-package", detail))
-        try:
-            data = path.read_bytes()
-        except OSError as exc:
-            result.violations.append(
-                BundleFinding(relative, "unreadable-binary", f"cannot be read: {exc}")
-            )
-            continue
-        findings, is_binary = scan_bundle_file(data, relative, allowlist)
-        result.binaries += is_binary
-        for finding in findings:
-            (result.allowed if finding.allowed_by else result.violations).append(finding)
-    return result
+        scanner.scan_file(path, path.relative_to(base).as_posix())
+    return scanner.result
 
 
 # ------------------------------------------------------------------------ command line
@@ -1546,8 +1828,9 @@ def _main_bundle(root: Path, *, quiet: bool, annotate: bool) -> int:
     if result.ok:
         if not quiet:
             print(
-                f"check_privacy: OK: {result.binaries} native binaries in {result.files} files "
-                f"of {shown}; no telemetry, and networking only where allow-listed."
+                f"check_privacy: OK: {result.binaries} native binaries and "
+                f"{result.python_modules} Python modules in {result.files} files of {shown}; "
+                "no telemetry, and networking only where allow-listed."
             )
         return 0
     print(

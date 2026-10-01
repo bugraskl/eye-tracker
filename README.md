@@ -33,8 +33,9 @@ eyes through the webcam you already have and moves the cursor, and keyboard focu
 are looking at. Your hands stay on the keyboard.
 
 It is an open-source, cross-platform take on the idea behind [Glance Switch](https://glanceswitch.com/),
-with extras for privacy and presence: it locks your computer when you walk away, blanks the screen
-when someone looks over your shoulder, and never sends a single byte over the network.
+with extras for privacy and presence: it locks your computer when you walk away, can cover the
+screen when someone looks over your shoulder (opt-in), and never sends a single byte over the
+network.
 
 ## Features
 
@@ -46,31 +47,37 @@ when someone looks over your shoulder, and never sends a single byte over the ne
 | 🛡️ | **No accidental switches** | Dwell time, hysteresis at the bezels, typing and mouse grace periods, and glances at your phone or desk are ignored. |
 | 📖 | **Reading-aware** | Copying from a document on the other screen? Focus stays in your editor while you read. |
 | 🎯 | **Learns as you work** | Every time you move the mouse somewhere and stop, the calibration gets a little better. |
-| 🚶 | **Walk-away lock** | No face and no input for 45 s: a 10 s countdown, then lock and/or displays off. Displays wake when you return. |
+| 🚶 | **Walk-away lock** | No face and no input for 45 s: lock and/or displays off, announced by a 10 s countdown during the last seconds. Displays wake when you return. Until the setup assistant is finished, it only shows a notification. |
 | 🙈 | **Privacy mode** | One hotkey releases the camera completely; the webcam light goes out. |
-| 👥 | **Shoulder guard** | A second face behind you for 2 s: privacy curtain, notification or lock. |
-| 📞 | **Plays nice with calls** | Releases the camera automatically when Teams, Zoom or another app needs it. |
+| 👥 | **Shoulder guard** | Opt-in (**Settings → Presence & privacy**): a second face behind you for 2 s gets a privacy curtain, a notification or a lock. |
+| 📞 | **Plays nice with calls** | Releases the camera automatically on Windows and Linux when Teams, Zoom or another app needs it. On macOS, add your call apps to **Pause while these apps run**. |
 | 🔋 | **Tiny CPU footprint** | Adaptive frame rate and a motion gate that skips unchanged frames. |
 | 🖥️ | **Any layout** | Two, three or more monitors, side by side, stacked, or a laptop below. One calibration per desk setup. |
 | 🚀 | **Starts with your computer** | Optional start at login on all three platforms, in the background. |
+
+Walk-away lock and the shoulder guard need the camera: they pause while tracking is paused, in
+privacy mode, during calibration and while another app has the camera.
 
 ## Download
 
 | Platform | Package | |
 |---|---|---|
 | **Windows** 10/11 x64 | Installer `.exe` or portable `.zip` | [Download](https://github.com/bugraskl/eye-tracker/releases/latest) |
-| **macOS** 13+ Apple silicon | `.dmg` | [Download](https://github.com/bugraskl/eye-tracker/releases/latest) |
+| **macOS** 14+ Apple silicon | `.dmg` | [Download](https://github.com/bugraskl/eye-tracker/releases/latest) |
 | **Linux** x86_64 | `.AppImage` or `.tar.gz` | [Download](https://github.com/bugraskl/eye-tracker/releases/latest) |
 
 Every release ships `SHA256SUMS.txt` and GitHub build-provenance attestations. Builds are not
 code-signed yet; see [platform notes](docs/platform-support.md) for the one-time Gatekeeper and
-SmartScreen steps.
+SmartScreen steps. The portable ZIP keeps its settings in your user profile like the installed app;
+start it with `--config-dir FOLDER` to keep everything in a folder of your choice.
 
 ## Quick start
 
 1. Install and start **Eye Tracker**. An eye icon appears in the tray (menu bar on macOS).
-2. Follow the short setup: pick your camera, grant permissions on macOS, choose what happens when
-   you walk away.
+2. Follow the short setup assistant: pick your camera, grant permissions on macOS, choose what
+   happens when you walk away. Until it is finished, walking away only shows a notification. (If
+   Eye Tracker first starts at sign-in, the assistant is offered as a notification; you can also
+   open it with **Run setup assistant…** under Settings → General.)
 3. **Calibrate**: look at the dots as they appear, about 15 seconds per monitor.
    ([Calibration guide](docs/calibration.md))
 4. Work normally. Look at the other monitor and start typing.
@@ -79,13 +86,16 @@ Default hotkeys:
 
 | Action | Windows | macOS | Linux (X11) |
 |---|---|---|---|
-| Pause / resume tracking | `Ctrl+Alt+Win+T` | `⌃⌥T` | `Ctrl+Alt+Shift+T` |
-| Privacy mode (camera off) | `Ctrl+Alt+Win+P` | `⌃⌥P` | `Ctrl+Alt+Shift+P` |
-| Calibrate | `Ctrl+Alt+Win+C` | `⌃⌥C` | `Ctrl+Alt+Shift+C` |
+| Pause / resume tracking | `Ctrl+Alt+Win+T` | `⌃⌥⌘T` | `Ctrl+Alt+Super+T` |
+| Privacy mode (camera off) | `Ctrl+Alt+Win+P` | `⌃⌥⌘P` | `Ctrl+Alt+Super+P` |
+| Calibrate | `Ctrl+Alt+Win+C` | `⌃⌥⌘C` | `Ctrl+Alt+Super+C` |
 
 The defaults avoid combinations that type characters on keyboards with AltGr (Ctrl+Alt+T is `₺` on
-Turkish Q, for example). You can change them in **Settings → Hotkeys**. Every other option is listed
-in the [configuration reference](docs/configuration.md).
+Turkish Q, for example), the ⌃⌥ shortcuts of Rectangle and Magnet on macOS, and on Linux the
+Alt+Shift and Ctrl+Shift keyboard-layout switches and the Ctrl+Alt+Shift shortcuts of JetBrains IDEs
+and VS Code. You can change them in **Settings → Hotkeys**; a combination that another app already
+uses, or that types a character on one of your keyboard layouts, is reported as unavailable. Every
+other option is listed in the [configuration reference](docs/configuration.md).
 
 ## How it works
 
@@ -115,8 +125,8 @@ Deeper dive: [architecture](docs/architecture.md).
 
 | Promise | Verified by |
 |---|---|
-| No network access at all: no telemetry, no update checks, no accounts. | A source scan and a scan of every built bundle's native libraries fail CI on networking code. |
-| Camera frames are analysed in memory and never saved. | The source scan fails CI on any image or video writing API. |
+| No network access at all: no telemetry, no update checks, no accounts. | A source scan fails CI on networking code. Every release build, and every pull request that changes the packaging or the dependencies, is scanned too: each bundled native library and Python module. |
+| Camera frames are analysed in memory and never saved. | The source scan fails CI on OpenCV's image and video writers (`imwrite`, `imencode`, `VideoWriter`); anything else is left to code review. |
 | Only numbers are stored: head angles, iris ratios, screen points. | `calibration.json` is plain JSON. |
 | Privacy mode, pause and a locked screen release the camera. | The webcam light goes out. |
 | Typing is detected from the OS idle timer, never by reading keys. | [`engine/input_state.py`](src/eye_tracker/engine/input_state.py) |
@@ -129,11 +139,27 @@ Details: [privacy](docs/privacy.md).
 Measured with `eye-tracker bench` (details and your own numbers: `eye-tracker bench`).
 <!-- PERF:END -->
 
-Eye Tracker analyses between 1 and 12 frames per second depending on what is happening, and skips
-frames in which nothing moved. Choose **Eco** for the lowest CPU use or **Responsive** for the
-fastest reactions under **Settings → Camera & performance**.
+Run `eye-tracker bench` to measure CPU use and latency on your own machine.
+
+With the default **Balanced** profile Eye Tracker analyses 1 to 12 frames per second depending on
+what is happening (24 while calibrating or while the camera preview is open), and skips frames in
+which nothing moved. **Eco** uses 0.5 to 8 (15) for the lowest CPU use, **Responsive** 1 to 20 (30)
+for the fastest reactions; choose under **Settings → Camera & performance**.
 
 ## Command line
+
+The examples use `eye-tracker`. What to type depends on how you installed Eye Tracker:
+
+| Installed from | Command |
+|---|---|
+| Windows installer | `eye-tracker` in a new terminal (PATH option unticked: `.\eye-tracker.exe` in `%LOCALAPPDATA%\Programs\Eye Tracker`) |
+| Windows portable ZIP | `.\eye-tracker-cli.exe` in the extracted folder |
+| macOS | `"/Applications/Eye Tracker.app/Contents/MacOS/eye-tracker-cli"` |
+| Linux AppImage | the AppImage file itself, e.g. `./EyeTracker-<version>-linux-x86_64.AppImage` |
+| Linux tarball | `./eye-tracker/eye-tracker` |
+| From source | `uv run eye-tracker` |
+
+`eye-tracker doctor` shows the command of your copy (*command_line*), and so do the app's own hints.
 
 ```bash
 eye-tracker                     # start the tray app
@@ -147,36 +173,43 @@ eye-tracker reset --all         # forget calibrations and settings
 ```
 
 `eye-tracker ctl` also lets you bind actions to your own keyboard shortcuts, for example on Wayland
-where global hotkeys are not available.
+where global hotkeys are not available. Bind the full command from the table: a shortcut bound to a
+command that does not exist does nothing.
 
 ## Platform support
 
 | | Windows | macOS | Linux X11 | Linux Wayland |
 |---|:---:|:---:|:---:|:---:|
-| Cursor follows gaze | ✅ | ✅ | ✅ | ⚠️ sway, Hyprland, or ydotool |
+| Cursor follows gaze | ✅ | ✅ | ✅ | ⚠️ sway, Hyprland, or ydotool¹ |
 | Keyboard focus follows | ✅ | ✅ | ✅ | ❌ |
-| Walk-away lock, privacy mode, shoulder guard | ✅ | ✅ | ✅ | ✅ |
+| Walk-away lock, privacy mode, shoulder guard | ✅ | ✅ | ✅ | ✅² |
 | Global hotkeys | ✅ | ✅ | ✅ | via `eye-tracker ctl` |
+
+¹ Wayland does not let apps read the pointer position: the cursor lands in the middle of the
+monitor instead of where you left it, and mouse use does not refine the calibration.
+
+² Outside GNOME, Wayland does not report keyboard and mouse use: only the camera tells whether you
+are there, and typing does not hold switching back.
 
 Full matrix and per-platform notes: [platform support](docs/platform-support.md).
 
 ## Compared with Glance Switch
 
 Glance Switch inspired this project. This comparison uses the features listed on
-[glanceswitch.com](https://glanceswitch.com/) in September 2026.
+[glanceswitch.com](https://glanceswitch.com/) in October 2026.
 
 | | Eye Tracker | Glance Switch |
 |---|---|---|
-| Platforms | Windows, macOS, Linux | macOS 14+ |
+| Platforms | Windows, macOS 14+ (Apple silicon; Intel from source), Linux | macOS 14+ (Apple silicon & Intel) |
 | Price | Free, MIT licence | $14.99 one-time |
 | Source code | Open | Closed |
-| Network use | None | Licence key check |
+| Network use | None | Licence key check + daily update check |
 | Tracking | Head pose + iris landmarks | Head pose (+ eye position for panes) |
 | Split-pane focus in terminals and editors | Not yet | ✅ |
 | Learns from your mouse use | ✅ | ✅ (from clicks) |
 | Walk-away lock / displays off | ✅ | Not listed |
 | Shoulder-surfer guard | ✅ | Not listed |
-| Automatic camera hand-off to calls | ✅ | Not listed |
+| Automatic camera hand-off to calls | ✅ Windows, Linux (app list on macOS) | Not listed |
 
 ## Run from source
 
@@ -189,8 +222,10 @@ uv sync
 uv run eye-tracker
 ```
 
-This is also the way to run Eye Tracker on Intel Macs and on Linux distributions older than the
-AppImage supports. Building installers yourself: [building](docs/building.md).
+This is also the way to run Eye Tracker on an Intel Mac (macOS 14 or newer). On Linux, running
+from source needs glibc 2.34 or newer (for the Qt wheels) and your distribution's `libxcb-cursor0`
+(Debian/Ubuntu) or `xcb-util-cursor` (Fedora, Arch) package. Building installers yourself:
+[building](docs/building.md).
 
 ## FAQ
 
@@ -218,8 +253,9 @@ you pause to read the other monitor during typing (6 s). All of these are adjust
 <details>
 <summary><b>What happens when I look at my phone?</b></summary>
 
-Glances away from every monitor are recognised from your calibrated range of head and eye movement
-and ignored.
+Nothing switches. From your calibration Eye Tracker estimates where your head and eyes point
+together, and a gaze that lands well below or beside every monitor (a phone, papers, the keyboard)
+is ignored.
 </details>
 
 <details>
@@ -259,6 +295,9 @@ helps other multi-monitor users find it.
 - [MediaPipe Face Landmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) model by Google (Apache-2.0)
 - [YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) face detector (MIT)
 - [OpenCV](https://opencv.org/) (Apache-2.0) and [Qt for Python](https://doc.qt.io/qtforpython-6/) (LGPLv3)
+
+The model files, their licence texts and checksums are listed in
+[NOTICE.md](src/eye_tracker/vision/models/NOTICE.md).
 
 ## License
 

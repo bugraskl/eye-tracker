@@ -16,6 +16,9 @@ Design
   ``False`` for the new one: the entry must be removed with "−" and the app
   added again. :meth:`MacPlatform.accessibility_status` reports this case as
   ``"stale"`` (it remembers which build was last trusted) so the UI can say so.
+  ``eye-tracker-cli``, the bundle's second executable, identifies the build by
+  the app's executable as well, but its own trust belongs to the terminal that
+  started it: it never records a grant and reports a missing one as unknown.
 * **Hung apps.** Accessibility calls block until the target app answers. An
   app that does not answer in time is left alone for a few seconds (window
   list and application-level handles only), so polling it cannot stall the UI.
@@ -39,6 +42,7 @@ import logging
 import math
 import os
 import platform as _stdlib_platform
+import plistlib
 import re
 import shutil
 import subprocess
@@ -102,6 +106,8 @@ _TOOL_TIMEOUT_S = 5.0
 _FRAME_TOLERANCE = 2
 #: Remembers which build Accessibility was granted to (see ``accessibility_status``).
 _ACCESSIBILITY_STATE_FILE = "macos-accessibility.json"
+#: Name suffix of the bundle's command-line executable (``eye-tracker-cli``).
+_CLI_SUFFIX = "-cli"
 
 _AX_POINT_RE = re.compile(r"x:\s*(-?[\d.]+)\s+y:\s*(-?[\d.]+)")
 _AX_SIZE_RE = re.compile(r"w:\s*(-?[\d.]+)\s+h:\s*(-?[\d.]+)")
@@ -159,20 +165,71 @@ def _macos_major_version() -> int:
         return 0
 
 
+def _bundle_main_executable(executable: Path) -> Path | None:
+    """The main executable of the app bundle ``executable`` belongs to.
+
+    The bundle holds two programs side by side in ``<App>.app/Contents/MacOS``
+    (see ``eye-tracker.spec``): the app itself, named by ``CFBundleExecutable``
+    in ``Contents/Info.plist``, and the ``eye-tracker-cli`` command. ``None``
+    when ``executable`` is not inside a bundle or the plist cannot be read.
+    """
+    macos_dir = executable.parent
+    contents = macos_dir.parent
+    if macos_dir.name != "MacOS" or contents.name != "Contents":
+        return None
+    try:
+        with open(contents / "Info.plist", "rb") as fh:
+            info = plistlib.load(fh)
+    except Exception as exc:  # OSError, InvalidFileException, an XML parser error ...
+        log.debug("Cannot read the bundle's Info.plist: %s", exc)
+        return None
+    name = info.get("CFBundleExecutable") if isinstance(info, dict) else None
+    if not isinstance(name, str) or not name or Path(name).name != name:
+        return None
+    return macos_dir / name
+
+
+def _packaged_executables() -> tuple[Path, Path] | None:
+    """``(this process's executable, the app's main executable)``; ``None`` from source."""
+    if not getattr(sys, "frozen", False):
+        return None
+    try:
+        executable = Path(sys.executable).resolve()
+    except OSError:
+        return None
+    return executable, _bundle_main_executable(executable) or executable
+
+
 def _build_fingerprint() -> str | None:
     """Identity of this packaged build; ``None`` when running from source.
 
     An ad-hoc signed app's Accessibility grant is tied to its code hash, which
     changes with every build - and so do the version, size and modification
-    time of the bundle's main executable.
+    time of the bundle's main executable. That is the app's executable even
+    in ``eye-tracker-cli``: both programs must name the same build.
     """
-    if not getattr(sys, "frozen", False):
+    executables = _packaged_executables()
+    if executables is None:
         return None
     try:
-        stat = Path(sys.executable).resolve().stat()
+        stat = executables[1].stat()
     except OSError:
         return None
     return f"{__version__}:{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def _runs_helper_executable() -> bool:
+    """Whether this process is a packaged build's ``eye-tracker-cli``, not the app.
+
+    macOS attributes the privacy permissions of such a process to whatever
+    started it (the terminal, for a command typed there), so
+    ``AXIsProcessTrusted()`` says nothing about the app's own grant.
+    """
+    executables = _packaged_executables()
+    if executables is None:
+        return False
+    executable, main = executables
+    return executable != main or executable.name.endswith(_CLI_SUFFIX)
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +497,7 @@ class MacPlatform(PlatformServices):
         self._trusted_build_loaded = False
         self._build_id: str | None = None  # see _fingerprint
         self._fingerprint_known = False
+        self._helper: bool | None = None  # see _is_helper
         self._warned_untrusted = False
 
     def _mod(self, name: str) -> Any:
@@ -963,10 +1021,16 @@ class MacPlatform(PlatformServices):
 
     # ------------------------------------------------------------ permissions
     def permissions(self) -> dict[str, bool | None]:
-        return {
-            "camera": self._camera_permission(),
-            "accessibility": self._accessibility_permission(),
-        }
+        """Camera and Accessibility permission (``None``: unknown or not decided).
+
+        In ``eye-tracker-cli`` an untrusted process reports Accessibility as
+        ``None``: macOS judged whatever started it (see :meth:`_is_helper`),
+        not the app, so ``doctor`` must not call the app's grant missing.
+        """
+        accessibility = self._accessibility_permission()
+        if accessibility is False and self._is_helper():
+            accessibility = None
+        return {"camera": self._camera_permission(), "accessibility": accessibility}
 
     def accessibility_status(self) -> str:
         """Accessibility permission, in more detail than :meth:`permissions`.
@@ -978,7 +1042,9 @@ class MacPlatform(PlatformServices):
           identity; System Settings keeps showing the old entry as enabled while
           it no longer applies. The fix: remove Eye Tracker from Privacy &
           Security › Accessibility with "−", then add the app again.
-        * ``"unknown"``: the Accessibility API is unavailable.
+        * ``"unknown"``: the Accessibility API is unavailable, or this is
+          ``eye-tracker-cli`` without the permission (it may be the terminal,
+          not the app, that lacks it; see :meth:`_is_helper`).
 
         Only packaged builds can be told apart this way; a source checkout
         (whose permission belongs to the terminal or Python) reports "missing".
@@ -989,6 +1055,8 @@ class MacPlatform(PlatformServices):
         self._trust_cache = (self._clock(), trusted)
         if trusted:
             return "granted"
+        if self._is_helper():
+            return "unknown"
         current = self._fingerprint()
         if current is None:
             return "missing"
@@ -1002,7 +1070,19 @@ class MacPlatform(PlatformServices):
             self._build_id = _build_fingerprint()
         return self._build_id
 
+    def _is_helper(self) -> bool:
+        """Whether this process is ``eye-tracker-cli`` (cached :func:`_runs_helper_executable`).
+
+        macOS attributes its Accessibility trust to the process that started
+        it - usually the terminal - so a trusted terminal must not be recorded
+        as a trusted app build, and an untrusted one says nothing about the app.
+        """
+        if self._helper is None:
+            self._helper = _runs_helper_executable()
+        return self._helper
+
     def _accessibility_permission(self) -> bool | None:
+        """Whether *this process* may use the Accessibility API (``AXIsProcessTrusted``)."""
         ax = self._ax()
         if ax is None:
             return None
@@ -1011,7 +1091,7 @@ class MacPlatform(PlatformServices):
         except Exception as exc:
             log.debug("AXIsProcessTrusted failed: %s", exc)
             return None
-        if trusted:
+        if trusted and not self._is_helper():
             self._remember_trusted_build()
         return trusted
 

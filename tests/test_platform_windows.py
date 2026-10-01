@@ -303,11 +303,25 @@ ZOOM_KEY = "C:#Program Files#Zoom#Zoom.exe"
 STORE_PYTHON = "PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0"
 
 
-def proc(
-    pid: int, name: str, *, created: int | None = SESSION_START - 600 * 10_000_000
-) -> windows._Process:
+@dataclass(frozen=True)
+class Proc:
+    """A fake running process: what ``_processes`` lists plus its creation time."""
+
+    pid: int
+    name: str
+    created: int | None  # FILETIME ticks; None = unreadable
+
+
+def proc(pid: int, name: str, *, created: int | None = SESSION_START - 600 * 10_000_000) -> Proc:
     """A running process, by default started ten minutes before the camera session."""
-    return windows._Process(pid=pid, name=name, created=created)
+    return Proc(pid=pid, name=name, created=created)
+
+
+def listed(processes: list[Proc] | None) -> list[windows._Process] | None:
+    """``processes`` as ``WindowsPlatform._processes`` lists them."""
+    if processes is None:
+        return None
+    return [windows._Process(pid=p.pid, name=p.name) for p in processes]
 
 
 @pytest.fixture
@@ -422,14 +436,33 @@ class TestHelpers:
         assert processes
         own = next(p for p in processes if p.pid == os.getpid())
         assert own.name == own.name.lower()
-        assert own.created is not None
+        created = WindowsPlatform._process_created(os.getpid())
+        assert created is not None
         boot = WindowsPlatform._boot_filetime()
         assert boot is not None
-        assert boot <= own.created
+        assert boot <= created
         exe = WindowsPlatform._process_exe(os.getpid())
         assert exe is not None
         assert Path(exe).name.lower() == own.name
         assert WindowsPlatform._process_exe(-1) is None
+        assert WindowsPlatform._process_created(-1) is None
+
+    def test_process_listing_asks_psutil_for_names_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Creation times of other accounts' processes cost ~6 ms each (GUI thread)."""
+        import psutil
+
+        requested: list[list[str]] = []
+        real = psutil.process_iter
+
+        def spy(attrs: list[str] | None = None, **kwargs: Any) -> Any:
+            requested.append(list(attrs or []))
+            return real(attrs, **kwargs)
+
+        monkeypatch.setattr(psutil, "process_iter", spy)
+        assert make_platform(FakeWin32([]))._processes()
+        assert requested == [["name"]]
 
 
 # ------------------------------------------------------------- lifecycle
@@ -787,21 +820,33 @@ class TestCamera:
     def _platform(
         self,
         entries: dict[str, dict[str, Any]],
-        processes: list[windows._Process] | None,
+        processes: list[Proc] | None,
         *,
         exes: dict[int, str | None] | None = None,
         packaged: dict[str, dict[str, Any]] | None = None,
         api: FakeWin32 | None = None,
         boot: int | None = BOOT,
     ) -> WindowsPlatform:
-        """Consent-store entries, running processes (``exes``: pid -> path) and boot time."""
+        """Consent-store entries, running processes (``exes``: pid -> path) and boot time.
+
+        Creation times are served on demand; ``self.created_reads`` records
+        whose were read.
+        """
         keys = {("HKCU", f"{NON_PACKAGED}\\{app}"): values for app, values in entries.items()}
         keys.update(
             {("HKCU", f"{WEBCAM}\\{app}"): values for app, values in (packaged or {}).items()}
         )
         plat = make_platform(api or FakeWin32([]), FakeRegistry(keys))
         plat._own_paths = frozenset({windows._norm_path(r"C:\Python\python.exe")})
-        plat._processes = lambda: processes  # type: ignore[method-assign]
+        plat._processes = lambda: listed(processes)  # type: ignore[method-assign]
+        created = {p.pid: p.created for p in processes or []}
+        self.created_reads: list[int] = []
+
+        def process_created(pid: int) -> int | None:
+            self.created_reads.append(pid)
+            return created.get(pid)
+
+        plat._process_created = process_created  # type: ignore[method-assign]
         plat._process_exe = (exes or {}).get  # type: ignore[method-assign]
         plat._boot_filetime = lambda: boot  # type: ignore[method-assign]
         return plat
@@ -848,7 +893,7 @@ class TestCamera:
 
         def processes() -> list[windows._Process]:
             processes_listed.append(1)
-            return [proc(1, "zoom.exe", created=None)]
+            return [windows._Process(pid=1, name="zoom.exe")]
 
         next_day = SESSION_START + 24 * 3600 * windows.FILETIME_TICKS_PER_S
         plat = self._platform({ZOOM_KEY: IN_USE}, None, exes={1: ZOOM}, boot=next_day)
@@ -867,11 +912,29 @@ class TestCamera:
         assert plat.camera_in_use_by_other_app() is True
 
     @pytest.mark.parametrize("processes", [None, []])
-    def test_unknown_process_list_trusts_the_registry(
-        self, processes: list[windows._Process] | None
-    ) -> None:
+    def test_unknown_process_list_trusts_the_registry(self, processes: list[Proc] | None) -> None:
         plat = self._platform({ZOOM_KEY: IN_USE}, processes)
         assert plat.camera_in_use_by_other_app() is True
+
+    def test_creation_time_is_read_only_for_matching_processes(self) -> None:
+        """Reading it for every process stalled the GUI thread for about a second."""
+        processes = [proc(pid, f"svchost{pid}.exe") for pid in range(10, 60)]
+        processes.append(proc(7, "zoom.exe"))
+        plat = self._platform({ZOOM_KEY: IN_USE}, processes, exes={7: ZOOM})
+        assert plat.camera_in_use_by_other_app() is True
+        assert self.created_reads == [7]
+
+    def test_creation_time_is_read_only_for_the_matching_package(self) -> None:
+        api = FakeWin32([])
+        api.packages = {7: "MSTeams_8wekyb3d8bbwe", 8: "Some.Other_app"}
+        plat = self._platform(
+            {},
+            [proc(5, "explorer.exe"), proc(7, "ms-teams.exe"), proc(8, "other.exe")],
+            packaged={"MSTeams_8wekyb3d8bbwe": IN_USE},
+            api=api,
+        )
+        assert plat.camera_in_use_by_other_app() is True
+        assert self.created_reads == [7]
 
     def test_packaged_app_counts_while_its_package_runs(self) -> None:
         api = FakeWin32([])

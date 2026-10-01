@@ -51,7 +51,7 @@ bile göndermez.
 | 🙈 | **Gizlilik modu** | Tek kısayolla kamera tamamen bırakılır; webcam ışığı söner. Siz kapatana kadar yeniden başlatmadan veya güncellemeden sonra da açık kalır. |
 | 👥 | **Omuz koruması** | İsteğe bağlı (**Ayarlar → Presence & privacy**): arkanızda 2 sn boyunca ikinci bir yüz görünürse gizlilik perdesi, bildirim veya kilit. |
 | 📞 | **Görüşmelerle uyumlu** | Windows ve Linux'ta Teams, Zoom veya başka bir uygulama kameraya ihtiyaç duyunca kamerayı otomatik bırakır. macOS'ta görüşme uygulamalarınızı **Pause while these apps run** listesine ekleyin. |
-| 🔋 | **Çok düşük CPU** | Uyarlanabilir kare hızı ve değişmeyen kareleri atlayan hareket kapısı. |
+| 🔋 | **Çok düşük CPU** | Uyarlanabilir kare hızı ve değişmeyen kareleri atlayan hareket kapısı sayesinde 8 çekirdekli bir masaüstünde yaklaşık %0,5 CPU ([ölçüm](#performans)). |
 | 🖥️ | **Her düzen** | İki, üç veya daha fazla monitör; yan yana, üst üste ya da altta bir dizüstü. Her masa düzeni için ayrı kalibrasyon. |
 | 🚀 | **Bilgisayarla birlikte açılır** | Üç platformda da isteğe bağlı olarak oturum açılışında arka planda başlar. |
 
@@ -143,7 +143,16 @@ Ayrıntılar: [gizlilik](docs/privacy.md) (İngilizce).
 ## Performans
 
 <!-- PERF:BEGIN -->
-`eye-tracker bench` ile ölçülmüştür (kendi makinenizde ölçmek için: `eye-tracker bench`).
+İzleme açıkken normal çalışma sırasında ölçülmüştür: Windows 11, AMD Ryzen 7 3700X (8 çekirdek, 16
+iş parçacığı), 640×480'de Logitech C920, Balanced profili, dağıtılan `EyeTracker.exe`. CPU değerlerine
+kamera yakalama ve bildirim alanı uygulaması dahildir.
+
+| | Ölçülen |
+|---|---|
+| CPU, tüm makine | ortalama **%0,55** (en yüksek %1,7) |
+| CPU, tek çekirdek | ortalama %9 |
+| Kare başına yüz analizi | 11 ms (medyan), 12 ms (95. yüzdelik) |
+| Bellek | yaklaşık 200 MB |
 <!-- PERF:END -->
 
 Kendi makinenizde CPU kullanımını ve gecikmeyi ölçmek için `eye-tracker bench` komutunu çalıştırın.

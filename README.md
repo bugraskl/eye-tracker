@@ -51,7 +51,7 @@ network.
 | 🙈 | **Privacy mode** | One hotkey releases the camera completely; the webcam light goes out. It stays on after a restart or an update until you turn it off. |
 | 👥 | **Shoulder guard** | Opt-in (**Settings → Presence & privacy**): a second face behind you for 2 s gets a privacy curtain, a notification or a lock. |
 | 📞 | **Plays nice with calls** | Releases the camera automatically on Windows and Linux when Teams, Zoom or another app needs it. On macOS, add your call apps to **Pause while these apps run**. |
-| 🔋 | **Tiny CPU footprint** | Adaptive frame rate and a motion gate that skips unchanged frames. |
+| 🔋 | **Tiny CPU footprint** | About 0.5 % CPU on an 8-core desktop, thanks to an adaptive frame rate and a motion gate that skips unchanged frames ([measured](#performance)). |
 | 🖥️ | **Any layout** | Two, three or more monitors, side by side, stacked, or a laptop below. One calibration per desk setup. |
 | 🚀 | **Starts with your computer** | Optional start at login on all three platforms, in the background. |
 
@@ -140,7 +140,16 @@ Details: [privacy](docs/privacy.md).
 ## Performance
 
 <!-- PERF:BEGIN -->
-Measured with `eye-tracker bench` (details and your own numbers: `eye-tracker bench`).
+Measured during normal work with tracking on: Windows 11, AMD Ryzen 7 3700X (8 cores, 16 threads),
+Logitech C920 at 640×480, Balanced profile, the shipped `EyeTracker.exe`. CPU figures include camera
+capture and the tray app.
+
+| | Measured |
+|---|---|
+| CPU, whole machine | **0.55 %** on average (1.7 % peak) |
+| CPU, one core | 9 % on average |
+| Face analysis per frame | 11 ms (median), 12 ms (95th percentile) |
+| Memory | about 200 MB |
 <!-- PERF:END -->
 
 Run `eye-tracker bench` to measure CPU use and latency on your own machine.

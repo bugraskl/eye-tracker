@@ -44,6 +44,17 @@ def _load_script() -> ModuleType:
 check_privacy = _load_script()
 
 
+@pytest.fixture(autouse=True)
+def plain_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Report lines as on a developer's machine, wherever the tests run.
+
+    Under GitHub Actions (``GITHUB_ACTIONS=true``, inherited by the test run in
+    CI) the command line prints workflow-command annotations instead; the tests
+    of that format set the variable themselves.
+    """
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+
+
 def _rules(source: str) -> list[str]:
     violations = check_privacy.scan_source(textwrap.dedent(source), Path("snippet.py"))
     return [v.rule for v in violations]
@@ -338,12 +349,51 @@ def test_main_exit_codes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
 def test_github_annotations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    (tmp_path / "bad.py").write_text("import ssl\n", encoding="utf-8")
+    """Under GitHub Actions each violation becomes an error annotation on its line."""
+    bad = tmp_path / "bad.py"
+    bad.write_text("import os\nimport ssl\n", encoding="utf-8")
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    (clean / "ok.py").write_text("import os\n", encoding="utf-8")
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
-    assert check_privacy.main([str(tmp_path)]) == 1
-    out = capsys.readouterr().out
-    assert out.startswith("::error file=")
-    assert ",line=1,col=1,title=Privacy check::network-import:" in out
+
+    assert check_privacy.main([str(bad)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == (
+        f"::error file={check_privacy._display_path(bad)},line=2,col=1,title=Privacy check::"
+        "network-import: import of networking module 'ssl'\n"
+    )
+    # The summary stays a plain line on stderr.
+    assert captured.err.startswith("check_privacy: FAILED: 1 violation(s) in 1 of 1 files.")
+
+    assert check_privacy.main([str(clean)]) == 0
+    assert capsys.readouterr().out.startswith("check_privacy: OK: 1 files in ")
+
+
+@pytest.mark.parametrize("value", ["", "false", "1", "TRUE"])
+def test_github_annotations_only_under_github_actions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    value: str,
+) -> None:
+    """The runner sets GITHUB_ACTIONS=true; anything else gets plain lines."""
+    bad = tmp_path / "bad.py"
+    bad.write_text("import ssl\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_ACTIONS", value)
+    assert check_privacy.main([str(bad)]) == 1
+    assert capsys.readouterr().out == (
+        f"{check_privacy._display_path(bad)}:1:1: network-import: "
+        "import of networking module 'ssl'\n"
+    )
+
+
+def test_github_annotation_escapes_the_message() -> None:
+    violation = check_privacy.Violation(Path("pkg") / "a.py", 3, 5, "frame-write", "50%\nof it")
+    assert check_privacy._github_annotation(violation) == (
+        "::error file=pkg/a.py,line=3,col=5,title=Privacy check::frame-write: 50%25%0Aof it"
+    )
+    assert check_privacy._escape("a%b\r\nc") == "a%25b%0D%0Ac"
 
 
 def test_script_runs_standalone(tmp_path: Path) -> None:
@@ -1082,11 +1132,23 @@ def test_bundle_command_line(
     assert captured.out == "_internal/x.dll: network-library: links WININET.dll\n"
     assert "FAILED: 1 problem(s)" in captured.err
 
+    # Under GitHub Actions: a notice per allow-listed file, an error per problem
+    # (bundled files have no source line to point at); the summary stays plain.
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
-    assert check_privacy.main(["--bundle", str(bad)]) == 1
-    assert capsys.readouterr().out.startswith(
-        "::error title=Privacy check (bundle)::_internal/x.dll"
+    assert check_privacy.main(["--bundle", str(good)]) == 0
+    notice, summary = capsys.readouterr().out.splitlines()
+    assert notice.startswith(
+        "::notice title=Privacy check (bundle)::_internal/_socket.pyd: allowed WS2_32.dll: "
     )
+    assert summary.startswith("check_privacy: OK: 1 native binaries")
+    assert check_privacy.main(["--bundle", str(bad)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "::error title=Privacy check (bundle)::"
+        "_internal/x.dll: network-library: links WININET.dll\n"
+    )
+    assert captured.err.startswith("check_privacy: FAILED: 1 problem(s) in the bundle ")
+    monkeypatch.delenv("GITHUB_ACTIONS")
 
     assert check_privacy.main(["--bundle", str(tmp_path / "missing")]) == 2
     with pytest.raises(SystemExit) as exc:

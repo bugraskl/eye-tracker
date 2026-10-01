@@ -22,7 +22,7 @@ import pytest
 
 from eye_tracker.platform import linux
 from eye_tracker.platform.base import PlatformServices
-from eye_tracker.types import Rect, WindowRef
+from eye_tracker.types import AppIdentity, Rect, WindowRef
 
 _SESSION_VARS = (
     "XDG_SESSION_TYPE",
@@ -2149,6 +2149,10 @@ class FakeWindow:
         self.geometry = (0, 0, 100, 100)
         self.map_state = linux._X_IS_VIEWABLE
         self.sent: list[tuple[Any, int]] = []
+        self.wm_class: tuple[str, str] | None = None
+
+    def get_wm_class(self) -> tuple[str, str] | None:
+        return self.wm_class
 
     def get_full_property(self, atom: int, prop_type: int) -> Any:
         assert prop_type == linux._X_ANY_PROPERTY_TYPE
@@ -2307,6 +2311,36 @@ def test_window_rect_includes_decorations_and_drops_csd_shadow(
     assert x11_plat.window_rect(WindowRef(20)) == Rect(24, 24, 800, 600)
 
 
+def test_window_client_rect_excludes_decorations_and_csd_shadow(
+    x11_plat: linux.LinuxPlatform, xdisplay: FakeDisplay
+) -> None:
+    xdisplay.add(10, (100, 130, 800, 600), _NET_FRAME_EXTENTS=[2, 2, 30, 2])
+    xdisplay.add(20, (0, 0, 848, 648), _GTK_FRAME_EXTENTS=[24, 24, 24, 24])
+    assert x11_plat.window_client_rect(WindowRef(10)) == Rect(100, 130, 800, 600)
+    assert x11_plat.window_client_rect(WindowRef(20)) == Rect(24, 24, 800, 600)
+    assert x11_plat.window_client_rect(WindowRef(99)) is None  # gone
+    assert x11_plat.window_client_rect(WindowRef("x")) is None
+
+
+def test_window_app_reads_wm_class_and_process(
+    monkeypatch: pytest.MonkeyPatch, x11_plat: linux.LinuxPlatform, xdisplay: FakeDisplay
+) -> None:
+    xdisplay.add(10, (0, 0, 800, 600), pid=501).wm_class = ("kitty", "kitty")
+    xdisplay.add(20, (0, 0, 800, 600), pid=502)  # no WM_CLASS
+    names = {501: "kitty", 502: "xterm"}
+    monkeypatch.setattr(x11_plat, "_app_process_name", names.get)
+    assert x11_plat.window_app(WindowRef(10, pid=501)) == AppIdentity("kitty", "kitty")
+    assert x11_plat.window_app(WindowRef(20)) == AppIdentity("xterm", "")
+    assert x11_plat.window_app(WindowRef(10, pid=777)) is None  # another client's id now
+    assert x11_plat.window_app(WindowRef(99)) is None
+
+
+def test_pane_queries_need_x11(monkeypatch: pytest.MonkeyPatch, plat: linux.LinuxPlatform) -> None:
+    wayland(monkeypatch, "GNOME", display=False)
+    assert plat.window_client_rect(WindowRef(10)) is None
+    assert plat.window_app(WindowRef(10)) is None
+
+
 def test_foreground_window(x11_plat: linux.LinuxPlatform, xdisplay: FakeDisplay) -> None:
     xdisplay.add(20, (100, 100, 800, 600), pid=501)
     xdisplay.add(40, (0, 0, 10, 10), pid=OWN_PID)
@@ -2414,6 +2448,7 @@ def test_capabilities_x11(
     assert caps["focus"]
     assert caps["cursor"]
     assert caps["hotkeys"]
+    assert caps["panes"]
     assert not caps["key_idle"]
 
 
@@ -2430,6 +2465,7 @@ def test_capabilities_wayland(
     assert not caps["focus"]
     assert not caps["cursor"]
     assert not caps["hotkeys"]
+    assert not caps["panes"]
     ydotool_ready(monkeypatch, tools, tmp_path)
     assert plat.capabilities()["cursor"]
 

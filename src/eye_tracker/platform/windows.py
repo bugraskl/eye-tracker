@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import Any, ParamSpec, Protocol, TypeVar, cast
 
 from .. import APP_ID
-from ..types import Rect, WindowRef
+from ..types import AppIdentity, Rect, WindowRef
 from .base import PlatformServices
 
 log = logging.getLogger(__name__)
@@ -290,6 +290,10 @@ class _Win32:
             user32, "GetClassNameW", ctypes.c_int, hwnd, w.LPWSTR, ctypes.c_int
         )
         self._GetWindowRect = _bind(user32, "GetWindowRect", w.BOOL, hwnd, ctypes.POINTER(w.RECT))
+        self._GetClientRect = _bind(user32, "GetClientRect", w.BOOL, hwnd, ctypes.POINTER(w.RECT))
+        self._ClientToScreen = _bind(
+            user32, "ClientToScreen", w.BOOL, hwnd, ctypes.POINTER(w.POINT)
+        )
         self._WindowFromPoint = _bind(user32, "WindowFromPoint", hwnd, w.POINT)
         self._GetTopWindow = _bind(user32, "GetTopWindow", hwnd, hwnd)
         self._GetWindow = _bind(user32, "GetWindow", hwnd, hwnd, w.UINT)
@@ -449,6 +453,19 @@ class _Win32:
         if width <= 0 or height <= 0:
             return None
         return Rect(int(rect.left), int(rect.top), int(width), int(height))
+
+    def client_rect(self, hwnd: int) -> Rect | None:
+        """Client area in physical pixels (the process is per-monitor DPI aware)."""
+        rect = wintypes.RECT()
+        if not self._GetClientRect(hwnd, ctypes.byref(rect)):
+            return None
+        origin = wintypes.POINT(0, 0)
+        if not self._ClientToScreen(hwnd, ctypes.byref(origin)):
+            return None
+        width, height = rect.right - rect.left, rect.bottom - rect.top
+        if width <= 0 or height <= 0:
+            return None
+        return Rect(int(origin.x), int(origin.y), int(width), int(height))
 
     def is_window(self, hwnd: int) -> bool:
         return bool(self._IsWindow(hwnd))
@@ -900,6 +917,7 @@ class WindowsPlatform(PlatformServices):
             cursor=True,
             camera_in_use=True,
             hotkeys=True,
+            panes=True,
         )
         return caps
 
@@ -1111,6 +1129,27 @@ class WindowsPlatform(PlatformServices):
         if hwnd is None or not self._api.is_window(hwnd):
             return None
         return self._api.frame_rect(hwnd)
+
+    @_best_effort(None)
+    def window_client_rect(self, ref: WindowRef) -> Rect | None:
+        hwnd = _hwnd_of(ref)
+        if hwnd is None or not self._api.is_window(hwnd):
+            return None
+        return self._api.client_rect(hwnd)
+
+    @_best_effort(None)
+    def window_app(self, ref: WindowRef) -> AppIdentity | None:
+        api = self._api
+        hwnd = _hwnd_of(ref)
+        if hwnd is None or not api.is_window(hwnd):
+            return None
+        pid = api.thread_process(hwnd)[1]
+        if not pid or (ref.pid is not None and pid != ref.pid):
+            return None  # gone, or the handle was recycled for another process's window
+        name = self._app_process_name(pid)
+        if name is None:
+            return None
+        return AppIdentity(process=name, app_id=api.class_name(hwnd))
 
     # ------------------------------------------------------------------- camera
     def _own_executables(self) -> frozenset[str]:

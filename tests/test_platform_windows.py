@@ -25,7 +25,7 @@ from eye_tracker import APP_ID
 from eye_tracker.platform import windows
 from eye_tracker.platform.base import PlatformServices
 from eye_tracker.platform.windows import WindowsPlatform
-from eye_tracker.types import Rect, WindowRef
+from eye_tracker.types import AppIdentity, Rect, WindowRef
 
 ON_WINDOWS = sys.platform == "win32"
 windows_only = pytest.mark.skipif(not ON_WINDOWS, reason="needs the Win32 API")
@@ -48,6 +48,7 @@ class FakeWindow:
     hung: bool = False
     ex_style: int = 0
     root: int | None = None  # top-level ancestor for child windows
+    client: Rect | None = None  # client area (None: like the frame)
 
 
 class FakeWin32:
@@ -106,6 +107,12 @@ class FakeWin32:
     def frame_rect(self, hwnd: int) -> Rect | None:
         w = self._win(hwnd)
         return w.rect if w is not None else None
+
+    def client_rect(self, hwnd: int) -> Rect | None:
+        w = self._win(hwnd)
+        if w is None:
+            return None
+        return w.client if w.client is not None else w.rect
 
     def is_window(self, hwnd: int) -> bool:
         return hwnd in self.windows
@@ -711,6 +718,35 @@ class TestWindows:
         assert plat.window_rect(WindowRef(handle=1)) == Rect(-1920, 0, 1920, 1080)
         assert plat.window_rect(WindowRef(handle=2)) is None
 
+    def test_window_client_rect(self) -> None:
+        window = FakeWindow(1, rect=Rect(0, 0, 1200, 800), client=Rect(8, 39, 1184, 753))
+        plat = make_platform(FakeWin32([window]))
+        assert plat.window_client_rect(WindowRef(handle=1)) == Rect(8, 39, 1184, 753)
+        assert plat.window_client_rect(WindowRef(handle=2)) is None
+        assert plat.window_client_rect(WindowRef(handle=None)) is None
+
+    def test_window_app_names_process_and_class(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        api = FakeWin32(
+            [
+                FakeWindow(1, pid=100, cls="CASCADIA_HOSTING_WINDOW_CLASS"),
+                FakeWindow(2, pid=200, cls="Chrome_WidgetWin_1"),
+            ]
+        )
+        plat = make_platform(api)
+        names = {100: "windowsterminal", 200: "code"}
+        monkeypatch.setattr(plat, "_app_process_name", names.get)
+        assert plat.window_app(WindowRef(handle=1, pid=100)) == AppIdentity(
+            "windowsterminal", "CASCADIA_HOSTING_WINDOW_CLASS"
+        )
+        assert plat.window_app(WindowRef(handle=2)) == AppIdentity("code", "Chrome_WidgetWin_1")
+        assert plat.window_app(WindowRef(handle=1, pid=999)) is None  # recycled HWND
+        assert plat.window_app(WindowRef(handle=3)) is None  # gone
+        names.clear()
+        assert plat.window_app(WindowRef(handle=1)) is None  # process not readable
+
+    def test_panes_capability(self) -> None:
+        assert make_platform(FakeWin32([])).capabilities()["panes"] is True
+
     def test_same_window_compares_handles(self) -> None:
         plat = make_platform(FakeWin32([]))
         assert plat.same_window(WindowRef(handle=5), WindowRef(handle=5, pid=1))
@@ -1093,6 +1129,10 @@ class TestLiveReadOnly:
         assert isinstance(plat.is_window_valid(ref), bool)
         rect = plat.window_rect(ref)
         assert rect is None or (rect.w > 0 and rect.h > 0)
+        client = plat.window_client_rect(ref)
+        assert client is None or (client.w > 0 and client.h > 0)
+        app = plat.window_app(ref)
+        assert app is None or (app.process and app.process == app.process.lower())
         if rect is not None:
             cx, cy = rect.center
             hit = plat.window_at(int(cx), int(cy))

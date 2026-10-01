@@ -197,6 +197,21 @@ class WindowRef:
     rect: Rect | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class AppIdentity:
+    """Which application a window belongs to (``PlatformServices.window_app``).
+
+    ``process`` is the lower-cased executable name without its extension
+    (``"windowsterminal"``, ``"wezterm-gui"``). ``app_id`` is the window class name
+    on Windows (``"CASCADIA_HOSTING_WINDOW_CLASS"``), the ``WM_CLASS`` class on X11
+    and the bundle identifier on macOS; ``""`` when unknown. Titles are never part
+    of it.
+    """
+
+    process: str
+    app_id: str = ""
+
+
 class TrackingState(enum.Enum):
     """High-level state shown in the tray and used by the rate scheduler."""
 

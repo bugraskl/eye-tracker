@@ -39,11 +39,12 @@ from face_drawing import draw_face, two_faces
 AVAILABLE = available_backends()
 needs_facemesh = pytest.mark.skipif("facemesh" not in AVAILABLE, reason="facemesh unavailable")
 needs_lite = pytest.mark.skipif("lite" not in AVAILABLE, reason="YuNet is unavailable")
+_BACKEND_PARAMS: list[object] = [*AVAILABLE] or [pytest.param("none", marks=pytest.mark.skip)]
 
 log = logging.getLogger(__name__)
 
 
-@pytest.fixture(params=AVAILABLE or [pytest.param("none", marks=pytest.mark.skip)])
+@pytest.fixture(params=_BACKEND_PARAMS)
 def backend(request: pytest.FixtureRequest) -> Iterator[VisionBackend]:
     instance = create_backend(request.param)
     try:
@@ -281,6 +282,19 @@ def test_close_is_idempotent_and_final(backend: VisionBackend) -> None:
     backend.close()
     with pytest.raises(RuntimeError):
         backend.process(np.zeros((10, 10, 3), np.uint8), 1.0)
+
+
+def test_reset_starts_afresh_and_a_still_face_is_settled(backend: VisionBackend) -> None:
+    """The worker calls reset() when the camera was released and asks ``settled``."""
+    frame = draw_face()
+    assert _run(backend, frame).usable
+    assert backend.settled  # a still face: the motion gate may repeat it
+    backend.reset()
+    backend.reset()  # idempotent
+    assert backend.settled
+    obs = backend.process(frame, 5.0)
+    assert obs.usable
+    assert backend.settled
 
 
 # --------------------------------------------------------------- drawn faces

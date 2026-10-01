@@ -25,7 +25,7 @@ from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QDesktopServices,
     QFocusEvent,
@@ -65,10 +65,11 @@ from PySide6.QtWidgets import (
 )
 
 from .. import APP_NAME, paths
+from ..cli import cli_command_text
 from ..config import Settings, describe_settings
 from ..platform import autostart
 from ..platform.base import PlatformServices
-from ..platform.hotkeys import format_hotkey, parse_hotkey
+from ..platform.hotkeys import Hotkey, HotkeyManager, format_hotkey, parse_hotkey
 from ..types import TrackingState
 from . import util
 from .icons import app_icon
@@ -86,6 +87,7 @@ __all__ = [
     "format_stats",
     "hotkey_text_from_event",
     "load_diagnostics_text",
+    "modifier_preview",
     "platform_from_controller",
     "probe_cameras",
     "settings_from_controller",
@@ -241,11 +243,12 @@ def camera_in_use(controller: object) -> set[int]:
     return {index} if index is not None else set()
 
 
-def load_diagnostics_text() -> str:
-    """The ``eye-tracker doctor`` report as text (tests patch this).
+def load_diagnostics_text(controller: object | None = None) -> str:
+    """The ``doctor`` report as text (tests patch this).
 
     Imported lazily: the report module is only needed when the page is opened.
-    Without a camera probe, so no camera light flashes.
+    Without a camera probe, so no camera light flashes. The controller's hotkey
+    manager, when there is one, tells the report which hotkeys the OS accepted.
     """
     try:
         from .. import diagnostics
@@ -256,9 +259,14 @@ def load_diagnostics_text() -> str:
         log.warning("Diagnostics module unavailable: %s", exc)
         return (
             "The diagnostics report is not available in this build.\n"
-            'Run "eye-tracker doctor" in a terminal instead.'
+            f"Run '{cli_command_text('doctor')}' in a terminal instead."
         )
-    return str(render(collect(False)))
+    manager = getattr(controller, "hotkey_manager", None)
+    return str(
+        render(
+            collect(False, hotkey_manager=manager if isinstance(manager, HotkeyManager) else None)
+        )
+    )
 
 
 # =================================================================== camera probe
@@ -429,6 +437,25 @@ def _modifier_names(mods: Qt.KeyboardModifier, macos: bool) -> list[str]:
     return names
 
 
+def modifier_preview(names: Sequence[str], macos: bool | None = None) -> str:
+    """Held modifiers in the notation of :func:`format_hotkey`, e.g. ``"Ctrl+Win+…"``.
+
+    Shown while a shortcut is being recorded. Built with ``format_hotkey`` so
+    the preview and the finished shortcut name the keys alike (Win on Windows,
+    Super on Linux, ⌃⌥⇧⌘ on macOS). Empty when nothing is held.
+    """
+    if not names:
+        return ""
+    if macos is None:
+        macos = sys.platform == "darwin"
+    # format_hotkey needs a key: F1 is valid with any modifier; drop its label.
+    text = format_hotkey(Hotkey(frozenset(names), "f1"), macos=macos)
+    prefix = text.removesuffix("F1")
+    if prefix == text:  # unexpected label: fall back to the plain names
+        prefix = "+".join(name.capitalize() for name in names) + "+"
+    return prefix + "…"
+
+
 def hotkey_text_from_event(event: QKeyEvent, macos: bool | None = None) -> str | None:
     """Settings-style hotkey text (``"ctrl+alt+p"``) for a key press.
 
@@ -569,7 +596,7 @@ class HotkeyEdit(QLineEdit):
         if text is None:
             # Only modifiers so far: show them as a live preview.
             held = _modifier_names(event.modifiers(), sys.platform == "darwin")
-            self.setText("+".join(n.capitalize() for n in held) + "+…" if held else "")
+            self.setText(modifier_preview(held))
             return
         self.set_hotkey(text)
 
@@ -649,10 +676,13 @@ class SettingsDialog(QDialog):
 
     Signals:
         calibration_requested: The user pressed "Recalibrate…".
+        setup_requested: The user pressed "Run setup assistant…" (the app opens
+            the first-run assistant right away).
         applied: Settings were handed to the controller (argument: the new ``Settings``).
     """
 
     calibration_requested = Signal()
+    setup_requested = Signal()
     applied = Signal(object)
 
     PAGES: tuple[tuple[str, str, str], ...] = (
@@ -684,6 +714,8 @@ class SettingsDialog(QDialog):
         self._pages: dict[str, int] = {}
         self._diagnostics_loaded = False
         self._loading = False
+        #: This dialog asked the controller to release the global hotkeys.
+        self._hotkeys_suspended = False
         self._scale = ui_scale(self.screen() or QGuiApplication.primaryScreen())
 
         self.setWindowTitle(f"{APP_NAME} Settings")
@@ -778,11 +810,12 @@ class SettingsDialog(QDialog):
         return autostart_ok
 
     def restore_defaults(self) -> None:
-        """Show default values (still to be applied). Keeps the first-run flag."""
+        """Show default values (still to be applied).
+
+        Settings without a widget, such as the first-run flag, keep their value.
+        """
         defaults = Settings()
         for key, binding in self._bindings.items():
-            if key == "general.first_run_done":
-                continue
             binding.write(_get(defaults, key))
         self._on_changed()
 
@@ -790,6 +823,13 @@ class SettingsDialog(QDialog):
     def accept(self) -> None:
         if self.apply():
             super().accept()
+
+    def hideEvent(self, event: QHideEvent) -> None:
+        # Closed or hidden while a shortcut field had focus: give the hotkeys
+        # back now. The deferred resume of _on_hotkey_recording would never run
+        # once the dialog is deleted.
+        super().hideEvent(event)
+        self._resume_hotkeys()
 
     # ============================================================== building
     def _build(self) -> None:
@@ -930,6 +970,8 @@ class SettingsDialog(QDialog):
         label = QLabel(text)
         label.setWordWrap(True)
         label.setTextFormat(Qt.TextFormat.RichText)
+        # Banners can name commands to paste into the desktop's shortcut settings.
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         row.addWidget(label, 1)
         return frame
 
@@ -948,14 +990,14 @@ class SettingsDialog(QDialog):
         signal.connect(self._on_changed)
         return binding
 
-    def _check(self, form: QFormLayout, key: str, text: str, *, invert: bool = False) -> QCheckBox:
+    def _check(self, form: QFormLayout, key: str, text: str) -> QCheckBox:
         box = QCheckBox(text)
 
         def read() -> bool:
-            return box.isChecked() != invert
+            return box.isChecked()
 
         def write(value: Any) -> None:
-            box.setChecked(bool(value) != invert)
+            box.setChecked(bool(value))
 
         self._register(_Binding(key, box, read, write, box.isChecked), box.toggled)
         form.addRow(box)
@@ -1135,10 +1177,16 @@ class SettingsDialog(QDialog):
         self._autostart_note.setVisible(False)
         form.addRow(self._autostart_note)
         self._check(form, "general.start_paused", "Start with tracking paused")
-        wizard = self._check(
-            form, "general.first_run_done", "Show the setup assistant at next start", invert=True
+        # Opens the assistant now. A "show it at next start" switch would have
+        # to clear general.first_run_done, and until the assistant is finished
+        # that flag also turns the walk-away lock into a mere notification.
+        setup = QPushButton("Run setup assistant…")
+        setup.setToolTip(
+            "Check the camera and choose what happens when you walk away, step by step. "
+            "Cancelling it changes nothing."
         )
-        wizard.setToolTip("Runs the first-run assistant (camera check, walk-away action) again.")
+        setup.clicked.connect(self.setup_requested)
+        form.addRow(setup)
 
         form = self._group(layout, "Interface")
         self._check(form, "general.notifications", "Show notifications")
@@ -1421,10 +1469,32 @@ class SettingsDialog(QDialog):
     def _on_hotkey_recording(self, recording: bool) -> None:
         # Registered global hotkeys are swallowed by the OS before they reach this
         # dialog, so they are released while a shortcut is being recorded.
+        if recording:
+            self._suspend_hotkeys(True)
+            return
+        # Moving from one shortcut field to the next leaves the first (False)
+        # just before entering the second (True). Resuming at once would
+        # re-register every hotkey (repeating "Hotkey unavailable" for one that
+        # fails) only to release them again, so it waits until focus settled.
+        QTimer.singleShot(0, self, self._resume_hotkeys_if_idle)
+
+    def _resume_hotkeys_if_idle(self) -> None:
+        """Give the hotkeys back unless a shortcut field is recording again."""
+        if not any(edit.recording for edit in self._hotkey_edits.values()):
+            self._resume_hotkeys()
+
+    def _resume_hotkeys(self) -> None:
+        """Give the hotkeys back now if this dialog released them."""
+        self._suspend_hotkeys(False)
+
+    def _suspend_hotkeys(self, suspended: bool) -> None:
+        if suspended == self._hotkeys_suspended:
+            return
+        self._hotkeys_suspended = suspended
         suspend = getattr(self._controller, "suspend_hotkeys", None)
         if callable(suspend):
             try:
-                suspend(recording)
+                suspend(suspended)
             except Exception:
                 log.debug("Suspending hotkeys failed", exc_info=True)
 
@@ -1479,15 +1549,20 @@ class SettingsDialog(QDialog):
         note = getattr(manager, "note", None)
         note = note if isinstance(note, str) and note.strip() else None
         if not supported:
-            text = html.escape(
-                note or "Global shortcuts are not available in this desktop session."
-            )
-            if "ctl" not in text:
+            note = note or "Global shortcuts are not available in this desktop session."
+            text = html.escape(note)
+            # Named as this copy is run (the .AppImage file, eye-tracker-cli, …):
+            # the packages put no "eye-tracker" command on the PATH, and a
+            # desktop shortcut bound to a missing command fails silently. Added
+            # unless the note already names the commands that way.
+            if cli_command_text("ctl") not in note:
+                commands = " · ".join(
+                    f"<code>{html.escape(cli_command_text('ctl', action))}</code>"
+                    for action in ("toggle", "privacy-toggle", "calibrate")
+                )
                 text += (
                     "<br>Bind these commands in your desktop's keyboard settings instead: "
-                    "<code>eye-tracker ctl toggle</code> · "
-                    "<code>eye-tracker ctl privacy-toggle</code> · "
-                    "<code>eye-tracker ctl calibrate</code>"
+                    + commands
                 )
             layout.addWidget(self._banner(text))
         elif note:
@@ -1848,9 +1923,13 @@ class SettingsDialog(QDialog):
     def refresh_diagnostics(self) -> None:
         """(Re)build the diagnostics report."""
         self._diagnostics_loaded = True
+        # The report says which hotkeys are registered. Clicking from a shortcut
+        # field to this page has only scheduled giving them back (see
+        # _on_hotkey_recording); do it first, or every hotkey would look refused.
+        self._resume_hotkeys_if_idle()
         QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            text = load_diagnostics_text()
+            text = load_diagnostics_text(self._controller)
         except Exception as exc:
             log.warning("Diagnostics report failed", exc_info=True)
             text = f"Could not collect the diagnostics report: {exc}"

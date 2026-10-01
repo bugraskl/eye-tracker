@@ -9,6 +9,7 @@ registry helpers fail, so the real ``HKCU\\...\\Run`` key is never touched.
 from __future__ import annotations
 
 import logging
+import os
 import plistlib
 import subprocess
 import sys
@@ -23,13 +24,59 @@ from eye_tracker.platform import autostart
 
 REAL_LINUX_DESKTOP_PATH = autostart._linux_desktop_path
 REAL_MAC_PLIST_PATH = autostart._mac_plist_path
+REAL_LAUNCHCTL = autostart._launchctl
+REAL_LAUNCHD_DOMAIN = autostart._mac_launchd_domain
 Status = autostart.Status
+LAUNCHD_DOMAIN = "gui/501"
+
+
+class FakeLaunchd:
+    """launchd's per-user database of switched-off services, seen through ``launchctl``."""
+
+    def __init__(self) -> None:
+        #: label -> state word as ``print-disabled`` shows it ("disabled", "enabled", "true" ...)
+        self.states: dict[str, str] = {}
+        self.calls: list[tuple[str, ...]] = []
+        self.broken = False  # launchctl fails (missing, times out ...)
+        self.sticky = False  # "enable" does not help (a switch-off it cannot override)
+
+    def __call__(self, *args: str) -> str | None:
+        self.calls.append(args)
+        if self.broken:
+            return None
+        if args == ("print-disabled", LAUNCHD_DOMAIN):
+            services = [f'\t"{label}" => {state}' for label, state in self.states.items()]
+            # Recent macOS adds a section mapping labels to app identifiers.
+            associations = [f'\t"{APP_ID}" => {APP_ID}']
+            return "\n".join(
+                [
+                    "disabled services = {",
+                    *services,
+                    "}",
+                    "",
+                    "login item associations = {",
+                    *associations,
+                    "}",
+                    "",
+                ]
+            )
+        if len(args) == 2 and args[0] == "enable":
+            domain, _, label = args[1].rpartition("/")
+            assert domain == LAUNCHD_DOMAIN
+            if not self.sticky:
+                self.states[label] = "enabled"
+            return ""
+        raise AssertionError(f"unexpected launchctl call: {args}")
+
+    @property
+    def enables(self) -> list[tuple[str, ...]]:
+        return [call for call in self.calls if call[0] == "enable"]
 
 
 # ------------------------------------------------------------------ fixtures
 @pytest.fixture(autouse=True)
 def isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
-    """Redirect every location into tmp_path and forbid the real registry."""
+    """Redirect every location into tmp_path; forbid the real registry and launchd."""
 
     def forbidden(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("the real registry must not be used in tests")
@@ -37,6 +84,9 @@ def isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
     monkeypatch.setattr(autostart, "_reg_read", forbidden)
     monkeypatch.setattr(autostart, "_reg_write_str", forbidden)
     monkeypatch.setattr(autostart, "_reg_delete", forbidden)
+    # launchctl changes real per-user state on a Mac: never run the real one.
+    monkeypatch.setattr(autostart, "_launchctl", FakeLaunchd())
+    monkeypatch.setattr(autostart, "_mac_launchd_domain", lambda: LAUNCHD_DOMAIN)
     monkeypatch.setattr(
         autostart, "_mac_plist_path", lambda: tmp_path / "LaunchAgents" / f"{APP_ID}.plist"
     )
@@ -47,6 +97,14 @@ def isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
     paths.set_base_override(None)  # the default profile unless a test says otherwise
     yield
     paths.set_base_override(None)
+
+
+@pytest.fixture
+def launchd(isolate: None) -> FakeLaunchd:
+    """The fake ``launchctl`` every test uses (installed by ``isolate``)."""
+    fake = autostart._launchctl
+    assert isinstance(fake, FakeLaunchd)
+    return fake
 
 
 @pytest.fixture
@@ -192,6 +250,29 @@ class TestLaunchCommand:
         frozen_app.unlink()
         monkeypatch.setattr(sys, "executable", str(cli))
         assert autostart.launch_command()[0] == str(cli)
+
+    def test_installer_command_on_the_path_registers_the_windowed_executable(
+        self, monkeypatch: pytest.MonkeyPatch, frozen_app: Path
+    ) -> None:
+        """The Windows installer adds eye-tracker.exe, a copy of eye-tracker-cli.exe, for
+        the "eye-tracker" command on the PATH; "eye-tracker autostart enable" runs as it
+        and must not register a console window for every sign-in."""
+        use_system(monkeypatch, "windows")
+        command = frozen_app.with_name("eye-tracker.exe")
+        command.write_text("")
+        monkeypatch.setattr(sys, "executable", str(command))
+        assert autostart.launch_command() == [str(frozen_app), "--background"]
+
+    def test_linux_bundle_has_one_executable_for_both_roles(
+        self, monkeypatch: pytest.MonkeyPatch, frozen_app: Path, tmp_path: Path
+    ) -> None:
+        use_system(monkeypatch, "linux")
+        bundle = tmp_path / "eye-tracker"
+        bundle.mkdir()
+        exe = bundle / "eye-tracker"
+        exe.write_text("")
+        monkeypatch.setattr(sys, "executable", str(exe))
+        assert autostart.launch_command()[0] == str(exe)
 
     def test_appimage(
         self, monkeypatch: pytest.MonkeyPatch, frozen_app: Path, tmp_path: Path
@@ -354,6 +435,80 @@ class TestMacOS:
         assert autostart.location() == str(autostart._mac_plist_path())
         default = REAL_MAC_PLIST_PATH()
         assert default == Path.home() / "Library" / "LaunchAgents" / f"{APP_ID}.plist"
+
+    @pytest.mark.parametrize("state", ["disabled", "true", "Disabled"])
+    def test_switch_off_recorded_by_launchd_is_reported(
+        self, launchd: FakeLaunchd, frozen_app: Path, state: str
+    ) -> None:
+        """`launchctl disable gui/$UID/<label>` leaves the plist as it is."""
+        autostart.enable()
+        assert launchd.enables == []  # nothing to clear: launchd left alone
+        launchd.states[APP_ID] = state
+        assert autostart.status() is Status.DISABLED
+        assert autostart.is_enabled() is False
+        assert autostart.registered_command() == [str(frozen_app), "--background"]
+        assert autostart.refresh() is False  # a switch-off is not undone behind the user's back
+
+    def test_other_services_and_enabled_records_do_not_count(self, launchd: FakeLaunchd) -> None:
+        autostart.enable()
+        launchd.states.update({"com.example.other": "disabled", APP_ID: "enabled"})
+        assert autostart.is_enabled() is True
+
+    def test_enable_clears_the_launchd_switch_off(self, launchd: FakeLaunchd) -> None:
+        autostart.enable()
+        launchd.states[APP_ID] = "disabled"
+        autostart.enable()  # the checkbox turned on again
+        assert launchd.enables == [("enable", f"{LAUNCHD_DOMAIN}/{APP_ID}")]
+        assert autostart.is_enabled() is True
+
+    def test_enable_reports_a_switch_off_it_cannot_clear(self, launchd: FakeLaunchd) -> None:
+        launchd.states[APP_ID] = "disabled"
+        launchd.sticky = True
+        with pytest.raises(autostart.AutostartError, match="Login Items"):
+            autostart.enable()
+        assert autostart._mac_plist_path().exists()  # written; launchd has the last word
+        assert autostart.status() is Status.DISABLED
+
+    def test_unreadable_launchd_state_trusts_the_plist(self, launchd: FakeLaunchd) -> None:
+        autostart.enable()
+        launchd.broken = True
+        assert autostart.is_enabled() is True
+
+    def test_launchd_is_only_asked_about_an_existing_agent(self, launchd: FakeLaunchd) -> None:
+        assert autostart.status() is Status.DISABLED
+        assert launchd.calls == []
+
+
+@pytest.mark.parametrize(
+    ("listing", "expected"),
+    [
+        (f'disabled services = {{\n\t"{APP_ID}" => disabled\n}}\n', True),
+        (f'disabled services = {{\n\t"{APP_ID}" => true\n}}\n', True),  # macOS 10.x
+        (f'disabled services = {{\n\t"{APP_ID}" => enabled\n}}\n', False),
+        (f'disabled services = {{\n\t"{APP_ID}" => false\n}}\n', False),
+        (f'disabled services = {{\n\t"{APP_ID}.helper" => disabled\n}}\n', False),
+        (f'login item associations = {{\n\t"{APP_ID}" => {APP_ID}\n}}\n', False),
+        ("", False),
+        ("garbage => disabled", False),
+    ],
+)
+def test_print_disabled_parsing(listing: str, expected: bool) -> None:
+    assert autostart._launchd_lists_disabled(listing, APP_ID) is expected
+
+
+def test_real_launchctl_runner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Its error handling, with a stand-in program (the real launchctl is never run)."""
+    monkeypatch.setattr(autostart, "_LAUNCHCTL", str(tmp_path / "missing"))
+    assert REAL_LAUNCHCTL("print-disabled", LAUNCHD_DOMAIN) is None
+    monkeypatch.setattr(autostart, "_LAUNCHCTL", sys.executable)
+    assert REAL_LAUNCHCTL("-c", "print('listing')") == "listing\n"
+    assert REAL_LAUNCHCTL("-c", "import sys; sys.exit(3)") is None
+
+
+def test_launchd_domain_is_the_users_gui_session() -> None:
+    getuid = getattr(os, "getuid", None)
+    expected = f"gui/{getuid()}" if getuid is not None else None
+    assert REAL_LAUNCHD_DOMAIN() == expected
 
 
 # ---------------------------------------------------------------------- Linux

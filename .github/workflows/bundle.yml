@@ -1,0 +1,153 @@
+name: Bundle
+
+# Builds the frozen bundles exactly like release.yml does and runs the same bundle
+# privacy gate and a short smoke test, whenever something that decides what goes
+# into them changes (the spec, the gate, the dependencies). A problem that would
+# fail a release, such as a new networking library pulled in by a dependency
+# update, then shows up on the pull request instead of after a tag is pushed.
+# Nothing is published or uploaded.
+on:
+  pull_request:
+    paths:
+      - "packaging/**"
+      - "scripts/check_privacy.py"
+      - "scripts/fetch_models.py"
+      - "scripts/make_icons.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/bundle.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "packaging/**"
+      - "scripts/check_privacy.py"
+      - "scripts/fetch_models.py"
+      - "scripts/make_icons.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/bundle.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: "1"
+  PYTHONUTF8: "1"
+  PYTHON_VERSION: "3.12"
+  UV_PYTHON_DOWNLOADS: never
+  UV_NO_PROGRESS: "1"
+  QT_QPA_PLATFORM: offscreen
+  # Same value as in release.yml (see the comment there).
+  MACOS_MINIMUM: "14.0"
+
+jobs:
+  bundle:
+    name: Bundle (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The same runners as the release builds.
+          - os: windows-latest
+            bundle: dist/EyeTracker
+            cli: dist/EyeTracker/eye-tracker-cli.exe
+          - os: macos-14
+            bundle: dist/Eye Tracker.app
+            cli: dist/Eye Tracker.app/Contents/MacOS/eye-tracker-cli
+          - os: ubuntu-22.04
+            bundle: dist/eye-tracker
+            cli: dist/eye-tracker/eye-tracker
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUNDLE: ${{ matrix.bundle }}
+      CLI: ${{ matrix.cli }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install system libraries
+        if: runner.os == 'Linux'
+        # Identical to build-linux in release.yml, so the same libraries are bundled.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 libfontconfig1 libdbus-1-3 \
+            libglib2.0-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-xinerama0 \
+            libxcb-xkb1 libx11-xcb1 libsm6 libice6 desktop-file-utils
+
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --python "${{ steps.python.outputs.python-path }}"
+
+      - name: Verify the face models
+        run: uv run --no-sync python scripts/fetch_models.py --check
+
+      - name: Render the icons
+        run: uv run --no-sync python scripts/make_icons.py
+
+      - name: Build with PyInstaller
+        run: uv run --no-sync pyinstaller packaging/pyinstaller/eye-tracker.spec --noconfirm --clean
+
+      - name: Check that no GTK or GIO libraries were bundled
+        if: runner.os == 'Linux'
+        run: |
+          if find "$BUNDLE" \( -name 'libgtk-3.so*' -o -name 'libgio-2.0.so*' \
+              -o -name 'libqgtk3.so' \) | grep .; then
+            echo "::error::the bundle contains GTK or GIO libraries"
+            exit 1
+          fi
+
+      - name: Privacy gate for the bundle (no telemetry, no unexpected networking code)
+        run: uv run --no-sync python scripts/check_privacy.py --bundle "$BUNDLE"
+
+      - name: Check the minimum macOS version
+        if: runner.os == 'macOS'
+        run: |
+          minimum="$(plutil -extract LSMinimumSystemVersion raw "$BUNDLE/Contents/Info.plist")"
+          if [[ "$minimum" != "$MACOS_MINIMUM" ]]; then
+            echo "::error::LSMinimumSystemVersion is $minimum, but MACOS_MINIMUM (and the README, docs and release notes) say $MACOS_MINIMUM"
+            exit 1
+          fi
+
+      - name: Smoke-test the frozen CLI
+        run: |
+          set -euo pipefail
+          cfg="$RUNNER_TEMP/eye-tracker-smoke"
+          "$CLI" --version
+          "$CLI" --config-dir "$cfg" doctor --json > doctor.json
+          "$CLI" --config-dir "$cfg" bench --camera packaging/linux/eye-tracker.png \
+            --seconds 1 --json > bench.json
+          uv run --no-sync python - <<'PY'
+          import json
+
+          report = json.load(open("doctor.json", encoding="utf-8"))
+          assert report["app"]["frozen"] is True, report["app"]
+          for name, model in report["backends"]["models"].items():
+              assert model.get("present") and model.get("sha256_ok"), (name, model)
+          bench = json.load(open("bench.json", encoding="utf-8"))
+          assert bench["modes"]["max"]["analysed"] > 0, bench["modes"]
+          print("smoke test passed")
+          PY

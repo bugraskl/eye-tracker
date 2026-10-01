@@ -8,6 +8,7 @@ fakes, so nothing here touches the registry, a camera or the desktop.
 
 from __future__ import annotations
 
+import html
 import sys
 import time
 from collections.abc import Callable, Iterator
@@ -17,7 +18,7 @@ from typing import Any
 import numpy as np
 import pytest
 from PySide6.QtCore import QObject, Qt, QUrl, Signal
-from PySide6.QtGui import QGuiApplication, QKeyEvent
+from PySide6.QtGui import QGuiApplication, QHideEvent, QKeyEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -207,7 +208,9 @@ def probes(monkeypatch: pytest.MonkeyPatch) -> list[frozenset[int]]:
         return [CameraInfo(0, "Integrated Camera", 640, 480), CameraInfo(2, "USB Cam", 1280, 720)]
 
     monkeypatch.setattr(sd, "probe_cameras", probe)
-    monkeypatch.setattr(sd, "load_diagnostics_text", lambda: "FAKE DIAGNOSTICS REPORT")
+    monkeypatch.setattr(
+        sd, "load_diagnostics_text", lambda controller=None: "FAKE DIAGNOSTICS REPORT"
+    )
     return calls
 
 
@@ -299,15 +302,20 @@ def dialog(controller: FakeController) -> Iterator[SettingsDialog]:
     _dispose(dlg)
 
 
+#: Settings without a widget: only the setup assistant sets the first-run flag
+#: (while it is False the walk-away lock is only a notification).
+UNBOUND = {"general.first_run_done"}
+
+
 def test_every_setting_has_a_widget(dialog: SettingsDialog) -> None:
     keys = {row["key"] for row in describe_settings()}
-    assert set(dialog.bound_keys()) == keys
+    assert set(dialog.bound_keys()) == keys - UNBOUND
 
 
 def test_tooltips_come_from_the_settings_documentation(dialog: SettingsDialog) -> None:
     for row in describe_settings():
-        if not row["doc"] or row["key"] == "general.first_run_done":
-            continue  # the wizard checkbox explains itself in UI terms
+        if not row["doc"] or row["key"] in UNBOUND:
+            continue
         assert row["doc"] in dialog.widget_for(row["key"]).toolTip(), row["key"]
 
 
@@ -595,7 +603,7 @@ def test_diagnostics_page_copy_and_log_folder(
 def test_diagnostics_failure_is_shown_not_raised(
     monkeypatch: pytest.MonkeyPatch, dialog: SettingsDialog
 ) -> None:
-    def broken() -> str:
+    def broken(controller: object = None) -> str:
         raise RuntimeError("boom")
 
     monkeypatch.setattr(sd, "load_diagnostics_text", broken)
@@ -626,9 +634,67 @@ def test_unsupported_hotkeys_explain_the_ctl_alternative(controller: FakeControl
     try:
         texts = " ".join(label.text() for label in dlg.findChildren(QLabel))
         assert "Wayland session" in texts
-        assert "eye-tracker ctl toggle" in texts
+        assert html.escape(sd.cli_command_text("ctl", "toggle")) in texts
     finally:
         _dispose(dlg)
+
+
+def test_ctl_alternative_names_the_command_of_this_copy(
+    controller: FakeController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (r2-docs-01): packages have no "eye-tracker" command on the PATH."""
+    from eye_tracker.platform.hotkeys import HotkeyManager
+
+    appimage = "/home/me/Apps/Eye_Tracker-x86_64.AppImage"
+    monkeypatch.setattr(sd, "cli_command_text", lambda *args: " ".join([appimage, *args]))
+    # A note that names the source-install command still gets the real ones.
+    controller.hotkey_manager = HotkeyManager(note="Wayland: bind 'eye-tracker ctl toggle'")
+    dlg = SettingsDialog(controller)
+    try:
+        texts = " ".join(label.text() for label in dlg.findChildren(QLabel))
+        for action in ("toggle", "privacy-toggle", "calibrate"):
+            assert f"<code>{appimage} ctl {action}</code>" in texts
+    finally:
+        _dispose(dlg)
+
+    # A note that already names them this way is not repeated.
+    controller.hotkey_manager = HotkeyManager(note=f"Wayland: bind '{appimage} ctl toggle'")
+    dlg = SettingsDialog(controller)
+    try:
+        texts = " ".join(label.text() for label in dlg.findChildren(QLabel))
+        assert "<code>" not in texts
+    finally:
+        _dispose(dlg)
+
+
+def test_setup_assistant_runs_now_and_leaves_the_walk_away_lock_alone(
+    controller: FakeController, dialog: SettingsDialog
+) -> None:
+    """Regression (r2-ui-app-01): "Show the setup assistant at next start" saved
+    first_run_done=False, which turned the walk-away lock into a notification at
+    once, and for good if the assistant was then cancelled."""
+    requested: list[bool] = []
+    dialog.setup_requested.connect(lambda: requested.append(True))
+    assert not any("setup assistant" in box.text() for box in dialog.findChildren(QCheckBox))
+    QTest.mouseClick(_button(dialog, "Run setup assistant…"), Qt.MouseButton.LeftButton)
+    assert requested == [True]
+    dialog.restore_defaults()
+    assert dialog.apply()
+    assert controller.settings.general.first_run_done == Settings().general.first_run_done
+    finished = Settings()
+    finished.general.first_run_done = True
+    controller.apply_settings(finished)
+    dialog.restore_defaults()
+    assert dialog.apply()
+    assert controller.settings.general.first_run_done is True
+
+
+def test_modifier_preview_uses_the_platform_key_names() -> None:
+    meta = "Win" if sys.platform == "win32" else "Super"
+    assert sd.modifier_preview([]) == ""
+    assert sd.modifier_preview(["ctrl", "meta"], macos=False) == f"Ctrl+{meta}+…"
+    assert sd.modifier_preview(["meta", "alt", "ctrl"], macos=False) == f"Ctrl+Alt+{meta}+…"
+    assert sd.modifier_preview(["ctrl", "meta"], macos=True) == "⌃⌘…"
 
 
 # =============================================================== calibration window
@@ -1160,10 +1226,71 @@ def test_hotkeys_are_suspended_while_a_shortcut_is_recorded(
     edit._set_recording(True)
     edit._set_recording(True)  # no duplicate notification
     edit._set_recording(False)
+    QApplication.processEvents()  # given back once focus has settled
     assert calls == [True, False]
     edit._set_recording(True)
     edit.hide()  # closing the dialog mid-recording must restore the hotkeys
+    QApplication.processEvents()
     assert calls == [True, False, True, False]
+
+
+def test_moving_between_shortcut_fields_does_not_re_register_the_hotkeys(
+    controller: FakeController, dialog: SettingsDialog
+) -> None:
+    """Regression (r2-ui-app-05): every focus change re-registered all hotkeys, and
+    the controller repeated "Hotkey unavailable" for one that cannot be registered."""
+    calls: list[bool] = []
+    controller.suspend_hotkeys = calls.append  # type: ignore[attr-defined]
+    first, second, third = dialog._hotkey_edits.values()
+    first._set_recording(True)
+    # Qt delivers focus-out to the old field, then focus-in to the new one.
+    first._set_recording(False)
+    second._set_recording(True)
+    QApplication.processEvents()
+    second._set_recording(False)
+    third._set_recording(True)
+    QApplication.processEvents()
+    assert calls == [True]
+    third._set_recording(False)  # focus leaves the shortcut fields
+    assert calls == [True]
+    QApplication.processEvents()
+    assert calls == [True, False]
+
+
+def test_closing_the_dialog_gives_the_hotkeys_back_at_once(
+    controller: FakeController, dialog: SettingsDialog
+) -> None:
+    calls: list[bool] = []
+    controller.suspend_hotkeys = calls.append  # type: ignore[attr-defined]
+    edit = next(iter(dialog._hotkey_edits.values()))
+    edit._set_recording(True)
+    # The deferred resume would never run once the closed dialog is deleted.
+    dialog.hideEvent(QHideEvent())
+    assert calls == [True, False]
+    edit._set_recording(False)
+    QApplication.processEvents()
+    assert calls == [True, False]  # nothing left to give back
+
+
+def test_diagnostics_see_the_hotkeys_registered(
+    controller: FakeController, dialog: SettingsDialog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[bool] = []
+    controller.suspend_hotkeys = calls.append  # type: ignore[attr-defined]
+    loaded_for: list[object] = []
+
+    def load(owner: object = None) -> str:
+        loaded_for.append(owner)
+        return f"hotkeys suspended: {calls[-1] if calls else False}"
+
+    monkeypatch.setattr(sd, "load_diagnostics_text", load)
+    edit = next(iter(dialog._hotkey_edits.values()))
+    edit._set_recording(True)
+    edit._set_recording(False)  # clicked from the field to the Diagnostics page
+    dialog.refresh_diagnostics()  # before the deferred resume has run
+    assert dialog.diagnostics_text() == "hotkeys suspended: False"
+    # The report reads the registrations from this controller's hotkey manager.
+    assert loaded_for == [controller]
 
 
 # ======================================================== settings: review fixes

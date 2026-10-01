@@ -8,17 +8,40 @@ frame rates) do not restart the delay. Once triggered, fewer than two faces
 must be seen continuously for ``clear_s`` before the guard clears, so a face
 that briefly drops out of detection does not flicker the privacy curtain.
 
-When only one face is left, the guard checks that it is the user's. The user
-sits closest to the camera, so while two faces are visible the primary
-(largest) face box is the user's. If the one remaining face does not match it
-- the user walked away and the onlooker stayed - the guard stays active and
-reports :attr:`ShoulderGuard.owner_missing`, so that the curtain is not lifted
-for the onlooker and the caller can treat the user as absent.
+**The guard never decides whether the user is present.** It cannot recognise
+faces; it can only compare face boxes, and any rule that turned "this face is
+not the user's" into "nobody is at the computer" would sooner or later lock
+out a user who merely moved in their chair while a colleague was in view.
+Walk-away detection therefore counts every detected face as the user. The
+guard only decides whether its privacy reaction (curtain, notification, lock)
+is still needed.
+
+Whose face is whose is judged by continuity, not by size:
+
+* While the guard is idle and exactly one face is in view (and no second face
+  was seen moments ago), that face is the user's (the *owner*); its box is
+  remembered and followed.
+* While two or more faces are in view only the primary (largest) face box is
+  known. It updates the owner's box only when it overlaps it, so a colleague
+  who leans in closer than the user never becomes the owner. Only when no
+  owner is known yet (the guard was switched on with two faces in view) is
+  the largest face taken as the owner.
+* Once triggered, a lone face that does not match the owner (much smaller and
+  not overlapping) means the user left and the onlooker stayed. The guard then
+  stays active (:attr:`ShoulderGuard.owner_missing`), also through frames
+  without any face, so an onlooker the detector misses for a moment does not
+  get the curtain lifted in front of them.
+* It clears once the owner is seen alone again, or once someone uses the
+  keyboard or mouse while the owner is judged missing (``last_input``):
+  whoever works at the computer with a single face in view is the user from
+  then on. That also heals a wrong judgement - the guard never stays stuck
+  on a user sitting at their own desk.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -42,7 +65,15 @@ MAX_GAP_S = 3.0
 OWNER_MIN_AREA_RATIO = 0.5
 
 #: ...or when it overlaps the user's last known face box at least this much (IoU).
+#: In frames with several faces, overlap alone decides whether the primary face
+#: is still the user's: the area test would accept a colleague leaning in.
 OWNER_MIN_IOU = 0.3
+
+#: Keyboard or mouse input counts as "someone works at the computer" only when
+#: it happened at least this long after the owner was judged missing. The user
+#: who gets up and leaves often touches the mouse once more after their face has
+#: left the picture; that must not make the onlooker the owner.
+INPUT_ADOPT_DELAY_S = 2.0
 
 
 @dataclass
@@ -74,7 +105,10 @@ class ShoulderGuard:
         self._single_since: float | None = None
         self._last_update: float | None = None
         self._owner_box: FaceBox | None = None
-        self._owner_missing = False
+        # The user left while the guard was active (a lone stranger's face was
+        # seen) and has not been seen since; set at ``_owner_left_at``.
+        self._owner_left = False
+        self._owner_left_at = -math.inf
 
     @property
     def active(self) -> bool:
@@ -83,12 +117,15 @@ class ShoulderGuard:
 
     @property
     def owner_missing(self) -> bool:
-        """The guard is active and the only face in view is not the user's.
+        """The guard is active and the user has not been seen since only another
+        person's face was left in view.
 
-        The user has most likely walked away while the onlooker stayed; the
-        caller should not count that face as the user being present.
+        The user has most likely walked away while the onlooker stayed, so the
+        guard stays active (the curtain stays up) until the user is back. This is
+        a judgement from face boxes, not a recognition: it must never be used to
+        decide that the user is absent (see the module docstring).
         """
-        return self._owner_missing
+        return self._owner_left
 
     @property
     def config(self) -> GuardConfig:
@@ -99,16 +136,21 @@ class ShoulderGuard:
         self._config = config
 
     def reset(self) -> None:
-        """Forget everything (inactive, no pending run). Emits nothing."""
+        """Forget everything (inactive, no pending run, no owner). Emits nothing."""
         self._active = False
         self._multi_since = None
         self._single_since = None
         self._last_update = None
         self._owner_box = None
-        self._owner_missing = False
+        self._owner_left = False
+        self._owner_left_at = -math.inf
 
     def update(
-        self, now: float, face_count: int | None, face_box: FaceBox | None = None
+        self,
+        now: float,
+        face_count: int | None,
+        face_box: FaceBox | None = None,
+        last_input: float = -math.inf,
     ) -> str | None:
         """Feed one observation; return ``"trigger"``, ``"clear"`` or ``None``.
 
@@ -117,7 +159,10 @@ class ShoulderGuard:
         "continuous", so any run in progress restarts. ``face_box`` is the
         primary (largest) face of the observation (``Observation.face_box``);
         without it the guard cannot tell whose face remains and clears as soon
-        as fewer than two faces are seen for ``clear_s``.
+        as fewer than two faces are seen for ``clear_s``. ``last_input`` is the
+        time of the latest keyboard or mouse input (same clock as ``now``;
+        ``-inf`` if unknown): input while the owner is judged missing means
+        someone works at the computer, see the module docstring.
         """
         cfg = self._config
         if not cfg.enabled:
@@ -129,10 +174,11 @@ class ShoulderGuard:
             return None
 
         if face_count is None:
+            # Nothing is known about this moment: runs restart, but whether the
+            # owner left is kept (a camera hiccup does not bring them back).
             self._multi_since = None
             self._single_since = None
             self._last_update = None
-            self._owner_missing = False
             return None
 
         interval = 0.0 if self._last_update is None else max(0.0, now - self._last_update)
@@ -141,9 +187,7 @@ class ShoulderGuard:
 
         if face_count >= 2:
             self._single_since = None
-            self._owner_missing = False
-            if face_box is not None:
-                self._owner_box = face_box  # the largest face is the user's
+            self._follow_owner_among_faces(face_box)
             if self._active:
                 return None
             if self._multi_since is None or now - self._multi_last > tolerance:
@@ -159,18 +203,41 @@ class ShoulderGuard:
         if self._multi_since is not None and now - self._multi_last > tolerance:
             self._multi_since = None
         if not self._active:
+            if face_count == 1 and face_box is not None and self._multi_since is None:
+                # Alone at the desk: the user. Not while a second face was seen
+                # moments ago - the lone face of such a dropout may be either one.
+                self._owner_box = face_box
             return None
 
+        someone_working = (
+            self._owner_left and last_input >= self._owner_left_at + INPUT_ADOPT_DELAY_S
+        )
         if face_count == 1 and face_box is not None and self._owner_box is not None:
-            if not self._is_owner(face_box):
+            if someone_working or self._is_owner(face_box):
+                if self._owner_left:
+                    log.info(
+                        "Shoulder guard: the user is back%s",
+                        " (keyboard or mouse input)" if someone_working else "",
+                    )
+                self._owner_left = False
+                self._owner_box = face_box  # follow the user's movements
+            else:
                 # The user left and the onlooker stayed: keep the curtain up.
-                if not self._owner_missing:
+                if not self._owner_left:
                     log.info("Shoulder guard: only the onlooker's face is left")
-                self._owner_missing = True
+                    self._owner_left = True
+                    self._owner_left_at = now
                 self._single_since = None
                 return None
-            self._owner_box = face_box  # follow the user's movements
-        self._owner_missing = False
+        elif self._owner_left:
+            # No face (or no box) after the user left: most likely the onlooker
+            # was missed for a moment, so the curtain stays up - unless someone
+            # is using the computer.
+            if not someone_working:
+                self._single_since = None
+                return None
+            log.info("Shoulder guard: keyboard or mouse input while no face is in view")
+            self._owner_left = False
         if self._single_since is None:
             self._single_since = now
         if now - self._single_since >= cfg.clear_s:
@@ -181,6 +248,23 @@ class ShoulderGuard:
         return None
 
     # ------------------------------------------------------------- internals
+    def _follow_owner_among_faces(self, face_box: FaceBox | None) -> None:
+        """Update the owner from the primary face of a frame with several faces.
+
+        The primary face is the largest one, which is the user's only if nobody
+        comes closer to the camera than they are. So it is taken as the user's
+        only where it overlaps their last known box (continuity); the largest
+        face is merely the fallback while no owner is known at all.
+        """
+        if face_box is None:
+            return
+        owner = self._owner_box
+        if owner is None or _iou(face_box, owner) >= OWNER_MIN_IOU:
+            self._owner_box = face_box
+            if self._owner_left:
+                log.info("Shoulder guard: the user is back next to the onlooker")
+            self._owner_left = False
+
     def _is_owner(self, box: FaceBox) -> bool:
         owner = self._owner_box
         if owner is None:

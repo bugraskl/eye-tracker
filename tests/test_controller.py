@@ -23,6 +23,7 @@ from eye_tracker.config import Settings
 from eye_tracker.engine import controller as controller_module
 from eye_tracker.engine.controller import COMMANDS, UI_COMMANDS, Controller, QtCursor, qt_monitors
 from eye_tracker.gaze.calibration import CalibrationSample
+from eye_tracker.gaze.learning import refit_model
 from eye_tracker.gaze.model import GazeModel
 from eye_tracker.gaze.store import (
     CalibrationData,
@@ -245,6 +246,10 @@ class FakeHotkeys:
             return False
         self.bindings[name] = (str(hotkey), callback)
         return True
+
+    @property
+    def registered(self) -> dict[str, str]:
+        return {name: combo for name, (combo, _callback) in self.bindings.items()}
 
     def last_error(self, name: str) -> str | None:
         return self.errors.get(name)
@@ -1016,6 +1021,119 @@ def test_hotkeys_disabled(make_controller: Callable[..., Harness]) -> None:
     h = make_controller(s)
     assert h.hotkeys.bindings == {}
     assert h.hotkeys.stopped
+    assert h.controller.status()["hotkeys"] == {"registered": [], "errors": {}}
+
+
+IN_USE = "⌃⌥⌘C is already in use by another application"
+
+
+def _hotkey_notices(h: Harness) -> list[str]:
+    return [message for title, message in h.events["notify"] if title == "Hotkey unavailable"]
+
+
+def test_status_says_which_hotkeys_the_system_took(
+    make_controller: Callable[..., Harness],
+) -> None:
+    """Regression (r2-docs-12): `doctor` can only learn from the running app why a
+    hotkey failed, e.g. because another application owns the combination."""
+    hotkeys = FakeHotkeys()
+    hotkeys.fail = {Settings().hotkeys.recalibrate}
+    hotkeys.errors["recalibrate"] = IN_USE + "."
+    h = make_controller(hotkeys=hotkeys)
+    expected = {
+        "registered": ["toggle_privacy", "toggle_tracking"],
+        "errors": {"recalibrate": IN_USE},
+    }
+    assert h.controller.status()["hotkeys"] == expected
+    assert json.loads(h.controller.handle_command("status"))["hotkeys"] == expected
+
+    # Released while Settings → Hotkeys records a shortcut: not a failure.
+    h.controller.suspend_hotkeys(True)
+    suspended = h.controller.status()["hotkeys"]
+    assert suspended["registered"] == []
+    assert set(suspended["errors"]) == {"toggle_tracking", "toggle_privacy", "recalibrate"}
+    assert all("Settings → Hotkeys" in reason for reason in suspended["errors"].values())
+    h.controller.suspend_hotkeys(False)
+    assert h.controller.status()["hotkeys"] == expected
+
+    # A cleared hotkey is neither registered nor an error.
+    s = h.controller.settings.copy()
+    s.hotkeys.recalibrate = ""
+    h.controller.apply_settings(s)
+    assert h.controller.status()["hotkeys"] == {
+        "registered": ["toggle_privacy", "toggle_tracking"],
+        "errors": {},
+    }
+
+
+def test_doctor_reads_the_hotkeys_from_the_running_app(
+    make_controller: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eye_tracker import diagnostics
+
+    hotkeys = FakeHotkeys()
+    hotkeys.fail = {Settings().hotkeys.recalibrate}
+    hotkeys.errors["recalibrate"] = IN_USE
+    h = make_controller(hotkeys=hotkeys)
+    monkeypatch.setattr(
+        diagnostics, "_instance_status", lambda: json.loads(h.controller.handle_command("status"))
+    )
+    names = ["toggle_tracking", "toggle_privacy", "recalibrate"]
+    assert diagnostics._hotkey_registration(names, None, True) == {
+        "toggle_tracking": "registered",
+        "toggle_privacy": "registered",
+        "recalibrate": f"not registered: {IN_USE}",
+    }
+
+
+def test_leaving_the_hotkey_fields_does_not_repeat_the_failure(
+    make_controller: Callable[..., Harness],
+) -> None:
+    """Regression (r2-ui-app-05): the settings dialog releases the hotkeys while a
+    shortcut field records and gives them back afterwards; an unchanged failure
+    was announced again every time."""
+    hotkeys = FakeHotkeys()
+    default = Settings().hotkeys.recalibrate
+    hotkeys.fail = {default}
+    hotkeys.errors["recalibrate"] = IN_USE
+    h = make_controller(hotkeys=hotkeys)
+    assert _hotkey_notices(h) == [f"{IN_USE}. Choose another in Settings → Hotkeys."]
+
+    for _ in range(3):
+        h.controller.suspend_hotkeys(True)
+        h.controller.suspend_hotkeys(False)
+    assert len(_hotkey_notices(h)) == 1
+
+    # Changing the hotkeys is a deliberate act: every failure is reported again.
+    s = h.controller.settings.copy()
+    s.hotkeys.toggle_tracking = "ctrl+alt+meta+y"
+    hotkeys.fail.add("ctrl+alt+meta+y")
+    hotkeys.errors["toggle_tracking"] = "⌃⌥⌘Y is already in use by another application"
+    h.controller.apply_settings(s)
+    assert len(_hotkey_notices(h)) == 2
+    assert IN_USE in _hotkey_notices(h)[-1]
+    assert "⌃⌥⌘Y" in _hotkey_notices(h)[-1]
+
+    # Once a combination works, a later failure of it is news again.
+    hotkeys.fail.discard(default)
+    h.controller.suspend_hotkeys(True)
+    h.controller.suspend_hotkeys(False)
+    assert "recalibrate" in hotkeys.bindings
+    assert len(_hotkey_notices(h)) == 2  # ⌃⌥⌘Y: unchanged, not repeated
+    hotkeys.fail.add(default)
+    h.controller.suspend_hotkeys(True)
+    h.controller.suspend_hotkeys(False)
+    assert len(_hotkey_notices(h)) == 3
+    assert _hotkey_notices(h)[-1].startswith(IN_USE)
+
+    # Switching the hotkeys off and on again announces the failures afresh.
+    s = h.controller.settings.copy()
+    s.hotkeys.enabled = False
+    h.controller.apply_settings(s)
+    s = s.copy()
+    s.hotkeys.enabled = True
+    h.controller.apply_settings(s)
+    assert len(_hotkey_notices(h)) == 4
 
 
 def test_shutdown_stops_everything(make_controller: Callable[..., Harness]) -> None:
@@ -1342,15 +1460,63 @@ def test_guard_run_does_not_span_a_camera_error(make_controller: Callable[..., H
     assert "lock_screen" not in h.platform.names()
 
 
-def test_onlooker_left_alone_counts_as_nobody_at_the_keyboard(
+def test_onlooker_left_alone_keeps_the_curtain_but_counts_as_a_face(
     make_controller: Callable[..., Harness],
 ) -> None:
+    # Faces are not recognised, so walk-away detection cannot tell the onlooker
+    # from the user: any face in view counts as someone at the computer (the
+    # guard's judgement "not the user" must never lock a user out, r2-controller-01).
     h = make_controller(guard_settings("curtain"))
     h.feed(boxed_obs(2, USER_BOX), 2.5)
     assert h.events["guard_changed"] == [True]
-    h.feed(boxed_obs(1, ONLOOKER_BOX), 5.5, step=0.5)  # the user left, the onlooker stayed
+    h.feed(boxed_obs(1, ONLOOKER_BOX), 30.0, step=0.5)  # the user left, the onlooker stayed
+    assert h.events["guard_changed"] == [True]  # the curtain stays up in front of them
+    assert h.controller.guard_active
+    assert h.events["away_warning"] == []
+    assert "lock_screen" not in h.platform.names()
+    h.feed(no_face(), 3.0, step=0.5)  # missed for a moment: still covered
     assert h.events["guard_changed"] == [True]
-    assert h.events["away_warning"]  # the walk-away countdown runs
+
+
+# r2-controller-01: the user ~65 cm from the camera; a colleague leans in beside
+# them to ~45 cm, so the colleague's face is the larger (primary) one.
+SEATED_USER_BOX = (0.40, 0.30, 0.20, 0.27)
+LEANING_COLLEAGUE_BOX = (0.05, 0.15, 0.30, 0.40)
+
+
+def test_colleague_leaning_in_closer_than_the_user_never_locks_the_user(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller(guard_settings("curtain"))  # walk-away action "lock"
+    h.feed(boxed_obs(1, SEATED_USER_BOX), 2.0)
+    h.feed(boxed_obs(2, LEANING_COLLEAGUE_BOX), 2.5)
+    assert h.events["guard_changed"] == [True]
+    # The colleague leaves; the user reads without touching anything.
+    h.feed(boxed_obs(1, SEATED_USER_BOX), 2.0)
+    assert h.events["guard_changed"] == [True, False]  # recognised as the user
+    assert not h.controller.guard_active
+    h.feed(boxed_obs(1, SEATED_USER_BOX), 30.0, step=0.5)
+    assert h.events["away_warning"] == []
+    assert "lock_screen" not in h.platform.names()
+
+
+def test_user_misjudged_as_the_onlooker_is_never_locked_and_input_lifts_the_curtain(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller(guard_settings("curtain"))
+    # The guard starts with both faces in view and the colleague's is the larger
+    # one: it takes the colleague for the user and the user for the onlooker.
+    h.feed(boxed_obs(2, LEANING_COLLEAGUE_BOX), 2.5)
+    assert h.events["guard_changed"] == [True]
+    h.feed(boxed_obs(1, SEATED_USER_BOX), 30.0, step=0.5)
+    assert h.events["guard_changed"] == [True]
+    assert h.events["away_warning"] == []  # the visible face keeps the user present
+    assert "lock_screen" not in h.platform.names()
+    h.cursor.position = (800, 600)  # the user touches the mouse
+    h.tick()
+    h.feed(boxed_obs(1, SEATED_USER_BOX), 2.0)
+    assert h.events["guard_changed"] == [True, False]
+    assert not h.controller.guard_active
 
 
 def test_user_left_alone_clears_the_guard(make_controller: Callable[..., Harness]) -> None:
@@ -1560,6 +1726,25 @@ def test_phone_below_the_monitors_does_not_switch_with_realistic_features(
             h.push(Observation(timestamp=0.0, face_count=1, features=features, quality=1.0))
             h.controller.tick()
     assert h.events["switched"] == []
+
+
+def test_gaze_estimated_just_below_a_monitor_still_switches(
+    make_controller: Callable[..., Harness],
+) -> None:
+    """r2-gaze-engine-03: looking away is judged from the combined gaze direction
+    on the calibrated monitors, not from each feature's calibrated range."""
+    save_calibration(paths.calibration_file(), make_calibration(nonlinear=(0, 1)))
+    h = make_controller(calibrated=False)
+    assert h.state is S.TRACKING
+    model = h.controller._model
+    assert model is not None
+    assert model.has_linear_estimate
+    taskbar = (2880, 1200)  # the estimate lands a little below the right monitor
+    assert model.looks_away(features_for(*taskbar))  # what the per-feature test said
+    h.feed(gaze_obs(taskbar), 1.0)
+    assert h.events["switched"] == [1]
+    h.feed(gaze_obs((960, 2600)), 2.0)  # papers on the desk below the left monitor
+    assert h.events["switched"] == [1]
 
 
 # --------------------------------------------------------- backend identity
@@ -2129,3 +2314,269 @@ def test_no_action_stays_silent_before_the_setup_is_finished(
     assert h.state is S.AWAY
     assert h.events["notify"] == []
     assert h.platform.names() == []
+
+
+# ================================================== second review regressions
+# ------------------------------------------------------------ r2-controller-02
+def test_preview_frame_captured_before_privacy_mode_is_not_shown(
+    make_controller: Callable[..., Harness], qapp: Any
+) -> None:
+    h = make_controller()
+    h.controller.set_preview(True, "window")
+    frame = np.zeros((4, 4, 3), np.uint8)
+
+    def from_worker() -> None:
+        thread = threading.Thread(target=h.worker.on_preview, args=(frame,))
+        thread.start()
+        thread.join()
+
+    from_worker()  # analysed just before the privacy hotkey was handled
+    h.controller.set_privacy(True)
+    qapp.processEvents()
+    assert h.events["preview_frame"] == []
+    from_worker()  # finished by the worker after the camera was switched off
+    qapp.processEvents()
+    assert h.events["preview_frame"] == []
+
+    h.controller.set_privacy(False)
+    from_worker()
+    qapp.processEvents()
+    assert h.events["preview_frame"] == [frame]
+
+
+# ------------------------------------------------------------ r2-controller-03
+def pause_when_locked_off() -> Settings:
+    s = make_settings()
+    s.privacy.pause_when_locked = False
+    return s
+
+
+def lock_session_keep_tracking(h: Harness) -> None:
+    h.platform.locked = True
+    h.tick(2.1)
+    assert h.state is S.TRACKING  # pause_when_locked is off
+
+
+def test_no_switching_on_the_lock_screen(make_controller: Callable[..., Harness]) -> None:
+    h = make_controller(pause_when_locked_off())
+    lock_session_keep_tracking(h)
+    h.cursor.allow = False  # the lock screen owns the input desktop
+    for _ in range(4):  # the user at the desk looks at both screens
+        h.feed(gaze_obs(RIGHT_CENTRE), 2.0)
+        h.feed(gaze_obs(LEFT_CENTRE), 2.0)
+    assert h.cursor.moves == []
+    assert "activate_window" not in h.platform.names()
+    assert titles(h) == []  # no "Cannot move the cursor" (with a Wayland hint) on Windows
+
+    h.platform.locked = False
+    h.cursor.allow = True
+    h.tick(2.1)
+    h.feed(gaze_obs(RIGHT_CENTRE), 1.0)
+    assert h.events["switched"] == [1]
+
+
+def test_refused_moves_around_a_lock_do_not_suspend_switching_after_unlock(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h = make_controller(pause_when_locked_off())
+    # The session is locked but that is not noticed yet (polled every
+    # LOCK_POLL_S): the system refuses the moves and switching is suspended.
+    h.cursor.allow = False
+    h.feed(gaze_obs(RIGHT_CENTRE), 3.0)
+    assert len(h.cursor.moves) == controller_module.WARP_REFUSAL_LIMIT
+    lock_session_keep_tracking(h)
+    h.platform.locked = False
+    h.cursor.allow = True
+    h.tick(2.1)
+    h.feed(gaze_obs(RIGHT_CENTRE), 1.0)
+    assert h.events["switched"] == [1]  # at once, not WARP_BACKOFF_S later
+
+
+# ------------------------------------------------------------ r2-controller-04
+def learned_office_profile() -> CalibrationData:
+    """The two-monitor profile after learning that the gaze lands 300 px further
+    right than the calibration says (40 samples)."""
+    cal = make_calibration()
+    learned = []
+    for i, x in enumerate(np.linspace(200.0, 3400.0, 40)):
+        target = float(x) + 300.0
+        monitor = 0 if target < 1920 else 1
+        learned.append(CalibrationSample(features_for(x, 540), target, 540, monitor, -1 - i, 0.5))
+    model = refit_model(cal.samples, learned, cal.model)
+    return dataclasses.replace(cal, implicit_samples=learned, model=model)
+
+
+def predicted_x(h: Harness, x: float) -> float:
+    model = h.controller._model
+    assert model is not None
+    return float(model.predict(features_for(x, 540))[0])
+
+
+def stored_office() -> CalibrationData:
+    office = [p for p in CalibrationLibrary.load(paths.calibration_file()) if len(p.monitors) == 2]
+    assert len(office) == 1
+    return office[0]
+
+
+def test_lower_learning_capacity_applies_to_a_profile_used_later(
+    make_controller: Callable[..., Harness],
+) -> None:
+    save_calibration(paths.calibration_file(), learned_office_profile())
+    save_calibration(paths.calibration_file(), make_calibration([*MONITORS, THIRD]))
+    h = make_controller(calibrated=False, start=False)
+    h.monitors.append(THIRD)  # at the home desk
+    h.controller.start()
+    assert h.state is S.TRACKING
+    new = h.controller.settings.copy()
+    new.learning.max_samples = 0  # "forget what was learned"
+    h.controller.apply_settings(new)
+
+    del h.monitors[2]  # docked at the office
+    h.controller.refresh_monitors()
+    assert h.state is S.TRACKING
+    cal = h.controller.calibration()
+    assert cal is not None
+    assert len(cal.monitors) == 2
+    assert h.controller._learner.samples == []
+    assert cal.implicit_samples == []
+    assert predicted_x(h, 960) == pytest.approx(960, abs=1)  # no learned shift left
+    assert stored_office().implicit_samples == []
+
+
+def test_lower_learning_capacity_in_the_settings_file_applies_at_start(
+    make_controller: Callable[..., Harness],
+) -> None:
+    office = learned_office_profile()
+    save_calibration(paths.calibration_file(), office)
+    s = make_settings()
+    s.learning.max_samples = 10
+    h = make_controller(s, calibrated=False)
+    assert h.state is S.TRACKING
+    cal = h.controller.calibration()
+    assert cal is not None
+    kept = h.controller._learner.samples
+    assert len(kept) == 10
+    assert cal.implicit_samples == kept
+    expected = refit_model(office.samples, kept, office.model)
+    assert predicted_x(h, 960) == pytest.approx(float(expected.predict(features_for(960, 540))[0]))
+    assert len(stored_office().implicit_samples) == 10
+
+
+# ------------------------------------------------------------ r2-controller-05
+def test_unreliable_pointer_follows_its_monitor_when_screens_are_renumbered(
+    make_controller: Callable[..., Harness],
+) -> None:
+    b_alone = Monitor(0, "right", RIGHT.rect, primary=True)
+    c_alone = Monitor(1, "third", THIRD.rect)
+    save_calibration(paths.calibration_file(), make_calibration([*MONITORS, THIRD]))
+    save_calibration(paths.calibration_file(), make_calibration([b_alone, c_alone]))
+    platform = FakePlatform()
+    platform.cursor_reliable = False
+    h = make_controller(calibrated=False, platform=platform, start=False)
+    h.monitors.append(THIRD)
+    h.controller.start()
+    h.cursor.track = False  # the reported position stays on the left monitor
+    h.feed(gaze_obs(RIGHT_CENTRE), 0.5)
+    assert h.events["switched"] == [1]  # the pointer is on B, monitor 1
+
+    h.monitors[:] = [b_alone, c_alone]  # A unplugged: B is now 0, C is now 1
+    h.controller.refresh_monitors()
+    assert h.state is S.TRACKING
+    assert h.controller._assumed_monitor == 0  # still B
+    h.feed(gaze_obs((4800, 540)), 1.0)  # look at C
+    assert h.events["switched"] == [1, 1]
+    assert h.cursor.moves[-1][0] >= THIRD.rect.x
+
+
+def test_unreliable_pointer_follows_its_monitor_by_name_when_the_desktop_moves(
+    make_controller: Callable[..., Harness],
+) -> None:
+    # A unplugged and the desktop laid out anew from x = 0: B takes A's place and
+    # C takes B's old rectangle, so only the screen names tell them apart.
+    b_moved = Monitor(0, "right", LEFT.rect, primary=True)
+    c_moved = Monitor(1, "third", RIGHT.rect)
+    save_calibration(paths.calibration_file(), make_calibration([*MONITORS, THIRD]))
+    save_calibration(paths.calibration_file(), make_calibration([b_moved, c_moved]))
+    platform = FakePlatform()
+    platform.cursor_reliable = False
+    h = make_controller(calibrated=False, platform=platform, start=False)
+    h.monitors.append(THIRD)
+    h.controller.start()
+    h.cursor.track = False
+    h.feed(gaze_obs(RIGHT_CENTRE), 0.5)
+    assert h.events["switched"] == [1]  # the pointer is on B
+
+    h.monitors[:] = [b_moved, c_moved]
+    h.controller.refresh_monitors()
+    assert h.state is S.TRACKING
+    assert h.controller._assumed_monitor == 0  # still B, now on the left
+    h.feed(gaze_obs(RIGHT_CENTRE), 1.0)  # look at C, where B used to be
+    assert h.events["switched"] == [1, 1]
+
+
+def test_same_monitor_prefers_names_then_places() -> None:
+    same = controller_module._same_monitor
+    a = Monitor(0, "DP-1", LEFT.rect)
+    b = Monitor(1, "DP-2", RIGHT.rect)
+    c = Monitor(2, "HDMI-1", THIRD.rect)
+    # Unchanged, and renumbered with the coordinates kept.
+    assert same(b, [a, b, c], [a, b, c]) == b
+    renumbered_b = Monitor(0, "DP-2", RIGHT.rect)
+    assert same(b, [a, b, c], [renumbered_b, Monitor(1, "HDMI-1", THIRD.rect)]) == renumbered_b
+    # Laid out anew: the name follows the monitor.
+    moved = [Monitor(0, "DP-2", LEFT.rect), Monitor(1, "HDMI-1", RIGHT.rect)]
+    assert same(b, [a, b, c], moved) == moved[0]
+    # Names that cannot tell (duplicates, positional fallbacks): the same place.
+    twins = [Monitor(0, "U2419H", LEFT.rect), Monitor(1, "U2419H", RIGHT.rect)]
+    assert same(twins[1], twins, [twins[0]]) is None  # the right one was unplugged
+    fallback = [Monitor(i, f"Screen {i + 1}", m.rect) for i, m in enumerate([LEFT, RIGHT, THIRD])]
+    renumbered = [Monitor(0, "Screen 1", RIGHT.rect), Monitor(1, "Screen 2", THIRD.rect)]
+    assert same(fallback[1], fallback, renumbered) == renumbered[0]
+    # Gone: whatever covers its centre now, if anything.
+    assert same(c, [a, b, c], [a, b]) is None
+    wider = Monitor(0, "DP-9", Rect(0, 0, 5760, 1080))
+    assert same(c, [a, b, c], [wider]) == wider
+
+
+# ------------------------------------------------------------ r2-controller-06
+def test_failed_lock_after_the_displays_went_off_wakes_them_on_return(
+    make_controller: Callable[..., Harness],
+) -> None:
+    s = make_settings()
+    s.presence.action = "lock_and_display_off"
+    platform = FakePlatform()
+    platform.lock_ok = False
+    h = make_controller(s, platform=platform)
+    h.feed(no_face(), 10.0, step=0.5)
+    assert h.platform.names() == ["display_off", "lock_screen"]
+    assert titles(h) == ["Could not lock the screen"]
+    h.push(gaze_obs((500, 500)))  # back, face only (no input)
+    assert h.platform.names() == ["display_off", "lock_screen", "wake_display"]
+    assert h.state is S.TRACKING
+
+
+def test_failed_lock_from_the_thread_after_the_displays_went_off_wakes_them(
+    make_controller: Callable[..., Harness], qapp: Any
+) -> None:
+    s = make_settings()
+    s.presence.action = "lock_and_display_off"
+    platform = SlowLockPlatform()
+    platform.lock_ok = False
+    h = make_controller(s, platform=platform, threaded_locks=True)
+    h.feed(no_face(), 10.0, step=0.5)
+    assert platform.entered.wait(5.0)
+    finish_lock(h, qapp)
+    h.push(gaze_obs((500, 500)))
+    assert h.platform.names() == ["display_off", "lock_screen", "wake_display"]
+
+
+def test_successful_lock_and_display_off_does_not_wake_the_displays(
+    make_controller: Callable[..., Harness],
+) -> None:
+    s = make_settings()
+    s.presence.action = "lock_and_display_off"
+    h = make_controller(s)
+    h.feed(no_face(), 10.0, step=0.5)
+    assert h.platform.names() == ["display_off", "lock_screen"]
+    h.push(gaze_obs((500, 500)))  # back before the lock was noticed
+    assert "wake_display" not in h.platform.names()

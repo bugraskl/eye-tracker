@@ -55,7 +55,7 @@
     <text x="80" y="336" font-size="32" font-weight="500" fill="#CBD5E1">Look at a screen.</text>
     <text x="80" y="378" font-size="32" font-weight="600" fill="url(#accent)">Your cursor and focus follow.</text>
 
-    <text x="80" y="438" font-size="19" fill="#94A3B8">Any webcam · head pose + iris fusion · ~1% CPU</text>
+    <text x="80" y="438" font-size="19" fill="#94A3B8">Any webcam · head pose + iris fusion · tiny CPU footprint</text>
     <text x="80" y="466" font-size="19" fill="#94A3B8">Walk-away lock · privacy mode · shoulder guard</text>
 
     <g font-size="15" font-weight="600" fill="#E2E8F0">

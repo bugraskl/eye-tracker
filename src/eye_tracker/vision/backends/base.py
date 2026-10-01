@@ -28,8 +28,8 @@ class VisionBackend(ABC):
     feature_version: ClassVar[str]
     #: The subset of ``feature_names`` that encodes where the user looks (head
     #: rotation and eye direction, as opposed to head position or roll). The gaze
-    #: model applies nonlinear terms only to these, and a value far outside its
-    #: calibrated range means the user looks away from every monitor.
+    #: model applies nonlinear terms only to these, and judges looking away from
+    #: every monitor from the combined direction they give (``GazeModel.looks_away``).
     gaze_features: ClassVar[tuple[str, ...]] = ()
 
     @abstractmethod
@@ -43,6 +43,24 @@ class VisionBackend(ABC):
 
     def set_max_faces(self, n: int) -> None:  # noqa: B027 - optional hook
         """Maximum number of faces to detect (2 enables the shoulder guard)."""
+
+    @property
+    def settled(self) -> bool:
+        """Whether the last observation is final for an unchanged picture.
+
+        A tracking backend returns ``False`` when analysing the very same picture
+        again would still give noticeably different features (its search window
+        was still catching up with a moved face). The vision worker then analyses
+        the next frame instead of letting the motion gate repeat the observation.
+        """
+        return True
+
+    def reset(self) -> None:  # noqa: B027 - optional hook
+        """Forget what was tracked in earlier frames; the next frame starts afresh.
+
+        Called when the camera was released or replaced: the next frame may show
+        a different scene, so nothing may be carried over from before.
+        """
 
     def annotate(self, frame_bgr: np.ndarray, observation: Observation) -> np.ndarray:
         """Return a copy of the frame with landmarks drawn (camera preview only)."""

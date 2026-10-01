@@ -8,6 +8,7 @@ isolated live smoke test on those systems).
 
 from __future__ import annotations
 
+import array
 import collections
 import logging
 import os
@@ -209,10 +210,12 @@ def test_str_is_canonical_and_round_trips() -> None:
     [
         # Windows: Ctrl+Alt is AltGr, so the Win key keeps the defaults from typing.
         ("win32", {"ctrl", "alt", "meta"}),
-        # Linux: Ctrl+Alt+T opens a terminal; Ctrl+Alt+Shift is free and never types.
-        ("linux", {"ctrl", "alt", "shift"}),
-        ("freebsd14", {"ctrl", "alt", "shift"}),
-        ("darwin", {"ctrl", "alt"}),
+        # Linux: Ctrl+Alt+T opens a terminal, and Ctrl+Alt+Shift cannot be pressed with
+        # an Alt+Shift / Ctrl+Shift layout switch and is a JetBrains shortcut.
+        ("linux", {"ctrl", "alt", "meta"}),
+        ("freebsd14", {"ctrl", "alt", "meta"}),
+        # macOS: ⌃⌥T and ⌃⌥C are Rectangle's and Magnet's defaults.
+        ("darwin", {"ctrl", "alt", "meta"}),
     ],
 )
 def test_default_settings_hotkeys_per_platform(
@@ -361,6 +364,35 @@ def test_factory_wayland_without_display_is_unsupported(monkeypatch: pytest.Monk
     assert "ctl" in manager.note
 
 
+def test_wayland_notes_name_the_commands_of_this_copy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression (r2-docs-01): the release packages put no "eye-tracker" command on
+    the PATH, and a desktop shortcut bound to a missing command fails silently."""
+    from eye_tracker import cli
+
+    appimage = "/home/me/Apps/Eye Tracker.AppImage"
+    monkeypatch.setattr(
+        cli, "cli_command_text", lambda *args: cli.format_command([appimage, *args])
+    )
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    wayland = create_hotkey_manager().note
+
+    monkeypatch.setenv("DISPLAY", ":0")  # XWayland
+    monkeypatch.setitem(sys.modules, "Xlib", types.ModuleType("Xlib"))
+    xwayland = create_hotkey_manager().note
+
+    for note in (wayland, xwayland):
+        assert note is not None
+        assert "eye-tracker ctl" not in note
+        for action in ("toggle", "privacy-toggle", "calibrate"):
+            assert f"'{cli.format_command([appimage, 'ctl', action])}'" in note
+    assert wayland is not None
+    assert wayland.startswith("Wayland does not allow applications to register global hotkeys.")
+    assert xwayland is not None
+    assert "may only fire while an X11 window has focus" in xwayland
+
+
 def test_factory_headless_linux(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.delenv("DISPLAY", raising=False)
@@ -491,10 +523,10 @@ def altgr_conflict(text: str, probe: FakeLayoutProbe) -> str | None:
 def test_altgr_conflict_catches_the_old_defaults() -> None:
     probe = FakeLayoutProbe(LAYOUT_TABLES)
     assert altgr_conflict("ctrl+alt+t", probe) == (
-        "Ctrl+Alt+T is AltGr+T, which types '₺' on the Turkish Q keyboard layout"
+        "Ctrl+Alt+T is AltGr+T and types '₺' on the Turkish Q keyboard layout"
     )
     assert altgr_conflict("ctrl+alt+c", probe) == (
-        "Ctrl+Alt+C is AltGr+C, which types 'ć' on the Polish (Programmers) keyboard layout"
+        "Ctrl+Alt+C is AltGr+C and types 'ć' on the Polish (Programmers) keyboard layout"
     )
     assert altgr_conflict("ctrl+alt+p", probe) is None  # nothing on these three layouts
     # Every installed layout is asked, because RegisterHotKey fires on any of them.
@@ -514,6 +546,38 @@ def test_altgr_conflict_with_shift_and_dead_keys() -> None:
     dead = hotkeys._win_altgr_conflict(parse_hotkey("ctrl+alt+semicolon"), VK_OEM_1, probe)
     assert dead is not None
     assert "the dead key '´'" in dead
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("ć", "'ć'"),
+        ("ab", "'ab'"),
+        ("'", '"\'"'),
+        ("e\u0301", "'é'"),  # composed first
+        # Invisible characters are named, never shown as Python escapes like '\xa0'.
+        ("\xa0", "no-break space (U+00A0)"),
+        ("\u202f", "narrow no-break space (U+202F)"),
+        (" ", "space (U+0020)"),
+        ("\u200b", "zero width space (U+200B)"),
+        ("\u0301", "combining acute accent (U+0301)"),  # would sit on the quote sign
+        ("\ue000", "U+E000"),  # private use: no name
+        ("x\xa0", "latin small letter x (U+0078) + no-break space (U+00A0)"),
+        ("", "nothing"),
+    ],
+)
+def test_typed_characters_are_described_readably(text: str, expected: str) -> None:
+    assert hotkeys._describe_typed(text) == expected
+
+
+def test_altgr_conflict_messages_read_well() -> None:
+    assert altgr_conflict("ctrl+alt+space", FakeLayoutProbe(everything="\xa0")) == (
+        "Ctrl+Alt+Space is AltGr+Space and types no-break space (U+00A0) on the US keyboard layout"
+    )
+    # A punctuation key does not run into the sentence ("is AltGr+,, which types").
+    assert altgr_conflict("ctrl+alt+comma", FakeLayoutProbe(everything="ç")) == (
+        "Ctrl+Alt+, is AltGr+, and types 'ç' on the US keyboard layout"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1154,6 +1218,43 @@ def test_mac_option_combinations_that_type_are_refused() -> None:
         mac.stop()
 
 
+def test_mac_option_space_names_the_no_break_space() -> None:
+    """⌥Space (Alfred's default) types U+00A0 on US/ABC: say so without escapes."""
+    space = hotkeys._MAC_KEYCODES["space"]
+    carbon = FakeCarbon(MAC_US, modified={0x0800: {space: "\xa0"}})
+    mac = MacHotkeyManager(carbon=carbon)
+    try:
+        assert not mac.register("s", "alt+space", lambda: None)
+        assert mac.last_error("s") == (
+            "⌥Space types no-break space (U+00A0) on the current keyboard layout"
+        )
+    finally:
+        mac.stop()
+
+
+def test_mac_defaults_avoid_window_manager_shortcuts(
+    mac: MacHotkeyManager, carbon: FakeCarbon, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eye_tracker.config import LEGACY_HOTKEYS, HotkeySettings
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    control_option, command = 0x1000 | 0x0800, 0x0100
+    # Rectangle and Magnet hold ⌃⌥T (Last Two Thirds) and ⌃⌥C (Center) by default.
+    for key in ("t", "c"):
+        carbon.reject[(hotkeys._MAC_KEYCODES[key], control_option)] = -9878
+    defaults = HotkeySettings()
+    for name in ("toggle_tracking", "toggle_privacy", "recalibrate"):
+        assert mac.register(name, getattr(defaults, name), lambda: None), name
+    assert {mods for _code, mods, _sig, _id in carbon.registered.values()} == {
+        control_option | command
+    }
+    assert format_hotkey(hk(defaults.toggle_tracking)) == "⌃⌥⌘T"
+    # The old defaults: registered exclusively, so the collision is reported clearly
+    # instead of both apps reacting to one press.
+    assert not mac.register("old", LEGACY_HOTKEYS[0], lambda: None)
+    assert mac.last_error("old") == "⌃⌥T is already in use by another application"
+
+
 def test_mac_layout_conflict_before_start_and_off_main_thread() -> None:
     e_code = hotkeys._MAC_KEYCODES["e"]
     carbon = FakeCarbon(MAC_US, modified={0x0800: {e_code: "´"}})
@@ -1445,6 +1546,20 @@ class FakeRoot:
         self.grabs: set[tuple[int, int]] = set()
         self.foreign: set[tuple[int, int]] = set()  # held by "another client"
         self.grab_calls: list[tuple[int, int, bool, int, int]] = []
+        self.properties: dict[int, Any] = {}  # atom → property value
+        self.property_reads = 0
+        self.broken_reads = False
+        self.event_mask: int | None = None  # what this client selected on the root
+
+    def get_full_property(self, atom: int, property_type: int) -> Any:
+        self.property_reads += 1
+        if self.broken_reads:
+            raise ConnectionError("lost the X server")
+        value = self.properties.get(atom)
+        return None if value is None else types.SimpleNamespace(value=value)
+
+    def change_attributes(self, event_mask: int = 0, onerror: Any = None) -> None:
+        self.event_mask = event_mask
 
     def grab_key(
         self,
@@ -1476,6 +1591,7 @@ class FakeDisplay:
         self.refreshed: list[Any] = []
         self.closed = False
         self.error_handler: Any = None
+        self.atoms: dict[str, int] = {}
         self._r = self._w = -1
         if selectable:
             self._r, self._w = os.pipe()
@@ -1502,6 +1618,13 @@ class FakeDisplay:
 
     def refresh_keyboard_mapping(self, event: Any) -> None:
         self.refreshed.append(event)
+
+    def intern_atom(self, name: str, only_if_exists: bool = False) -> int:
+        if name not in self.atoms:
+            if only_if_exists:
+                return 0  # X.NONE
+            self.atoms[name] = 100 + len(self.atoms)
+        return self.atoms[name]
 
     def pending_events(self) -> int:
         if self._r >= 0:
@@ -1530,6 +1653,17 @@ class FakeDisplay:
         self.events.append(event)
         if self._w >= 0:
             os.write(self._w, b"x")
+
+    def set_xkb_options(self, *options: str) -> int:
+        """Record ``options`` in ``_XKB_RULES_NAMES`` as setxkbmap does; returns the atom."""
+        atom = self.intern_atom("_XKB_RULES_NAMES")
+        names = ["evdev", "pc105", "us,ru", ",", ",".join(options)]
+        self.root.properties[atom] = "\0".join(names).encode() + b"\0"
+        return atom
+
+
+def property_event(atom: int) -> Any:
+    return types.SimpleNamespace(type=hotkeys._X_PROPERTY_NOTIFY, atom=atom, state=0)
 
 
 def key_event(kind: int, keycode: int, state: int, time: int) -> Any:
@@ -1778,6 +1912,291 @@ def test_x11_error_catcher_protocol() -> None:
     assert catcher.error == "first"
 
 
+# -------------------------------------------------- X11 keyboard-layout switches (XKB)
+ALT_SHIFT = "grp:alt_shift_toggle"
+SWITCHES_LAYOUT = "which switches the keyboard layout"
+
+
+@pytest.fixture
+def x11_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Label the meta key "Super", as on the systems that run X11."""
+    monkeypatch.setattr(sys, "platform", "linux")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            b"evdev\0pc105\0us,ru\0,\0grp:alt_shift_toggle,terminate:ctrl_alt_bksp\0",
+            (ALT_SHIFT, "terminate:ctrl_alt_bksp"),
+        ),
+        ("evdev\0pc105\0us\0\0grp:ctrl_shift_toggle", ("grp:ctrl_shift_toggle",)),
+        (array.array("B", b"evdev\0pc105\0us\0\0 grp:lwin_toggle , \0"), ("grp:lwin_toggle",)),
+        (bytearray(b"base\0pc105\0us\0\0\0"), ()),
+        (b"evdev\0pc105\0us", ()),  # truncated
+        (b"", ()),
+        (None, ()),  # no such property
+        (12, ()),  # not a string at all
+    ],
+)
+def test_x11_parse_xkb_options(value: Any, expected: tuple[str, ...]) -> None:
+    assert hotkeys._x11_parse_xkb_options(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "options", "expected"),
+    [
+        # The finding: Ctrl+Alt+Shift (the old Linux default) with an Alt+Shift switch.
+        (
+            "ctrl+alt+shift+t",
+            [ALT_SHIFT],
+            f"Ctrl+Alt+Shift+T includes Alt+Shift, {SWITCHES_LAYOUT} (XKB option {ALT_SHIFT})",
+        ),
+        # The first option that takes keys of the hotkey is named.
+        (
+            "ctrl+alt+shift+p",
+            ["terminate:ctrl_alt_bksp", "grp:ctrl_shift_toggle", ALT_SHIFT],
+            f"Ctrl+Alt+Shift+P includes Ctrl+Shift, {SWITCHES_LAYOUT} "
+            "(XKB option grp:ctrl_shift_toggle)",
+        ),
+        # Today's default with the rare switches that do take its keys.
+        (
+            "ctrl+alt+meta+c",
+            ["grp:ctrl_alt_toggle"],
+            f"Ctrl+Alt+Super+C includes Ctrl+Alt, {SWITCHES_LAYOUT} "
+            "(XKB option grp:ctrl_alt_toggle)",
+        ),
+        (
+            "ctrl+alt+meta+t",
+            ["grp:lwin_toggle"],
+            f"Ctrl+Alt+Super+T includes Super, {SWITCHES_LAYOUT} (XKB option grp:lwin_toggle)",
+        ),
+        (
+            "ctrl+alt+meta+t",
+            ["lv3:lwin_switch"],
+            "Ctrl+Alt+Super+T includes Super, which acts as AltGr (XKB option lv3:lwin_switch)",
+        ),
+        # Key toggles only concern their key.
+        (
+            "ctrl+alt+space",
+            ["grp:alt_space_toggle"],
+            f"Ctrl+Alt+Space includes Alt+Space, {SWITCHES_LAYOUT} "
+            "(XKB option grp:alt_space_toggle)",
+        ),
+        (
+            "meta+space",
+            ["grp:win_space_toggle"],
+            "Super+Space switches the keyboard layout (XKB option grp:win_space_toggle)",
+        ),
+        ("ctrl+alt+t", ["grp:alt_space_toggle", "grp:win_space_toggle"], None),
+        ("ctrl+shift+t", [ALT_SHIFT, "grp:nonexistent_option"], None),
+        ("ctrl+alt+shift+t", [], None),
+    ],
+)
+def test_x11_layout_switch_conflict(
+    x11_labels: None, text: str, options: list[str], expected: str | None
+) -> None:
+    assert hotkeys._x11_layout_switch_conflict(hk(text), options) == expected
+
+
+#: Layout switches and other XKB options people commonly set (GNOME Tweaks, KDE and
+#: Xfce keyboard settings, setxkbmap guides), none of which takes keys of a default.
+COMMON_XKB_OPTIONS = [
+    ALT_SHIFT,
+    "grp:alt_shift_toggle_bidir",
+    "grp:lalt_lshift_toggle",
+    "grp:ctrl_shift_toggle",
+    "grp:lctrl_lshift_toggle",
+    "grp:win_space_toggle",
+    "grp:caps_toggle",
+    "grp:shift_caps_toggle",
+    "grp:alt_caps_toggle",
+    "grp:shifts_toggle",
+    "grp:alts_toggle",
+    "grp:ctrls_toggle",
+    "grp:toggle",
+    "grp:menu_toggle",
+    "grp:rwin_toggle",
+    "grp:ralt_rshift_toggle",
+    "grp:rctrl_ralt_toggle",
+    "grp:sclk_toggle",
+    "lv3:ralt_switch",
+    "lv3:caps_switch",
+    "compose:ralt",
+    "compose:menu",
+    "terminate:ctrl_alt_bksp",
+    "grp_led:scroll",
+    "ctrl:nocaps",
+    "caps:escape",
+]
+
+
+def test_x11_default_hotkeys_survive_the_usual_layout_switches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from eye_tracker.config import LEGACY_HOTKEYS_X11, HotkeySettings
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    defaults = HotkeySettings()
+    for text in (defaults.toggle_tracking, defaults.toggle_privacy, defaults.recalibrate):
+        assert hotkeys._x11_layout_switch_conflict(hk(text), COMMON_XKB_OPTIONS) is None, text
+    # The previous defaults could not be pressed with the two most common switches.
+    for option in (ALT_SHIFT, "grp:ctrl_shift_toggle"):
+        for text in LEGACY_HOTKEYS_X11:
+            assert hotkeys._x11_layout_switch_conflict(hk(text), [option]) is not None
+
+
+def test_x11_layout_switch_table_is_consistent() -> None:
+    for option, taken in hotkeys._X_KEY_OPTIONS.items():
+        assert option.startswith(("grp:", "lv3:")), option
+        assert taken.modifiers, option
+        assert taken.modifiers <= set(MODIFIERS), option
+        assert taken.key is None or taken.key in KEYS, option
+    # Right-hand-only switches leave the keys that chords are pressed with alone.
+    for option in ("grp:ralt_rshift_toggle", "grp:rctrl_rshift_toggle", "grp:rwin_toggle"):
+        assert option not in hotkeys._X_KEY_OPTIONS
+
+
+def test_x11_refuses_a_hotkey_the_layout_switch_makes_unpressable(
+    x11: tuple[X11HotkeyManager, FakeDisplay], x11_labels: None
+) -> None:
+    manager, display = x11
+    display.set_xkb_options(ALT_SHIFT, "terminate:ctrl_alt_bksp")
+    manager._follow_xkb_options()
+    assert manager._xkb_options == (ALT_SHIFT, "terminate:ctrl_alt_bksp")
+    assert display.root.event_mask == hotkeys._X_PROPERTY_CHANGE_MASK
+    blocked = bind_x11(manager, "t", "ctrl+alt+shift+t", lambda: None)
+    # XGrabKey would succeed and the hotkey would silently never fire: refuse it.
+    assert not manager._grab_binding(blocked)
+    assert display.root.grab_calls == []
+    assert manager.last_error("t") == (
+        f"Ctrl+Alt+Shift+T includes Alt+Shift, {SWITCHES_LAYOUT} (XKB option {ALT_SHIFT})"
+    )
+    assert manager.layout_conflict("ctrl+alt+shift+t") == manager.last_error("t")
+    assert manager.layout_conflict(hk("ctrl+alt+meta+t")) is None
+    assert not display.closed  # answered from what the hotkey thread knows
+    fine = bind_x11(manager, "p", "ctrl+alt+meta+p", lambda: None)
+    assert manager._grab_binding(fine)
+    assert (keycode_of("p"), 4 | 8 | 64) in display.root.grabs
+
+
+def test_x11_follows_layout_switch_changes(
+    x11: tuple[X11HotkeyManager, FakeDisplay], x11_labels: None
+) -> None:
+    manager, display = x11
+    manager._follow_xkb_options()  # no _XKB_RULES_NAMES yet: nothing to avoid
+    assert manager._xkb_options == ()
+    fired: list[int] = []
+    binding = bind_x11(manager, "t", "ctrl+alt+shift+t", lambda: fired.append(1))
+    assert manager._grab_binding(binding)
+    code, mods = keycode_of("t"), 1 | 4 | 8
+    # The desktop applies the user's Alt+Shift switch after the app started (login).
+    atom = display.set_xkb_options(ALT_SHIFT)
+    reads = display.root.property_reads
+    manager._handle_event(property_event(atom + 1))  # another root property: ignored
+    assert display.root.property_reads == reads
+    assert (code, mods) in display.root.grabs
+    manager._handle_event(property_event(atom))
+    assert display.root.grabs == set()
+    assert manager.registered == {}  # reported as not working …
+    error = manager.last_error("t")
+    assert error is not None
+    assert ALT_SHIFT in error
+    # … an unchanged value (desktops rewrite it) does not churn the grabs …
+    grab_calls = len(display.root.grab_calls)
+    manager._handle_event(property_event(atom))
+    assert len(display.root.grab_calls) == grab_calls
+    # … and the hotkey comes back when the switch moves to Super+Space.
+    display.set_xkb_options("grp:win_space_toggle")
+    manager._handle_event(property_event(atom))
+    assert (code, mods) in display.root.grabs
+    assert manager.registered == {"t": hk("ctrl+alt+shift+t")}
+    assert manager.last_error("t") is None
+    manager._handle_event(key_event(hotkeys._X_KEY_PRESS, code, mods, 10))
+    assert fired == [1]
+
+
+def test_x11_mapping_change_rereads_the_layout_switches(
+    x11: tuple[X11HotkeyManager, FakeDisplay], x11_labels: None
+) -> None:
+    manager, display = x11
+    manager._follow_xkb_options()
+    binding = bind_x11(manager, "p", "ctrl+shift+p", lambda: None)
+    assert manager._grab_binding(binding)
+    display.set_xkb_options("grp:ctrl_shift_toggle")
+    manager._handle_event(types.SimpleNamespace(type=hotkeys._X_MAPPING_NOTIFY, request=1))
+    assert manager.registered == {}
+    error = manager.last_error("p")
+    assert error is not None
+    assert "grp:ctrl_shift_toggle" in error
+
+
+def test_x11_failed_option_reads_keep_what_was_known(
+    x11: tuple[X11HotkeyManager, FakeDisplay],
+) -> None:
+    manager, display = x11
+    atom = display.set_xkb_options(ALT_SHIFT)
+    manager._follow_xkb_options()
+    display.root.broken_reads = True
+    manager._handle_event(property_event(atom))
+    assert manager._xkb_options == (ALT_SHIFT,)  # no flip-flop on a failed read
+
+
+def test_x11_hotkeys_work_when_the_options_cannot_be_followed(
+    x11: tuple[X11HotkeyManager, FakeDisplay], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, display = x11
+
+    def broken(name: str, only_if_exists: bool = False) -> int:
+        raise ConnectionError("lost the X server")
+
+    monkeypatch.setattr(display, "intern_atom", broken)
+    manager._follow_xkb_options()
+    assert manager._rules_atom == 0
+    assert manager._xkb_options == ()
+    binding = bind_x11(manager, "t", "ctrl+alt+shift+t", lambda: None)
+    assert manager._grab_binding(binding)
+    manager._handle_event(property_event(0))  # nothing followed: ignored, no crash
+    assert manager.registered == {"t": hk("ctrl+alt+shift+t")}
+
+
+def test_x11_layout_conflict_before_the_hotkey_thread_runs(x11_labels: None) -> None:
+    display = FakeDisplay()
+    display.set_xkb_options(ALT_SHIFT)
+    opened: list[str | None] = []
+
+    def factory(name: str | None) -> FakeDisplay:
+        opened.append(name)
+        return display
+
+    manager = X11HotkeyManager(":1", display_factory=factory)
+    conflict = manager.layout_conflict("ctrl+alt+shift+c")
+    assert conflict == (
+        f"Ctrl+Alt+Shift+C includes Alt+Shift, {SWITCHES_LAYOUT} (XKB option {ALT_SHIFT})"
+    )
+    assert manager.layout_conflict("ctrl+alt+meta+c") is None
+    # A short-lived, read-only connection per question: nothing grabbed or selected.
+    assert opened == [":1", ":1"]
+    assert display.closed
+    assert display.root.grab_calls == []
+    assert display.root.event_mask is None
+    # A server without the property: nothing to check, no atom created.
+    bare = FakeDisplay()
+    assert (
+        X11HotkeyManager(display_factory=lambda name: bare).layout_conflict("ctrl+alt+shift+c")
+        is None
+    )
+    assert bare.atoms == {}
+
+    def unreachable(name: str | None) -> Any:
+        raise ConnectionError("no X server")
+
+    # Advisory only: an unreachable server never breaks the caller.
+    assert X11HotkeyManager(display_factory=unreachable).layout_conflict("ctrl+alt+shift+c") is None
+    with pytest.raises(ValueError, match="needs a key"):
+        manager.layout_conflict("ctrl+alt")
+
+
 @pytest.mark.skipif(not IS_POSIX, reason="the X11 loop selects on pipes (POSIX only)")
 def test_x11_thread_with_fake_display(fake_keysyms: None) -> None:
     display = FakeDisplay(selectable=True)
@@ -1806,6 +2225,36 @@ def test_x11_thread_with_fake_display(fake_keysyms: None) -> None:
     assert display.closed
     assert display.root.grabs == set()
     assert manager._thread is None
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="the X11 loop selects on pipes (POSIX only)")
+def test_x11_thread_refuses_hotkeys_a_layout_switch_takes(
+    fake_keysyms: None, x11_labels: None
+) -> None:
+    display = FakeDisplay(selectable=True)
+    atom = display.set_xkb_options(ALT_SHIFT)
+    manager = X11HotkeyManager(display_factory=lambda name: display)
+    try:
+        assert not manager.register("t", "ctrl+alt+shift+t", lambda: None)
+        error = manager.last_error("t")
+        assert error is not None
+        assert ALT_SHIFT in error
+        assert display.root.grabs == set()
+        assert manager.register("t", "ctrl+alt+meta+t", lambda: None)
+        assert manager.layout_conflict("ctrl+alt+shift+t") is not None  # cached options
+        assert display.root.event_mask == hotkeys._X_PROPERTY_CHANGE_MASK
+        # The switch changes while the app runs: the thread follows it.
+        assert manager.register("p", "ctrl+shift+p", lambda: None)
+        display.set_xkb_options("grp:ctrl_shift_toggle")
+        display.push(property_event(atom))
+        # Each loop pass runs queued calls, then drains events: after two round
+        # trips the pass that saw the pushed event has finished.
+        for _ in range(2):
+            assert manager._call_on_thread(lambda: True, False)
+        assert set(manager.registered) == {"t"}
+    finally:
+        manager.stop()
+    assert display.closed
 
 
 @pytest.mark.skipif(not IS_POSIX, reason="the X11 loop selects on pipes (POSIX only)")
@@ -2032,7 +2481,7 @@ def test_windows_altgr_collision_is_refused_before_registering() -> None:
         assert not refusing.register("t", COMBO, lambda: None)
         assert refusing.registered == {}
         assert refusing.last_error("t") == (
-            "Ctrl+Alt+Shift+F24 is AltGr+Shift+F24, which types 'x' on the US keyboard layout"
+            "Ctrl+Alt+Shift+F24 is AltGr+Shift+F24 and types 'x' on the US keyboard layout"
         )
         assert other.register("t", COMBO, lambda: None)  # nothing was registered
         # With Win held, AltGr is not involved: no check, registration proceeds.

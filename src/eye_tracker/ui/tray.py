@@ -20,6 +20,7 @@ from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 from .. import APP_NAME
+from ..cli import cli_command_text
 from ..config import Settings
 from ..platform.hotkeys import Hotkey, format_hotkey
 from ..types import TrackingState
@@ -50,6 +51,15 @@ _STATUS_COLORS: dict[TrackingState, str] = {
 
 #: Controller hotkey actions (``settings.hotkeys`` field names) per menu item.
 _HOTKEY_ACTIONS = ("toggle_tracking", "toggle_privacy", "recalibrate")
+
+#: Show hotkeys as menu text after a tab instead of as the action's shortcut.
+#: Windows has no native tray menu, so Qt draws it and renders a shortcut with
+#: its own names and order: "Meta+Ctrl+Alt+T", although Windows keyboards have
+#: no Meta key and the tooltip (format_hotkey) says "Ctrl+Alt+Win+T". QMenu
+#: draws text after a tab in the shortcut column, so the result looks the same.
+#: Elsewhere the shortcut stays: macOS renders it with the right glyphs, and the
+#: DBusMenu of Linux trays sends it as key names ("Super") the shell displays.
+_HOTKEY_AS_TEXT = sys.platform == "win32"
 
 _PAUSE_TIP = "Stop moving the cursor; the camera is released"
 _RESUME_TIP = "Start following your gaze again"
@@ -138,6 +148,10 @@ class TrayIcon(QObject):
         self._muted_until = -math.inf
         self._icon_key: tuple[object, ...] | None = None
         self._hotkey_labels: dict[str, str] = {}
+        #: Menu texts of the hotkey actions without the hotkey (see _HOTKEY_AS_TEXT).
+        self._action_texts: dict[str, str] = {}
+        #: ``"\t<hotkey>"`` appended to those texts, by hotkey action.
+        self._hotkey_suffixes: dict[str, str] = {}
         self._disposed = False
 
         # A context menu needs a QWidget parent to be owned; this QObject has
@@ -179,8 +193,9 @@ class TrayIcon(QObject):
         self.tray.show()
         if not self.available:
             log.warning(
-                "No system tray is available; control the app with 'eye-tracker ctl …' "
-                "or enable a tray/AppIndicator extension"
+                "No system tray is available; control the app with '%s …' "
+                "or enable a tray/AppIndicator extension",
+                cli_command_text("ctl"),
             )
 
     def hide(self) -> None:
@@ -312,6 +327,7 @@ class TrayIcon(QObject):
         self.action_quit = self._add_action(f"Quit {APP_NAME}", self._on_quit)
         menu.setToolTipsVisible(True)
         menu.aboutToShow.connect(self._on_menu_about_to_show)
+        self._action_texts = {name: action.text() for name, action in self._hotkey_actions()}
 
     def _connect_controller(self) -> None:
         for name, slot in (
@@ -340,13 +356,13 @@ class TrayIcon(QObject):
         state = self._state
         busy = state is TrackingState.CALIBRATING
         paused = self._flag("paused", state is TrackingState.PAUSED)
-        self.action_pause.setText("Resume tracking" if paused else "Pause tracking")
+        self._set_action_text("toggle_tracking", "Resume tracking" if paused else "Pause tracking")
         self.action_pause.setEnabled(not busy)
         self.action_privacy.setChecked(self._flag("privacy", state is TrackingState.PRIVACY))
         self.action_privacy.setEnabled(not busy)
 
         needs = state is TrackingState.NEEDS_CALIBRATION
-        self.action_calibrate.setText("Calibrate now…" if needs else "Calibrate…")
+        self._set_action_text("recalibrate", "Calibrate now…" if needs else "Calibrate…")
         font = self.action_calibrate.font()
         font.setBold(needs)
         self.action_calibrate.setFont(font)
@@ -403,7 +419,12 @@ class TrayIcon(QObject):
         self._hotkey_labels = {name: format_hotkey(hk) for name, hk in hotkeys.items()}
         for name, action in self._hotkey_actions():
             hotkey = hotkeys.get(name)
-            sequence = util.hotkey_sequence(hotkey) if hotkey is not None else None
+            sequence: QKeySequence | None = None
+            if _HOTKEY_AS_TEXT:
+                label = self._hotkey_labels.get(name)
+                self._hotkey_suffixes[name] = f"\t{label}" if label else ""
+            elif hotkey is not None:
+                sequence = util.hotkey_sequence(hotkey)
             # The shortcut is only *displayed* next to the item (natively: a column
             # in Qt menus, a key equivalent on macOS, the DBusMenu "shortcut" on
             # Linux). WidgetShortcut limits it to the open menu; the global hotkey
@@ -411,7 +432,20 @@ class TrayIcon(QObject):
             action.setShortcut(sequence if sequence is not None else QKeySequence())
             action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
             action.setShortcutVisibleInContextMenu(True)
+            self._set_action_text(name, self._action_texts.get(name, ""))
         self._sync_tooltips()
+
+    def _set_action_text(self, name: str, text: str) -> None:
+        """Set the text of hotkey action ``name``, followed by its hotkey on Windows.
+
+        Every text change of these actions goes through here, so the hotkey
+        suffix (see :data:`_HOTKEY_AS_TEXT`) survives "Pause" becoming "Resume".
+        """
+        self._action_texts[name] = text
+        action = dict(self._hotkey_actions())[name]
+        full = text + self._hotkey_suffixes.get(name, "")
+        if action.text() != full:
+            action.setText(full)
 
     def _sync_tooltips(self) -> None:
         state = self._state

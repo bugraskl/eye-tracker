@@ -5,8 +5,10 @@ entry point from the name it was started as:
 
 * ``EyeTracker.exe`` (Windows) and ``Eye Tracker`` (inside the macOS app) are the
   windowed tray app and call :func:`eye_tracker.cli.gui_main`.
-* Anything else, i.e. ``eye-tracker-cli`` (Windows, macOS) and ``eye-tracker``
-  (Linux, where one executable serves both roles), calls :func:`eye_tracker.cli.main`.
+* Anything else, i.e. ``eye-tracker-cli`` (Windows, macOS), ``eye-tracker.exe``
+  (the copy of ``eye-tracker-cli.exe`` that the Windows installer puts on PATH)
+  and ``eye-tracker`` (Linux, where one executable serves both roles), calls
+  :func:`eye_tracker.cli.main`.
 
 The names are set in ``eye-tracker.spec``; keep ``_GUI_EXECUTABLES`` in sync with it.
 """

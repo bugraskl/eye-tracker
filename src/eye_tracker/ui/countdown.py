@@ -30,6 +30,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QWidget
 
 from ..config import Settings
+from ..engine.controller import effective_away_action
 from ..types import Rect, TrackingState, monitor_at
 from . import util
 
@@ -70,9 +71,12 @@ class CountdownToast(QWidget):
 
     Listens to ``away_warning(remaining_s)``, ``away_cancelled``,
     ``state_changed`` and ``settings_changed``. It keeps its own deadline, so the
-    controller may send the warning once or repeat it. The text follows
-    ``settings.presence.action``. For ``"none"`` nothing is shown, because
-    nothing is going to happen. ``clock`` is injectable for tests.
+    controller may send the warning once or repeat it. The text names the action
+    that will really run (:func:`~eye_tracker.engine.controller.effective_away_action`:
+    until the first-run setup is finished a lock is only a notification). For
+    ``"none"`` nothing is shown, because nothing is going to happen. The hint
+    offers only what can cancel here: keyboard and mouse use cannot be observed
+    on every desktop (Wayland outside GNOME). ``clock`` is injectable for tests.
     """
 
     def __init__(
@@ -88,6 +92,8 @@ class CountdownToast(QWidget):
         self._controller = controller
         self._clock = clock
         self._settings: Settings = util.controller_settings(controller)
+        #: Whether keyboard and mouse use can be observed (asked once, when needed).
+        self._input_observable: bool | None = None
         self._deadline: float | None = None
         self._total = 1.0
         self._scale = 1.0
@@ -116,8 +122,9 @@ class CountdownToast(QWidget):
     # ------------------------------------------------------------------ public API
     @property
     def action(self) -> str:
-        """The presence action being counted down to (``settings.presence.action``)."""
-        return self._settings.presence.action
+        """The presence action being counted down to: ``settings.presence.action``,
+        or ``"notify"`` for a lock or blanked displays while the setup is unfinished."""
+        return effective_away_action(self._settings)
 
     @property
     def active(self) -> bool:
@@ -172,10 +179,28 @@ class CountdownToast(QWidget):
         return _TITLES[action].format(n=n) if n > 0 else _NOW_TITLES[action]
 
     def hint_text(self) -> str:
-        """How to cancel, which depends on whether input counts as presence."""
-        if self._settings.presence.require_input_idle:
+        """How to cancel: input counts as presence only when the settings say so
+        and the system lets the app observe it."""
+        if self._settings.presence.require_input_idle and self._input_is_observable():
             return "Move the mouse or look at the camera to cancel"
         return "Look at the camera to cancel"
+
+    def _input_is_observable(self) -> bool:
+        """The platform's ``input_idle`` capability (true when it cannot be read).
+
+        Wayland desktops other than GNOME offer no idle time: keystrokes are never
+        seen there, and pointer moves only over X11 (XWayland) windows.
+        """
+        if self._input_observable is None:
+            capabilities: dict[str, bool] = {}
+            platform = getattr(self._controller, "platform", None)
+            try:
+                if platform is not None:
+                    capabilities = dict(platform.capabilities())
+            except Exception:
+                log.debug("capabilities() failed", exc_info=True)
+            self._input_observable = bool(capabilities.get("input_idle", True))
+        return self._input_observable
 
     def text(self) -> str:
         """The whole message on one line (also the accessible name)."""

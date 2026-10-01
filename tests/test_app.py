@@ -417,7 +417,7 @@ def test_second_instance_hands_over_and_exits(
     build: Callable[..., Harness], qapp: QApplication
 ) -> None:
     first = build()
-    second = build()
+    second = build(background=False)
     assert second.ctx.exit_code == 0
     assert second.ctx.app is None
     assert second.workers == []
@@ -431,6 +431,118 @@ def test_second_instance_hands_over_and_exits(
 
     # run_app returns the hand-over result without entering the event loop.
     assert run_app(argparse.Namespace(background=True)) == 0
+
+
+def test_a_login_start_does_not_pop_up_the_running_instance(
+    build: Callable[..., Harness], qapp: QApplication
+) -> None:
+    """Regression (r2-ui-app-04): a --background launch asked the instance to show
+    itself, which popped up its tray menu, the setup assistant or the settings."""
+    first = build()
+    second = build(background=True)
+    assert second.ctx.exit_code == 0
+    assert second.ctx.app is None
+    settle(qapp)
+    assert first.app.settings_dialog is None
+    assert first.app.wizard is None
+
+
+def test_a_launch_waits_for_an_instance_that_is_shutting_down(
+    build: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (r2-ui-app-02): quitting and starting again right away left
+    nothing running: the quitting instance still held the lock while it released
+    the camera, and the new launch gave up at once."""
+    monkeypatch.setattr(ipc, "STARTUP_WAIT_MS", 0)
+    holder = ipc.InstanceLock()  # the quitting instance
+    assert holder.acquire()
+    waits: list[int] = []
+
+    def wait(ms: int) -> None:
+        waits.append(ms)
+        if len(waits) == 2:
+            holder.release()  # it has stopped the camera and exits
+
+    monkeypatch.setattr(app_module, "_wait_ms", wait)
+    try:
+        h = build(background=False)
+    finally:
+        holder.release()
+    # This launch took over as the instance.
+    assert h.ctx.exit_code is None
+    assert h.ctx.app is not None
+    assert h.ctx.server is not None
+    assert h.ctx.server.lock is not None
+    assert h.ctx.server.lock.is_held
+    assert waits == [app_module._HANDOVER_RETRY_MS] * 2
+
+
+def test_a_launch_hands_over_once_a_busy_instance_answers(
+    build: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ipc, "STARTUP_WAIT_MS", 0)
+    busy = "error: Eye Tracker is starting or shutting down; try again"
+    replies = iter([busy, busy, "ok"])
+    sent: list[str] = []
+
+    def send(command: str, timeout_ms: int = 0, *, wait_ms: int = 0) -> str:
+        sent.append(command)
+        return next(replies)
+
+    monkeypatch.setattr(ipc, "send_command", send)
+    monkeypatch.setattr(app_module, "_wait_ms", lambda ms: None)
+    holder = ipc.InstanceLock()  # an instance that is still starting up
+    assert holder.acquire()
+    try:
+        h = build(background=False)
+    finally:
+        holder.release()
+    assert h.ctx.exit_code == 0
+    assert h.ctx.app is None
+    assert sent == ["show", "show", "show"]
+
+
+def test_options_for_a_new_instance_are_reported_as_not_applied(
+    build: Callable[..., Harness], caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    """Regression (r2-docs-15): --trace (and --camera, --backend) were silently
+    dropped when the app was already running, and no trace file appeared."""
+    build()
+    trace = tmp_path / "trace.jsonl"
+    with caplog.at_level(logging.WARNING, logger="eye_tracker.app"):
+        second = build(trace=str(trace), camera="clip.mp4")
+    assert second.ctx.exit_code == 0
+    assert not trace.exists()
+    (message,) = [r.getMessage() for r in caplog.records if "not applied" in r.getMessage()]
+    assert "--trace, --camera were not applied" in message
+    assert "--backend" not in message
+    assert app_module.cli_command_text("ctl", "quit") in message
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="eye_tracker.app"):
+        assert build(calibrate=True).ctx.exit_code == 0  # nothing ignored
+    assert not any("not applied" in r.getMessage() for r in caplog.records)
+
+
+def test_the_setup_assistant_from_the_settings_keeps_the_walk_away_lock(
+    build: Callable[..., Harness], qapp: QApplication
+) -> None:
+    """Regression (r2-ui-app-01): asking for the assistant "at next start" stored
+    first_run_done=False, which replaced the walk-away lock by a notification at
+    once and for good when the assistant was cancelled."""
+    h = build()
+    h.app.open_settings()
+    dialog = h.app.settings_dialog
+    assert dialog is not None
+    dialog.setup_requested.emit()  # "Run setup assistant…"
+    wizard = h.app.wizard
+    assert wizard is not None
+    assert h.controller.settings.general.first_run_done is True
+    wizard.reject()
+    settle(qapp)
+    assert h.app.wizard is None
+    assert h.controller.settings.general.first_run_done is True
+    assert Settings.load(paths.settings_file()).general.first_run_done is True
 
 
 def test_session_overrides_stay_out_of_the_settings_file(
@@ -741,6 +853,7 @@ def test_a_lock_holder_that_does_not_answer_keeps_other_launches_out(
 ) -> None:
     """windows-09: the instance lock decides who runs, not a racy socket probe."""
     monkeypatch.setattr(ipc, "STARTUP_WAIT_MS", 300)
+    monkeypatch.setattr(app_module, "HANDOVER_WAIT_MS", 300)  # then it gives up
     holder = ipc.InstanceLock()  # e.g. an instance that is still starting up, or hangs
     assert holder.acquire()
     try:

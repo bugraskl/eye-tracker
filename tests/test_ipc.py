@@ -569,10 +569,161 @@ def test_windows_process_owner_check() -> None:
     assert ipc._process_is_current_user(os.getpid()) is True
     assert ipc._process_is_current_user(4) is False  # the System process
     assert ipc._pipe_server_is_current_user(0) is None  # not a pipe handle
+    assert ipc._pipe_client_is_current_user(0) is None
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="checks the non-Windows fallbacks")
 def test_windows_checks_are_inert_elsewhere() -> None:
     assert ipc._pipe_server_is_current_user(5) is None
+    assert ipc._pipe_client_is_current_user(5) is None
     assert ipc._process_is_current_user(1) is None
     assert ipc._win_security() is None
+    assert ipc._pipe_name_taken("anything") is False
+    assert ipc._client_is_trusted(object()) is True  # type: ignore[arg-type]
+
+
+# ------------------------------------------------------------- client identity
+def test_client_of_another_account_is_refused(
+    server_factory: Callable[..., ipc.InstanceServer],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Another account reaching our pipe (a squatted name) cannot pause or quit us."""
+    handled: list[str] = []
+    server = server_factory(recorder(handled))
+    assert server.listen()
+    monkeypatch.setattr(ipc, "_client_is_trusted", lambda socket: False)
+    with caplog.at_level(logging.DEBUG, logger="eye_tracker.ipc"):
+        assert ipc.send_command("privacy-on", timeout_ms=300) is None
+        assert ipc.send_command("quit", timeout_ms=300) is None
+    for _ in range(3):
+        QCoreApplication.processEvents()
+    assert handled == []
+    refusals = [r for r in caplog.records if "Refused a command connection" in r.getMessage()]
+    # Loud once, quiet afterwards: a client retrying in a loop must not flood the log.
+    assert [r.levelno for r in refusals] == [logging.WARNING, logging.DEBUG]
+    monkeypatch.undo()
+    assert ipc.send_command("status") == "ok"  # our own clients still get through
+
+
+def test_client_check_accepts_our_own_client(
+    server_factory: Callable[..., ipc.InstanceServer], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verdicts: list[bool] = []
+    real = ipc._client_is_trusted
+
+    def spy(socket: Any) -> bool:
+        verdicts.append(real(socket))
+        return verdicts[-1]
+
+    monkeypatch.setattr(ipc, "_client_is_trusted", spy)
+    server = server_factory(lambda c: "ok")
+    assert server.listen()
+    assert ipc.send_command("status") == "ok"
+    assert verdicts == [True]
+
+
+def test_client_check_fails_open_when_the_client_is_unknown() -> None:
+    class Broken:
+        def socketDescriptor(self) -> int:
+            raise RuntimeError("no descriptor")
+
+    assert ipc._client_is_trusted(Broken()) is True  # type: ignore[arg-type]
+
+
+# ------------------------------------------------------- squatted pipe names
+class _SquatterPipe:
+    """A named pipe created with this process's default security (Windows)."""
+
+    _PIPE_ACCESS_DUPLEX = 0x3
+    _UNLIMITED_INSTANCES = 255
+
+    def __init__(self, name: str) -> None:
+        import ctypes
+        from ctypes import wintypes as w
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create = kernel32.CreateNamedPipeW
+        create.restype = w.HANDLE
+        # name, open mode, pipe mode, max instances, out/in buffers, timeout, security
+        create.argtypes = [w.LPCWSTR, *[w.DWORD] * 6, w.LPVOID]
+        self._close = kernel32.CloseHandle
+        self._close.argtypes = [w.HANDLE]
+        self._close.restype = w.BOOL
+        handle = create(
+            "\\\\.\\pipe\\" + name,
+            self._PIPE_ACCESS_DUPLEX,
+            0,  # PIPE_TYPE_BYTE | PIPE_WAIT
+            self._UNLIMITED_INSTANCES,
+            4096,
+            4096,
+            0,
+            None,
+        )
+        if not handle or handle == ctypes.c_void_p(-1).value:
+            raise OSError(ctypes.get_last_error(), "CreateNamedPipeW failed")
+        self._handle: int | None = handle
+
+    def close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            self._close(handle)
+
+
+windows_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows named pipes")
+
+
+@windows_only
+def test_pipe_name_created_by_someone_else_is_not_joined(
+    server_factory: Callable[..., ipc.InstanceServer],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Joining would give our pipe instances the squatter's access rules."""
+    from eye_tracker import cli
+
+    monkeypatch.setattr(ipc, "PIPE_NAME_GRACE_S", 0.2)
+    # The warning names the command as this copy is run (r2-docs-01).
+    monkeypatch.setattr(cli, "cli_command_text", lambda *args: " ".join(["eye-tracker-cli", *args]))
+    squatter = _SquatterPipe(ipc.server_name())
+    try:
+        server = server_factory(recorder([]))
+        with caplog.at_level(logging.WARNING, logger="eye_tracker.ipc"):
+            assert not server.listen()
+        assert not server.another_instance_running  # we still are the instance ...
+        lock = server.lock
+        assert lock is not None
+        assert lock.is_held  # ... and keep the lock, just without a command channel
+        assert not server.is_listening
+        assert "already exists" in caplog.text
+        assert "'eye-tracker-cli ctl' and desktop shortcuts cannot reach" in caplog.text
+    finally:
+        squatter.close()
+    assert server.listen()  # the name is ours once the squatter is gone
+    assert ipc.send_command("status") == "ok"
+
+
+@windows_only
+def test_pipe_name_check_waits_for_a_lingering_pipe(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    name = f"eye-tracker-test-{os.getpid()}-{time.monotonic_ns()}"
+    assert ipc._pipe_name_taken(name) is False
+    squatter = _SquatterPipe(name)
+    timer = threading.Timer(0.1, squatter.close)
+    timer.start()
+    try:
+        started = time.monotonic()
+        # Gone within the grace period: an exiting instance's pipe, not a squatter.
+        assert ipc._pipe_name_taken(name) is False
+        assert time.monotonic() - started < ipc.PIPE_NAME_GRACE_S
+    finally:
+        timer.join()
+        squatter.close()
+    monkeypatch.setattr(ipc, "PIPE_NAME_GRACE_S", 0.0)
+    squatter = _SquatterPipe(name)
+    try:
+        assert ipc._pipe_name_taken(name) is True
+        assert ipc._pipe_name_taken("\\\\.\\pipe\\" + name) is True  # full names work too
+    finally:
+        squatter.close()

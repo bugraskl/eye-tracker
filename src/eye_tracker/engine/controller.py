@@ -218,6 +218,18 @@ LOCK_JOIN_TIMEOUT_S = 2.0
 #: saw the setup assistant must not be locked out by an app they just installed.
 _DISRUPTIVE_AWAY_ACTIONS = frozenset({"lock", "lock_and_display_off", "display_off"})
 
+
+def effective_away_action(settings: Settings) -> str:
+    """The walk-away action that really runs: ``settings.presence.action``, except
+    that a lock or blanked displays only notify while the first-run setup is not
+    finished (see ``_DISRUPTIVE_AWAY_ACTIONS``). The countdown toast announces this
+    one, so it never says "Locking" before a mere notification."""
+    action = settings.presence.action
+    if not settings.general.first_run_done and action in _DISRUPTIVE_AWAY_ACTIONS:
+        return "notify"
+    return action
+
+
 #: IPC commands handled by :meth:`Controller.handle_command`.
 COMMANDS = (
     "show",
@@ -335,13 +347,44 @@ def qt_monitors() -> list[Monitor]:
         monitors.append(
             Monitor(
                 index=index,
-                name=screen.name() or f"Screen {index + 1}",
+                name=screen.name() or _fallback_screen_name(index),
                 rect=Rect(geometry.x(), geometry.y(), geometry.width(), geometry.height()),
                 primary=primary is not None and screen == primary,
                 scale=float(screen.devicePixelRatio()),
             )
         )
     return monitors
+
+
+def _fallback_screen_name(index: int) -> str:
+    """The name :func:`qt_monitors` gives a screen that has none (by position)."""
+    return f"Screen {index + 1}"
+
+
+def _same_monitor(old: Monitor, before: list[Monitor], after: list[Monitor]) -> Monitor | None:
+    """The monitor of the layout ``after`` that is most likely the physical
+    monitor ``old`` of the layout ``before``.
+
+    Indices follow Qt's screen order and say nothing once a screen was added or
+    removed. A screen's name (its connector or device name) follows the monitor
+    even when the desktop is laid out anew, so a name that is unique in both
+    layouts decides first - unless it is merely a positional fallback name.
+    Then the same rectangle, then whichever monitor now covers the old centre.
+    """
+    exact = next((m for m in after if m.name == old.name and m.rect == old.rect), None)
+    if exact is not None:
+        return exact
+    named = [m for m in after if m.name == old.name]
+    if (
+        len(named) == 1
+        and sum(m.name == old.name for m in before) == 1
+        and old.name != _fallback_screen_name(old.index)
+    ):
+        return named[0]
+    same_rect = next((m for m in after if m.rect == old.rect), None)
+    if same_rect is not None:
+        return same_rect
+    return monitor_at(after, *old.rect.center)
 
 
 def _make_vision_worker(
@@ -649,7 +692,12 @@ class Controller(QObject):
 
         # Presence / guard side effects.
         self._warning_shown = False
+        # The walk-away action left the displays off and the session unlocked, so
+        # the displays are to be woken when the user returns (wake_on_return).
         self._displays_off_only = False
+        # The walk-away action turned the displays off (whether or not it also
+        # locked); a lock that fails afterwards leaves them "off only".
+        self._away_displays_off = False
         self._curtain = False
         self._guard_locked = False
         self._guard_relock_until = -math.inf
@@ -671,6 +719,10 @@ class Controller(QObject):
 
         self._hotkeys: HotkeyManager | None = None
         self._hotkeys_suspended = False
+        #: (hotkey name, combination) pairs whose failure was announced. The
+        #: hotkeys are registered again after every stay in Settings → Hotkeys
+        #: (see suspend_hotkeys); a failure that has not changed is not repeated.
+        self._announced_hotkey_failures: set[tuple[str, str]] = set()
         self._screens_connected = False
 
         self._timer = QTimer(self)
@@ -1068,6 +1120,9 @@ class Controller(QObject):
                     backend_factory=self._make_backend_factory(new) if backend_changed else None,
                 )
         if old.hotkeys != new.hotkeys and self._hotkeys is not None:
+            # A deliberate change: report every hotkey that does not work now,
+            # also one that was announced before.
+            self._announced_hotkey_failures.clear()
             self._register_hotkeys()
 
         if self._started and not self._closed:
@@ -1169,7 +1224,40 @@ class Controller(QObject):
             "target_fps": stats.get("target_fps"),
             "cpu_percent": stats.get("cpu_percent"),
             "switches": self._switch_count,
+            "hotkeys": self._hotkey_status(),
         }
+
+    def _hotkey_status(self) -> dict[str, Any]:
+        """The global hotkeys as the OS took them: ``{"registered": [names],
+        "errors": {name: why it is not registered}}``.
+
+        Only this process knows: ``eye-tracker doctor`` reads it through
+        ``status`` (it cannot register anything itself without taking the
+        combinations away from the running app). Empty while hotkeys are off or
+        unsupported here, where nothing is registered on purpose.
+        """
+        manager = self._hotkeys
+        hk = self._settings.hotkeys
+        if manager is None or not hk.enabled or not manager.supported:
+            return {"registered": [], "errors": {}}
+        configured = [name for name in HOTKEY_ACTIONS if str(getattr(hk, name, "") or "").strip()]
+        if self._hotkeys_suspended:
+            # Released on purpose; they come back when the settings dialog is done.
+            released = "released while a shortcut is being recorded in Settings → Hotkeys"
+            return {"registered": [], "errors": dict.fromkeys(configured, released)}
+        try:
+            registered = sorted(str(name) for name in manager.registered)
+        except Exception:
+            log.debug("Reading the registered hotkeys failed", exc_info=True)
+            registered = []
+        errors: dict[str, str] = {}
+        for name in configured:
+            if name in registered:
+                continue
+            reason = self._hotkey_error(manager, name)
+            if reason:
+                errors[name] = reason
+        return {"registered": registered, "errors": errors}
 
     # ================================================================ housekeeping
     def tick(self) -> None:
@@ -1266,7 +1354,14 @@ class Controller(QObject):
         self._presence.reset(now)
         self._away = False
         self._displays_off_only = False
+        self._away_displays_off = False
         self._hide_countdown()
+        # Pointer moves refused around the lock (the lock screen owns the input
+        # desktop until it is noticed, at most LOCK_POLL_S) say nothing about the
+        # unlocked desktop: a backoff armed then must not outlive the lock.
+        self._warp_refusals = 0
+        self._warp_suspensions = 0
+        self._switching_suspended_until = -math.inf
         if self._guard_locked:
             # The user just unlocked a lock the shoulder guard caused. If the
             # onlooker is still there, cover the screens rather than lock again.
@@ -1382,7 +1477,16 @@ class Controller(QObject):
     def _deliver_preview(self) -> None:
         with self._preview_lock:
             frame, self._preview_pending = self._preview_pending, None
-        if frame is not None and self._preview_owners and not self._closed:
+        # A frame the worker captured just before the camera was switched off
+        # (privacy mode, pause, lock) arrives after the state change; shown then,
+        # it would stay on screen under "camera off". Dropped, like the late
+        # observations in _handle_observation.
+        if (
+            frame is not None
+            and self._preview_owners
+            and not self._closed
+            and self._state.camera_active
+        ):
             self.preview_frame.emit(frame)
 
     def _handle_worker_stats(self, stats: WorkerStats) -> None:
@@ -1470,9 +1574,11 @@ class Controller(QObject):
         ):
             self._update_guard(now, None)  # the stream was interrupted: nothing is "continuous"
         self._update_guard(now, None if obs.blind else int(obs.face_count), obs.face_box)
-        # A single face that is not the user's (they left, the onlooker stayed)
-        # is nobody at the keyboard as far as walk-away detection is concerned.
-        self._last_face = False if face and self._guard.owner_missing else face
+        # Every detected face counts as the user for walk-away detection, also
+        # one the shoulder guard judges to be the onlooker's: faces are compared
+        # by their boxes, not recognised, and a wrong "that is not the user"
+        # would lock out a user sitting at their desk (see engine/guard.py).
+        self._last_face = face
         self._update_presence(now)
         self._update_state()
         self._last_decision = None
@@ -1582,9 +1688,13 @@ class Controller(QObject):
         current = self._current_monitor(cursor)
         # No switching (and so no focus change) under the privacy curtain: focus
         # would move to a hidden window, and Esc would no longer reach the curtain.
+        # Nor on the lock screen (tracking goes on there when pause_when_locked is
+        # off): the desktop is not what the user sees, and the system refuses the
+        # pointer moves, which would count towards the refused-warp backoff.
         enabled = (
             self._settings.switching.enabled
             and not self._curtain
+            and not self._session_locked
             and now >= self._switching_suspended_until
         )
         decision = self._decider.update(
@@ -1615,7 +1725,9 @@ class Controller(QObject):
             return None
         if obs.usable and obs.features is not None:
             try:
-                away = model.looks_away(obs.features, self.gaze_feature_indices())
+                away = model.looks_away(
+                    obs.features, self.gaze_feature_indices(), monitors=self._monitors
+                )
                 raw = None if away else model.predict(obs.features)
             except (ValueError, RuntimeError) as exc:
                 self._feature_mismatches += 1
@@ -1628,9 +1740,9 @@ class Controller(QObject):
                 return None
             self._feature_mismatches = 0
             if raw is None:
-                # Far outside the calibrated range (phone, desk, a person beside
-                # the screens): off screen. Forget the last point so a blink right
-                # after does not bring it back, and restart the filter.
+                # The gaze direction points far off every monitor (phone, desk, a
+                # person beside the screens). Forget the last point so a blink
+                # right after does not bring it back, and restart the filter.
                 self._looking_away = True
                 self._last_gaze = None
                 self._last_gaze_time = None
@@ -1910,6 +2022,7 @@ class Controller(QObject):
                     log.info("User returned; waking the displays")
                     self._platform_call("wake_display")
                 self._displays_off_only = False
+                self._away_displays_off = False
 
     def _perform_away_action(self) -> None:
         action = self._settings.presence.action
@@ -1917,9 +2030,10 @@ class Controller(QObject):
         if action == "none":
             return
         setup_pending = not self._settings.general.first_run_done
-        if setup_pending and action in _DISRUPTIVE_AWAY_ACTIONS:
+        effective = effective_away_action(self._settings)
+        if effective != action:
             log.info("First-run setup not finished: notifying instead of %s", action)
-            action = "notify"
+            action = effective
         if action == "notify":
             message = "Nobody has been at the computer for a while."
             if setup_pending:
@@ -1940,9 +2054,12 @@ class Controller(QObject):
                         "This system does not allow it; choose another walk-away action.",
                         force=True,
                     )
+        # Set before the lock is requested: _finish_lock may run synchronously
+        # inside _request_lock, and a failed lock corrects _displays_off_only.
+        self._away_displays_off = display_off and displays_ok
+        self._displays_off_only = self._away_displays_off and not lock
         if lock:
             self._request_lock("away")  # the result arrives in _finish_lock
-        self._displays_off_only = display_off and displays_ok and not lock
 
     def _hide_countdown(self) -> None:
         if self._warning_shown:
@@ -1956,7 +2073,9 @@ class Controller(QObject):
         face_count: int | None,
         face_box: tuple[float, float, float, float] | None = None,
     ) -> None:
-        result = self._guard.update(now, face_count, face_box)
+        # Input tells the guard that someone works at the computer: while it
+        # judges the user gone, that person's face becomes the user's again.
+        result = self._guard.update(now, face_count, face_box, self._input.last_any_activity)
         if result == "trigger":
             self._on_guard_trigger(now)
         elif result == "clear":
@@ -2047,6 +2166,10 @@ class Controller(QObject):
             self._next_lock_check = min(self._next_lock_check, self._clock() + 0.5)
             return
         log.warning("Locking the screen failed or is not supported here")
+        if "away" in purposes and self._away:
+            # The displays may already be off; with the session unlocked they are
+            # "off only" and are woken when the user comes back.
+            self._displays_off_only = self._away_displays_off
         if "away" in purposes:
             self._notify(
                 "Could not lock the screen",
@@ -2116,6 +2239,8 @@ class Controller(QObject):
             self._last_face = None
             self._end_blind_episode()
             self._clear_guard()
+            with self._preview_lock:
+                self._preview_pending = None  # captured while the camera was on
         elif new in (TrackingState.CALIBRATING, TrackingState.CAMERA_ERROR):
             # No observations reach the guard in these states; a run in progress
             # must not survive them.
@@ -2232,8 +2357,41 @@ class Controller(QObject):
         self._implicit_dirty = False
         self._drift.reset()
         self._feature_mismatches = 0
+        changed = False
+        if data is not None and len(self._learner.samples) < len(data.implicit_samples):
+            # The learning capacity was lowered after this profile learned (while
+            # another profile was in use, or in the settings file): load() kept
+            # only what fits, but the stored model was fitted with all of them.
+            changed = self._refit_trimmed_profile(data)
         if save and data is not None and self._library.mark_used(data):
+            changed = True
+        if changed:
             self._write_library(quiet=True)
+
+    def _refit_trimmed_profile(self, data: CalibrationData) -> bool:
+        """Refit ``data`` with the learned samples the learner kept.
+
+        Otherwise the dropped samples would keep steering the gaze (with a
+        capacity of 0, "no learned influence" would not hold) and stay in the
+        file. Returns whether ``data`` changed (and should be saved); on failure
+        the profile is left as it was.
+        """
+        kept = self._learner.samples
+        if data.model.is_fitted:
+            try:
+                data.model = refit_model(data.samples, kept, data.model)
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                log.warning(
+                    "Could not refit the gaze model after trimming learned samples: %s", exc
+                )
+                return False
+        data.implicit_samples = kept
+        log.info(
+            "Learned samples trimmed to the capacity of %d; gaze model refitted with %d",
+            self._learner.max_samples,
+            len(kept),
+        )
+        return True
 
     def _flush_learned(self) -> None:
         """Copy unsaved learned samples into the calibration they belong to."""
@@ -2545,6 +2703,8 @@ class Controller(QObject):
         except Exception:
             log.debug("Releasing hotkeys failed", exc_info=True)
         if not hk.enabled:
+            # Turning them on again announces every failure afresh.
+            self._announced_hotkey_failures.clear()
             with contextlib.suppress(Exception):
                 manager.stop()
             return
@@ -2553,6 +2713,7 @@ class Controller(QObject):
                 log.info("Global hotkeys unavailable: %s", manager.note)
             return
         failed: list[str] = []
+        failing: set[tuple[str, str]] = set()
         for name in HOTKEY_ACTIONS:
             combo = str(getattr(hk, name, "") or "").strip()
             if not combo:
@@ -2562,11 +2723,20 @@ class Controller(QObject):
             except Exception:
                 log.warning("Registering hotkey %s failed", combo, exc_info=True)
                 ok = False
-            if not ok:
-                reason = self._hotkey_error(manager, name)
-                failed.append(
-                    reason or f"{combo} could not be registered (invalid, or used by another app)"
-                )
+            if ok:
+                continue
+            key = (name, combo.lower())
+            failing.add(key)
+            if key in self._announced_hotkey_failures:
+                log.debug("Hotkey %s for %s is still unavailable (already announced)", combo, name)
+                continue
+            reason = self._hotkey_error(manager, name)
+            failed.append(
+                reason or f"{combo} could not be registered (invalid, or used by another app)"
+            )
+        # Pairs that register now (or are no longer configured) are forgotten, so
+        # a combination that fails again later is announced again.
+        self._announced_hotkey_failures = failing
         if failed:
             self._notify(
                 "Hotkey unavailable",
@@ -2647,13 +2817,21 @@ class Controller(QObject):
             return []
 
     def _set_monitors(self, monitors: list[Monitor]) -> None:
+        before = self._monitors
+        assumed = next((m for m in before if m.index == self._assumed_monitor), None)
         self._monitors = list(monitors)
         self._decider.set_monitors(self._monitors)
         sides = [min(m.rect.w, m.rect.h) for m in self._monitors if m.rect.w > 0 and m.rect.h > 0]
         self._min_side = float(min(sides)) if sides else 1000.0
-        if not self._cursor_reliable and not any(
-            m.index == self._assumed_monitor for m in self._monitors
-        ):
+        if self._cursor_reliable:
+            return
+        if assumed is not None:
+            # Monitors are numbered in the order Qt lists the screens, so removing
+            # a screen (or changing the primary) renumbers the others: follow the
+            # physical monitor the pointer was moved to, not its old number.
+            match = _same_monitor(assumed, before, self._monitors)
+            self._assumed_monitor = match.index if match is not None else None
+        if not any(m.index == self._assumed_monitor for m in self._monitors):
             # A stale position is still the best guess until the first switch.
             cursor = self._cursor_pos()
             monitor = monitor_at(self._monitors, *cursor) if cursor else None

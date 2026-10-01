@@ -4,9 +4,14 @@
 JSON-friendly dict and :func:`format_report` renders it for humans. Collection
 never fails as a whole: a section that cannot be gathered carries an ``error``
 entry instead. The report is meant to be pasted into public bug reports, so it
-must not reveal the user's account name: paths are shown relative to the home
-directory (``~``), camera files by their name only, and nothing derived from
-the user name (such as the instance socket name) is included.
+must not reveal the user's account name: the home directory is shown as ``~``
+wherever it appears (paths, quoted paths, error messages), camera files by
+their name only, camera device links without their serial number, and nothing
+derived from the user name (such as the instance socket name) is included.
+
+Whether the global hotkeys could be registered is only known to the app that
+registered them: the settings window passes its hotkey manager in, and the
+command-line ``doctor`` asks a running instance (``status``).
 
 :func:`run_bench` measures what the vision pipeline costs on this machine, once
 as fast as possible and once at the rate the app uses while you sit still.
@@ -14,26 +19,30 @@ as fast as possible and once at the rate the app uses while you sit still.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.metadata
 import json
 import logging
 import os
 import platform as py_platform
-import shlex
-import subprocess
+import re
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from . import APP_NAME, __version__, paths
+from .cli import FROZEN_CLI_NAME, cli_command, format_command
 from .config import Settings, describe_settings
 from .platform.base import PlatformServices
 from .types import Monitor, Rect, layout_signature, virtual_bounds
+
+if TYPE_CHECKING:
+    from .platform.hotkeys import HotkeyManager
 
 __all__ = [
     "BenchError",
@@ -78,6 +87,35 @@ _WAYLAND_CURSOR_NOTE = (
     "ydotool 1.x with ydotoold running and a flat pointer-acceleration profile for "
     "ydotool's virtual device (ydotool 0.1 is not supported)"
 )
+#: ``eye-tracker-cli`` on macOS: the system judges the Accessibility permission of
+#: whatever started the command (the terminal), so the app's own grant is unknown.
+_MAC_CLI_ACCESSIBILITY_NOTE = (
+    "unknown from the command line: macOS judges the Accessibility permission of the "
+    "program that started this command (the terminal), not the app's own. The app's "
+    "Settings > Diagnostics shows the app's state"
+)
+#: A lock tool being installed does not mean it locks this session: loginctl is
+#: on every systemd system, but a bare i3/sway session has nothing listening.
+_LINUX_LOCK_NOTE = (
+    "only shows which lock tools are installed; whether one locks this session is "
+    "known when it is tried. If nothing locks, you get a 'Could not lock the screen' "
+    "notification: test it once with a short 'After ... s away'"
+)
+#: ``hotkeys.registration`` when no running app can say what the OS accepted.
+_HOTKEYS_NOT_RUNNING = (
+    "unknown: Eye Tracker is not running. When it starts, a hotkey the system refuses "
+    "(for example because another app uses it) is reported in a 'Hotkey unavailable' "
+    "notification and in the log"
+)
+_HOTKEYS_NOT_REPORTED = (
+    "unknown: the running app does not report it; see its 'Hotkey unavailable' "
+    "notification or the log"
+)
+#: How long ``doctor`` waits for the running instance's ``status``.
+_STATUS_TIMEOUT_MS = 1000
+#: The serial number at the end of a udev ``/dev/v4l/by-id`` name
+#: (``usb-<vendor>_<model>_<serial>-video-index0``).
+_BY_ID_SERIAL = re.compile(r"_[^_/]+(-video-index\d+)$")
 
 #: Shown for empty values. Reports are pasted into bug reports and printed on
 #: consoles with legacy code pages, so the text output is kept ASCII-only.
@@ -95,10 +133,16 @@ class _State:
 
 
 # ======================================================================= doctor
-def collect_report(probe_cameras: bool = False) -> dict[str, Any]:
+def collect_report(
+    probe_cameras: bool = False, *, hotkey_manager: HotkeyManager | None = None
+) -> dict[str, Any]:
     """Gather diagnostics. Creates a ``QGuiApplication`` if none exists (for monitors).
 
-    ``probe_cameras`` briefly opens camera indices 0-3 (their lights may flash).
+    Args:
+        probe_cameras: Briefly open camera indices 0-3 (their lights may flash).
+        hotkey_manager: The app's own hotkey manager (the settings window passes
+            it), which knows what the OS accepted. Without it, a running
+            instance is asked for its ``status``.
     """
     services = _platform_services()
     settings, settings_info = _settings_section()
@@ -112,14 +156,18 @@ def collect_report(probe_cameras: bool = False) -> dict[str, Any]:
         "backends": _safe(lambda: _backends_section(settings)),
         "cameras": _safe(lambda: _cameras_section(settings, probe_cameras)),
         "platform": _safe(lambda: _platform_section(services)),
-        "hotkeys": _safe(lambda: _hotkeys_section(settings)),
-        "autostart": _safe(_autostart_section),
-        "paths": _safe(_paths_section),
-        "settings": settings_info,
     }
+    running = _instance_running(report)
+    report["hotkeys"] = _safe(lambda: _hotkeys_section(settings, hotkey_manager, running))
+    report["autostart"] = _safe(_autostart_section)
+    report["paths"] = _safe(_paths_section)
+    report["settings"] = settings_info
     report["calibration"] = _safe(lambda: _calibration_section(report, settings))
     report["problems"] = _problems(report)
-    return report
+    # Every section redacts its paths; this catches what they cannot foresee
+    # (an OS error quoting a file under the home directory, a note, ...).
+    redacted: dict[str, Any] = _redact_tree(report)
+    return redacted
 
 
 def format_report(report: dict[str, Any]) -> str:
@@ -187,7 +235,12 @@ def _safe(collect: Callable[[], Any]) -> Any:
         return collect()
     except Exception as exc:
         log.debug("Diagnostics section failed", exc_info=True)
-        return {"error": f"{type(exc).__name__}: {exc}"}
+        return {"error": _error_text(exc)}
+
+
+def _error_text(exc: BaseException) -> str:
+    """``"PermissionError: …"`` without the home directory (OS errors quote paths)."""
+    return _redact(f"{type(exc).__name__}: {exc}") or type(exc).__name__
 
 
 def _platform_services() -> PlatformServices:
@@ -214,6 +267,9 @@ def _app_section() -> dict[str, Any]:
         "version": __version__,
         "frozen": paths.is_frozen(),
         "executable": _redact(sys.executable),
+        # What "eye-tracker ..." means for this copy (release packages do not
+        # put an eye-tracker command on the PATH).
+        "command_line": _redacted_command(cli_command()),
         "python": py_platform.python_version(),
         "implementation": py_platform.python_implementation(),
         "instance_running": running,
@@ -346,7 +402,7 @@ def _backends_section(settings: Settings) -> dict[str, Any]:
         out["feature_version"] = cls.feature_version
     except BackendUnavailable as exc:
         out["active"] = None
-        out["active_error"] = str(exc)
+        out["active_error"] = _redact(str(exc))
     return out
 
 
@@ -378,14 +434,25 @@ def _platform_section(services: PlatformServices) -> dict[str, Any]:
     accessibility = _accessibility_status(services)
     if accessibility != "unknown":
         out["accessibility"] = accessibility
+    lock_methods = _lock_methods(services)
+    if lock_methods is not None:
+        out["lock_methods"] = lock_methods
     notes: dict[str, str] = {}
     if sys.platform.startswith("linux"):
         notes["camera_release"] = _LINUX_CAMERA_NOTE
         if services.is_wayland:
             notes["cursor"] = _WAYLAND_CURSOR_NOTE
+        notes["lock"] = _LINUX_LOCK_NOTE
+    if sys.platform == "darwin" and out["permissions"].get("accessibility") is None and _is_cli():
+        notes["accessibility"] = _MAC_CLI_ACCESSIBILITY_NOTE
     if notes:
         out["notes"] = notes
     return out
+
+
+def _is_cli() -> bool:
+    """Whether this is the console executable of a release package (``eye-tracker-cli``)."""
+    return paths.is_frozen() and Path(sys.executable).stem.lower() == FROZEN_CLI_NAME
 
 
 def _accessibility_status(services: PlatformServices) -> str:
@@ -397,14 +464,43 @@ def _accessibility_status(services: PlatformServices) -> str:
         return "unknown"
 
 
-def _hotkeys_section(settings: Settings) -> dict[str, Any]:
+def _lock_methods(services: PlatformServices) -> list[str] | None:
+    """The screen-lock methods available here, in the order they are tried.
+
+    Read from ``services.lock_methods()`` where the platform provides it;
+    ``None`` otherwise (the ``lock`` capability is all that is known then).
+    """
+    getter = getattr(services, "lock_methods", None)
+    if not callable(getter):
+        return None
+    try:
+        return [str(method) for method in getter()]
+    except Exception:
+        log.debug("lock_methods() failed", exc_info=True)
+        return None
+
+
+#: ``settings.hotkeys`` fields, in the order the settings window shows them.
+_HOTKEY_NAMES = ("toggle_tracking", "toggle_privacy", "recalibrate")
+
+
+def _hotkeys_section(
+    settings: Settings, live_manager: HotkeyManager | None, running: bool
+) -> dict[str, Any]:
+    """Configured hotkeys, what is wrong with them, and what the OS accepted.
+
+    ``doctor`` cannot register anything itself (a running app holds its
+    hotkeys, and grabbing them would change global state), so registration
+    results come from ``live_manager`` (the app's own manager) or a running
+    instance; otherwise they are unknown.
+    """
     from .platform.hotkeys import create_hotkey_manager, parse_hotkey
 
     manager = create_hotkey_manager()
     configured: dict[str, Any] = {}
     invalid: dict[str, str] = {}
     conflicts: dict[str, str] = {}
-    for name in ("toggle_tracking", "toggle_privacy", "recalibrate"):
+    for name in _HOTKEY_NAMES:
         text = getattr(settings.hotkeys, name)
         configured[name] = text
         if not text:
@@ -423,7 +519,7 @@ def _hotkeys_section(settings: Settings) -> dict[str, Any]:
             conflict = None
         if conflict:
             conflicts[name] = conflict
-    return {
+    out: dict[str, Any] = {
         "enabled": settings.hotkeys.enabled,
         "backend": manager.name,
         "supported": bool(manager.supported),
@@ -432,6 +528,81 @@ def _hotkeys_section(settings: Settings) -> dict[str, Any]:
         "invalid": invalid,
         "layout_conflicts": conflicts,
     }
+    wanted = [name for name in _HOTKEY_NAMES if configured[name] and name not in invalid]
+    if settings.hotkeys.enabled and wanted and manager.supported:
+        out["registration"] = _hotkey_registration(wanted, live_manager, running)
+    return out
+
+
+def _hotkey_registration(
+    names: Sequence[str], live_manager: HotkeyManager | None, running: bool
+) -> dict[str, str] | str:
+    """``{name: "registered" | "not registered: <why>"}``, or why that is unknown."""
+    if live_manager is not None:
+        registered = set(live_manager.registered)
+        errors: dict[str, str] = {}
+        for name in names:
+            try:
+                reason = live_manager.last_error(name)
+            except Exception:
+                log.debug("last_error(%s) failed", name, exc_info=True)
+                reason = None
+            if reason:
+                errors[name] = str(reason)
+    elif not running:
+        return _HOTKEYS_NOT_RUNNING
+    else:
+        live = _instance_hotkeys()
+        if live is None:
+            return _HOTKEYS_NOT_REPORTED
+        registered, errors = live
+    return {
+        name: "registered"
+        if name in registered
+        else f"not registered: {errors.get(name) or 'reason unknown'}"
+        for name in names
+    }
+
+
+def _instance_hotkeys() -> tuple[set[str], dict[str, str]] | None:
+    """What the running instance's ``status`` says about its hotkeys.
+
+    ``(registered names, {name: why it is not registered})``; ``None`` when the
+    instance does not answer or does not report its hotkeys (an older version).
+    """
+    status = _instance_status()
+    hotkeys = status.get("hotkeys") if status is not None else None
+    if not isinstance(hotkeys, Mapping):
+        return None
+    registered = hotkeys.get("registered")
+    # A list of names, or a {name: hotkey} mapping: iterating gives the names.
+    names = {str(n) for n in registered} if isinstance(registered, (list, Mapping)) else set()
+    raw_errors = hotkeys.get("errors")
+    errors = (
+        {str(k): str(v) for k, v in raw_errors.items() if v}
+        if isinstance(raw_errors, Mapping)
+        else {}
+    )
+    return names, errors
+
+
+def _instance_status() -> dict[str, Any] | None:
+    """The running instance's ``status`` (read-only), or ``None``."""
+    from . import ipc
+
+    try:
+        _ensure_gui_app()  # before ipc creates a plain QCoreApplication
+        reply = ipc.send_command("status", timeout_ms=_STATUS_TIMEOUT_MS)
+    except Exception:
+        log.debug("Asking the running instance for its status failed", exc_info=True)
+        return None
+    if not reply or reply.startswith("error"):
+        return None
+    try:
+        data = json.loads(reply)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _autostart_section() -> dict[str, Any]:
@@ -481,7 +652,7 @@ def _settings_section() -> tuple[Settings, dict[str, Any]]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             info["valid"] = False
-            info["error"] = f"{type(exc).__name__}: {exc}"
+            info["error"] = _error_text(exc)
         else:
             settings = Settings.from_dict(data)
             info["valid"] = isinstance(data, dict)
@@ -662,6 +833,11 @@ def _problems(report: dict[str, Any]) -> list[str]:
     if hotkeys.get("enabled"):
         for name, conflict in (hotkeys.get("layout_conflicts") or {}).items():
             problems.append(f"Hotkey {name} cannot be used: {conflict}.")
+        registration = hotkeys.get("registration")
+        for name, result in (registration if isinstance(registration, dict) else {}).items():
+            reason = str(result).removeprefix("not registered: ")
+            if reason != result and name not in (hotkeys.get("layout_conflicts") or {}):
+                problems.append(f"Hotkey {name} could not be registered: {reason}.")
 
     autostart_info = report.get("autostart") or {}
     if autostart_info.get("status") == "stale":
@@ -676,7 +852,11 @@ def _problems(report: dict[str, Any]) -> list[str]:
 
     calibration = report.get("calibration") or {}
     if calibration.get("exists") is False:
-        problems.append('Not calibrated yet: run "eye-tracker calibrate".')
+        # Spelled as this copy is run: release packages have no "eye-tracker" command.
+        command = _redacted_command(cli_command("calibrate"))
+        problems.append(
+            f"Not calibrated yet: choose 'Calibrate...' in the tray menu or run '{command}'."
+        )
     elif calibration.get("valid") is False:
         problems.append("The calibration file is damaged; please recalibrate.")
     elif calibration.get("compatible") is False:
@@ -787,13 +967,6 @@ def _ensure_gui_app() -> Any:
     return app if isinstance(app, QGuiApplication) else None
 
 
-def format_command(parts: Sequence[str]) -> str:
-    """Render a command as the user would type it on this OS."""
-    if os.name == "nt":
-        return subprocess.list2cmdline(list(parts))
-    return shlex.join(parts)
-
-
 def _get_setting(settings: Settings, dotted: str) -> Any:
     section_name, _, field_name = dotted.partition(".")
     section = getattr(settings, section_name)
@@ -811,24 +984,72 @@ def _sha256(path: Path) -> str:
 
 
 def _redact(value: str | os.PathLike[str] | None) -> str | None:
-    """Replace the home directory prefix with ``~``."""
+    """Replace the home directory with ``~`` wherever it appears in ``value``.
+
+    Not only as a prefix: paths also turn up quoted (Explorer's "Copy as path"
+    in *Pause while these apps run*), inside OS error messages and with either
+    slash. A longer name that merely starts with the home path (``/home/al``
+    in ``/home/alice``) is left alone.
+    """
     if value is None:
         return None
     text = os.fspath(value)
-    home = str(Path.home())
-    if not home or len(home) < 2:
-        return text
-    same = text.lower().startswith(home.lower()) if os.name == "nt" else text.startswith(home)
-    if same and (len(text) == len(home) or text[len(home)] in "/\\"):
-        return "~" + text[len(home) :]
-    return text
+    pattern = _home_pattern()
+    return pattern.sub("~", text) if pattern is not None else text
+
+
+def _home_pattern() -> re.Pattern[str] | None:
+    """Regex matching every spelling of the home directory, longest first."""
+    homes = {str(Path.home())}
+    with contextlib.suppress(OSError, RuntimeError):
+        homes.add(str(Path.home().resolve()))  # e.g. /home -> /var/home
+    alternatives = []
+    for home in sorted(homes, key=len, reverse=True):
+        parts = re.split(r"[\\/]+", home)
+        if len("".join(parts)) < 2:
+            continue  # "/" or "C:\" alone would redact everything
+        # Either slash matches either separator ("C:/Users/..." from Qt).
+        alternatives.append(r"[\\/]+".join(re.escape(part) for part in parts))
+    if not alternatives:
+        return None
+    # Case-insensitive file systems: C:\USERS\ALICE is the same directory.
+    flags = re.IGNORECASE if os.name == "nt" or sys.platform == "darwin" else 0
+    # Not followed by a character that would continue the last name (alice2, alice.old).
+    return re.compile("(?:" + "|".join(alternatives) + r")(?![\w.\-])", flags)
+
+
+def _redact_tree(value: Any) -> Any:
+    """``value`` with :func:`_redact` applied to every string in nested dicts and lists."""
+    pattern = _home_pattern()
+    if pattern is None:
+        return value
+
+    def walk(item: Any) -> Any:
+        if isinstance(item, str):
+            return pattern.sub("~", item)
+        if isinstance(item, dict):
+            return {key: walk(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [walk(child) for child in item]
+        return item
+
+    return walk(value)
 
 
 def _describe_device(device: str) -> str:
+    """A camera setting as a report may show it: no directories, no serial number."""
     spec = device.strip()
     if spec.isdigit():
         return f"camera {spec}"
-    return f"file {Path(spec).name}" if spec else "none"
+    if not spec:
+        return "none"
+    name = Path(spec).name
+    if spec.startswith("/dev/"):
+        # /dev/videoN or a udev link; by-id names end in the camera's serial.
+        if "/by-id/" in spec:
+            name = _BY_ID_SERIAL.sub(r"_*\1", name)
+        return f"device {name}"
+    return f"file {name}"
 
 
 # ======================================================================== bench

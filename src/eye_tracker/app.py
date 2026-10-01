@@ -11,8 +11,11 @@ loop. The startup order matters:
    (DPI awareness and Qt environment variables), then the ``QApplication``;
 3. the single-instance check: whoever takes the :class:`~eye_tracker.ipc.InstanceLock`
    is the instance. Otherwise (or if an older version answers) the running app
-   is asked to show itself (or to calibrate) and this process exits without
-   touching the log file or the settings;
+   is asked to show itself (or to calibrate; a login start only checks that it
+   answers) and this process exits without touching the log file or the
+   settings. An instance that is shutting down no longer answers but still
+   holds the lock for a moment: the launch waits for it to exit and then
+   becomes the instance;
 4. file logging, settings, the command socket, the
    :class:`~eye_tracker.engine.controller.Controller` and the UI; once the
    event loop runs, the login item is pointed at this copy if it moved.
@@ -43,11 +46,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QObject, Qt, QTimer
+from PySide6.QtCore import QEventLoop, QObject, Qt, QTimer
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from . import APP_AUTHOR, APP_NAME, APP_SLUG, __version__, ipc, paths
+from .cli import cli_command_text
 from .config import Settings
 from .logging_setup import install_qt_message_handler, set_level, setup_logging
 from .platform import get_platform
@@ -103,13 +107,31 @@ _QUIT_DELAY_MS = 100
 _AFTER_QUIET_MS = 250
 #: Settings that ``--camera`` / ``--backend`` override for one session.
 _OVERRIDABLE = {"camera": "camera.device", "backend": "general.backend"}
+#: Options that only a new instance applies: (``argparse`` attribute, option).
+_STARTUP_ONLY_OPTIONS = (
+    ("trace", "--trace"),
+    ("camera", "--camera"),
+    ("backend", "--backend"),
+)
+#: How long a launch keeps waiting for an instance that holds the lock but does
+#: not answer, after :data:`~eye_tracker.ipc.STARTUP_WAIT_MS`: one that is shutting
+#: down (its event loop has stopped while it releases the camera, which can take
+#: a few seconds) exits within this time, and the launch then takes its place.
+HANDOVER_WAIT_MS = 10_000
+#: Reply timeout for each retry during :data:`HANDOVER_WAIT_MS`.
+_HANDOVER_REPLY_MS = 500
+#: Pause between two retries during :data:`HANDOVER_WAIT_MS`.
+_HANDOVER_RETRY_MS = 250
+#: Part of the reply of an instance that cannot take commands yet or any more.
+_BUSY_MARKER = "is starting or shutting down"
 
 
 @dataclass(frozen=True, slots=True)
 class AppOptions:
     """Command-line switches that change how the app starts."""
 
-    #: Started at login: no first-run wizard, no startup notifications.
+    #: Started at login: no first-run wizard, no startup notifications, and an
+    #: instance that is already running is not asked to show itself.
     background: bool = False
     #: Open the calibration right after start.
     calibrate: bool = False
@@ -220,25 +242,31 @@ def build_app(
     # Single instance. Taking the lock is atomic, so of two launches racing each
     # other exactly one becomes the instance; the other hands its request over
     # (waiting for the winner to start listening) and leaves.
-    request = "calibrate" if options.calibrate else "show"
+    request = _handover_request(options)
     lock = ipc.InstanceLock()
     owner = lock.acquire()
     try:
         # The owner asks too: an instance of a version without the lock answers.
         # A launch that lost the lock waits for the winner to start listening.
         reply = ipc.send_command(request, wait_ms=0 if owner else ipc.STARTUP_WAIT_MS)
+        if not owner and (reply is None or _is_busy(reply)):
+            owner, reply = _wait_for_handover(lock, request)
     except BaseException:
         lock.release()  # never keep a later launch out after failing here
         raise
-    if reply is not None:
+    if reply is not None and not _is_busy(reply):
         lock.release()
         if reply.startswith("error"):
             log.warning("The running instance refused %r: %s", request, reply)
             return AppContext(qt_app, exit_code=1)
         log.info("%s is already running; asked it to %s", APP_NAME, request)
+        _warn_startup_options_ignored(args)
         return AppContext(qt_app, exit_code=0)
-    if not owner:
-        log.error("Another instance holds %s but does not answer; exiting", lock.path)
+    if not owner or reply is not None:
+        # Nobody answered in time, or only "starting or shutting down" (from an
+        # older version without the lock, when this process holds it).
+        lock.release()
+        log.error("Another instance (lock %s) does not answer; exiting", lock.path)
         _show_error(qt_app, f"{APP_NAME} is already running but does not respond.")
         return AppContext(qt_app, exit_code=1)
 
@@ -270,7 +298,7 @@ def build_app(
             server.close()
             app.shutdown()
             return AppContext(qt_app, exit_code=1)
-        log.warning("Command socket unavailable; 'eye-tracker ctl' will not work")
+        log.warning("Command socket unavailable; '%s' will not work", cli_command_text("ctl"))
 
     try:
         app.start()
@@ -550,7 +578,8 @@ class EyeTrackerApp(QObject):
         commands come back through ``ui_requested``)."""
         controller = self._controller
         if controller is None or self._closed:
-            return f"error: {APP_NAME} is starting or shutting down; try again"
+            # A second launch that gets this waits for the instance (_is_busy).
+            return f"error: {APP_NAME} {_BUSY_MARKER}; try again"
         return str(controller.handle_command(command))
 
     def present(self) -> None:
@@ -592,6 +621,7 @@ class EyeTrackerApp(QObject):
                 dialog.deleteLater()
             dialog = SettingsDialog(self._controller)
             dialog.calibration_requested.connect(self._on_settings_calibrate)
+            dialog.setup_requested.connect(self._on_settings_setup)
             dialog.finished.connect(functools.partial(self._on_settings_closed, dialog))
             self._settings_dialog = dialog
         _present(dialog)
@@ -685,6 +715,12 @@ class EyeTrackerApp(QObject):
 
     def _on_settings_calibrate(self) -> None:
         self.open_calibration("settings")
+
+    def _on_settings_setup(self) -> None:
+        # Opened right away rather than "at next start": waiting meant storing
+        # first_run_done=False, which also switches the walk-away lock to a
+        # notification until the assistant is finished (see the controller).
+        self.open_wizard()
 
     def _on_wizard_calibrate(self) -> None:
         self.open_calibration("wizard")
@@ -905,7 +941,12 @@ class EyeTrackerApp(QObject):
         QTimer.singleShot(int(delay * 1000) + _AFTER_QUIET_MS, self, callback)
 
     def _setup_pending(self) -> bool:
-        """The first-run setup was never finished (or was asked for again)."""
+        """The first-run setup was never finished.
+
+        Nothing in the UI sets ``first_run_done`` back to ``False``: running the
+        assistant again from the settings opens it at once (see
+        :meth:`_on_settings_setup`), so the walk-away lock stays in force.
+        """
         controller = self._controller
         return controller is not None and not controller.settings.general.first_run_done
 
@@ -963,6 +1004,88 @@ class EyeTrackerApp(QObject):
 
 
 # ======================================================================= helpers
+def _handover_request(options: AppOptions) -> str:
+    """What a launch asks an instance that is already running to do.
+
+    A login start (``--background``) must not pop anything up there (the tray
+    menu, the setup assistant or the settings take the keyboard from whatever
+    the user is typing in), so it only asks for ``status``, which just proves
+    that the instance answers.
+    """
+    if options.calibrate:
+        return "calibrate"
+    return "status" if options.background else "show"
+
+
+def _is_busy(reply: str) -> bool:
+    """Whether ``reply`` says the instance cannot take commands yet or any more."""
+    return reply.startswith("error") and _BUSY_MARKER in reply
+
+
+def _wait_for_handover(lock: ipc.InstanceLock, request: str) -> tuple[bool, str | None]:
+    """Wait for an instance that holds ``lock`` but did not answer ``request``.
+
+    Such an instance is usually shutting down: ``aboutToQuit`` stops the camera
+    with the event loop already stopped, while the lock (and the socket, which
+    still accepts connections) are released only afterwards. Giving up at once
+    would leave nothing running once it has exited: the classic "quit from the
+    tray and start again right away". So until :data:`HANDOVER_WAIT_MS` has
+    passed, this takes the lock as soon as it is free, or hands ``request``
+    over if the instance answers after all.
+
+    Returns ``(owner, reply)``: ``(True, None)`` when this process now holds
+    the lock (it becomes the instance); otherwise the last reply (``None``, or
+    a "starting or shutting down" error) or the first real answer.
+    """
+    log.info("The running instance does not answer; waiting for it (it may be shutting down)")
+    deadline = time.monotonic() + HANDOVER_WAIT_MS / 1000.0
+    reply: str | None = None
+    while True:
+        if lock.acquire():
+            log.info("The previous instance has exited; starting")
+            return True, None
+        reply = ipc.send_command(request, timeout_ms=_HANDOVER_REPLY_MS)
+        if reply is not None and not _is_busy(reply):
+            return False, reply
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            return False, reply
+        _wait_ms(min(_HANDOVER_RETRY_MS, remaining_ms))
+
+
+def _wait_ms(ms: int) -> None:
+    """Wait ``ms`` while still processing timers and socket events (not user input)."""
+    loop = QEventLoop()
+    QTimer.singleShot(max(1, int(ms)), loop.quit)
+    loop.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+
+def _warn_startup_options_ignored(args: argparse.Namespace) -> None:
+    """Say which options had no effect because the request went to a running instance.
+
+    ``--trace``, ``--camera`` and ``--backend`` are applied when an instance
+    starts; a launch that only hands a request over cannot change the running
+    one, and silently dropping them left users waiting for a trace file that
+    never appeared.
+    """
+    ignored = [
+        option for attribute, option in _STARTUP_ONLY_OPTIONS if getattr(args, attribute, None)
+    ]
+    if not ignored:
+        return
+    log.warning(
+        "%s is already running, so %s %s not applied: %s only when %s starts. Quit it "
+        "first (tray menu > Quit %s, or '%s'), then run the command again.",
+        APP_NAME,
+        ", ".join(ignored),
+        "was" if len(ignored) == 1 else "were",
+        "it applies" if len(ignored) == 1 else "they apply",
+        APP_NAME,
+        APP_NAME,
+        cli_command_text("ctl", "quit"),
+    )
+
+
 def _apply_overrides(settings: Settings, args: argparse.Namespace) -> dict[str, tuple[str, str]]:
     """Apply ``--camera`` / ``--backend`` for this session.
 

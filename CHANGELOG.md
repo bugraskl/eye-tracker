@@ -30,6 +30,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - `eye-tracker ctl status` reports split-pane focus in a `panes` block, and `--trace` records the
   pane decisions (pane ids only).
 
+### Fixed
+
+- Windows: started from a terminal inside a packaged (MSIX) app, Eye Tracker took its own use of the
+  camera for another app's and released the camera every few seconds. It now also recognises its
+  interpreter under the redirected path that Windows records.
+
 ## [0.1.0] - 2026-10-01
 
 ### Added

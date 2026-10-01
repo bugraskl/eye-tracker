@@ -222,7 +222,7 @@ Glance Switch inspired this project. This comparison uses the features listed on
 | Source code | Open | Closed |
 | Network use | None | Licence key check + daily update check |
 | Tracking | Head pose + iris landmarks | Head pose (+ eye position for panes) |
-| Split-pane focus in terminals and editors | Terminals (experimental) | ✅ |
+| Split-pane focus in terminals and editors | Experimental: terminals, Claude and ChatGPT/Codex desktop apps | ✅ |
 | Learns from your mouse use | ✅ | ✅ (from clicks) |
 | Walk-away lock / displays off | ✅ | Not listed |
 | Shoulder-surfer guard | ✅ | Not listed |

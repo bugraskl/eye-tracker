@@ -60,6 +60,7 @@
     <symbol id="i-eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l18 18"/><path d="M10.6 5.1A10.4 10.4 0 0 1 12 5c6 0 10 7 10 7a17 17 0 0 1-3.2 3.9M6.6 6.6C3.9 8.4 2 12 2 12s4 7 10 7c1.6 0 3-.4 4.3-1"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></symbol>
     <symbol id="i-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14a6 6 0 0 1 3.5 6"/></symbol>
     <symbol id="i-video" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="m16 10 6-3v10l-6-3"/></symbol>
+    <symbol id="i-split" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="16" rx="2"/><path d="M12 4v16"/><path d="m15.5 12 2 0M6.5 12h2"/></symbol>
     <symbol id="i-monitors" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="4" width="9.5" height="7.5" rx="1.2"/><rect x="13" y="4" width="9.5" height="7.5" rx="1.2"/><rect x="7" y="14" width="10" height="6.5" rx="1.2"/></symbol>
     <symbol id="i-gauge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 17a9 9 0 1 1 17 0"/><path d="m12 13 4-5"/><circle cx="12" cy="13" r="1.4"/></symbol>
     <symbol id="i-power" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/></symbol>
@@ -217,6 +218,7 @@
               <li class="row"><svg aria-hidden="true"><use href="#i-shield"/></svg><div><strong>Grace while you work</strong><p>Nothing switches while you type or use the mouse, or for a moment after.</p></div><span class="value">2 s / 1.5 s</span></li>
               <li class="row"><svg aria-hidden="true"><use href="#i-book"/></svg><div><strong>Reading-aware</strong><p>Copying from a document on the other screen? Your editor keeps focus while you pause to read.</p></div><span class="value"><span class="combo">6 s<svg aria-hidden="true"><use href="#i-chevron"/></svg></span></span></li>
               <li class="row"><svg aria-hidden="true"><use href="#i-phone"/></svg><div><strong>Ignore glances away</strong><p>Looking at your phone or keyboard is recognised from your calibrated range, and ignored.</p></div><span class="value">Always</span></li>
+              <li class="row"><svg aria-hidden="true"><use href="#i-split"/></svg><div><strong>Follow split panes</strong><p>Look at another pane of Windows Terminal, tmux or WezTerm, or another session in the Claude or ChatGPT/Codex desktop app, and it gets the keyboard focus. Experimental.</p></div><span class="value">Off<span class="switch" aria-hidden="true"></span></span></li>
               <li class="row"><svg aria-hidden="true"><use href="#i-cursor"/></svg><div><strong>Cursor lands at</strong><p>Where you left it on that monitor, its centre, or the point you look at.</p></div><span class="value"><span class="combo">Last position<svg aria-hidden="true"><use href="#i-chevron"/></svg></span></span></li>
             </ul>
           </div>
@@ -282,7 +284,7 @@
               <tr><th scope="row">Source code</th><td class="us">Open</td><td>Closed</td></tr>
               <tr><th scope="row">Network use</th><td class="us">None</td><td>Licence key check and daily update check</td></tr>
               <tr><th scope="row">Tracking</th><td class="us">Head pose + iris landmarks</td><td>Head pose (+ eye position for panes)</td></tr>
-              <tr><th scope="row">Split-pane focus in terminals and editors</th><td class="us"><span class="mark no"><svg aria-hidden="true"><use href="#i-no"/></svg>Not yet</span></td><td><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Yes</span></td></tr>
+              <tr><th scope="row">Split-pane focus in terminals and editors</th><td class="us"><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Experimental: Windows Terminal, tmux, WezTerm, Claude and ChatGPT/Codex desktop apps (code editors next)</span></td><td><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Yes</span></td></tr>
               <tr><th scope="row">Learns from your mouse use</th><td class="us"><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Yes</span></td><td><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Yes (from clicks)</span></td></tr>
               <tr><th scope="row">Walk-away lock / displays off</th><td class="us"><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Yes</span></td><td><span class="mark no"><svg aria-hidden="true"><use href="#i-no"/></svg>Not listed</span></td></tr>
               <tr><th scope="row">Shoulder-surfer guard</th><td class="us"><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Yes</span></td><td><span class="mark no"><svg aria-hidden="true"><use href="#i-no"/></svg>Not listed</span></td></tr>
@@ -385,6 +387,10 @@ uv run eye-tracker</code></pre>
           <details>
             <summary>What happens when I look at my phone?<svg aria-hidden="true"><use href="#i-chevron"/></svg></summary>
             <p>Glances away from every monitor are recognised from your calibrated range of head and eye movement, and ignored.</p>
+          </details>
+          <details>
+            <summary>Can it switch between split panes or AI sessions?<svg aria-hidden="true"><use href="#i-chevron"/></svg></summary>
+            <p>Yes, experimentally. Turn on <em>Follow split panes</em> and the pane you look at gets the keyboard focus in Windows Terminal, tmux and WezTerm. On Windows you can also opt in for two Claude sessions side by side or a ChatGPT/Codex conversation next to its side chat. Panes must be large enough for your calibration's accuracy, and nothing switches while you type. Support for VS Code, Cursor, Antigravity and JetBrains IDEs is next.</p>
           </details>
           <details>
             <summary>Does it record me?<svg aria-hidden="true"><use href="#i-chevron"/></svg></summary>

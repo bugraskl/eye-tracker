@@ -226,7 +226,7 @@ Bu proje Glance Switch'ten ilham aldı. Karşılaştırma, [glanceswitch.com](ht
 | Kaynak kod | Açık | Kapalı |
 | Ağ kullanımı | Yok | Lisans anahtarı kontrolü + günlük güncelleme kontrolü |
 | İzleme | Baş pozu + iris noktaları | Baş pozu (+ paneller için göz konumu) |
-| Terminal ve editörlerde bölünmüş panel odağı | Terminallerde (deneysel) | ✅ |
+| Terminal ve editörlerde bölünmüş panel odağı | Deneysel: terminaller, Claude ve ChatGPT/Codex masaüstü uygulamaları | ✅ |
 | Fare kullanımından öğrenme | ✅ | ✅ (tıklamalardan) |
 | Uzaklaşınca kilit / ekranları kapatma | ✅ | Listelenmemiş |
 | Omuz koruması | ✅ | Listelenmemiş |

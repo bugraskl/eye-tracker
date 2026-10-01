@@ -170,6 +170,16 @@ ROI_SETTLE_SCALE = 0.035
 #: the observation, see ``VisionBackend.settled``), so a steadily moving head
 #: costs no extra inference.
 ROI_CATCH_UP_SHIFT = 0.08
+#: ... provided that the network is sure it sees a face in the crop (a presence
+#: logit of at least this). Far behind a large jump, an upward one especially,
+#: the network follows the face only a fraction of the way per pass, so a crop
+#: can ask for a shift below ROI_CATCH_UP_SHIFT while its landmarks are still
+#: 35-45 px (12-20° of pitch) off. Measured on drawn faces after such jumps,
+#: those crops scored a logit of 4-6, crops in the same band that were on the
+#: face (landmarks within 1.5 px) 19-23; for photos see ROLL_RETRY_BELOW_LOGIT.
+#: Without this, which of the two a jump ended on depended on pixel-level details
+#: (a 1 px shift of the face, sensor noise, the CPU's floating-point rounding).
+CATCH_UP_MIN_LOGIT = 10.0
 #: After this many analysed frames in a row whose crop did not settle, the
 #: result counts as settled anyway. A crop catching up with a jump settles
 #: within a frame or two; one that keeps shifting slightly on a still picture is
@@ -395,6 +405,20 @@ def crop_settled(
         return False
     offset = math.hypot(wanted.cx - used.cx, wanted.cy - used.cy) / used.side
     return offset <= shift and abs(wanted.side / used.side - 1.0) <= scale
+
+
+def crop_caught_up(used: Roi, wanted: Roi, logit: float) -> bool:
+    """True when a frame's landmark passes may stop at the crop ``used``.
+
+    That is when it is settled on the face (:func:`crop_settled`), or when it is
+    catching up with a moving face (``wanted`` within :data:`ROI_CATCH_UP_SHIFT`)
+    and the network is confident that it sees a face in it (``logit``, the
+    presence logit of the pass on ``used``, of at least
+    :data:`CATCH_UP_MIN_LOGIT`). See ``FaceMeshBackend._settle``.
+    """
+    if crop_settled(used, wanted):
+        return True
+    return logit >= CATCH_UP_MIN_LOGIT and crop_settled(used, wanted, shift=ROI_CATCH_UP_SHIFT)
 
 
 def primary_score(side: float, cx: float, cy: float, width: int, height: int) -> float:
@@ -883,7 +907,8 @@ class FaceMeshBackend(VisionBackend):
         if guard and not 0.0 <= timestamp - self._guard_ts < GUARD_PERIOD_S:
             counted = detections = self._guard_count(frame, timestamp)
 
-        found: tuple[np.ndarray, Roi] | None = None  # landmarks and the crop they came from
+        # Landmarks, the crop they came from and the pass's face-presence logit.
+        found: tuple[np.ndarray, Roi, float] | None = None
         roi = self._roi
         tracking = roi is not None
         if roi is not None:
@@ -900,11 +925,11 @@ class FaceMeshBackend(VisionBackend):
                 result = self._infer(frame, candidate)
                 if result is not None:
                     self._pose.reset()
-                    found = (result[0], candidate)
+                    found = (result[0], candidate, result[1])
             if found is None:
                 result = self._infer(frame, roi)
                 if result is not None:
-                    found = (result[0], roi)
+                    found = (result[0], roi, result[1])
         if found is None:
             # Lost (or never had) the face: find one. With the guard on, the
             # search doubles as a fresh face count.
@@ -950,7 +975,7 @@ class FaceMeshBackend(VisionBackend):
         width: int,
         height: int,
         timestamp: float,
-    ) -> tuple[np.ndarray, Roi] | None:
+    ) -> tuple[np.ndarray, Roi, float] | None:
         """Seed the landmark network from YuNet detections; the first that works wins.
 
         Candidates go best first (largest, then most central: see
@@ -960,7 +985,8 @@ class FaceMeshBackend(VisionBackend):
         misjudges strong head roll) and the most face-like crop wins. When it
         still fails, comparable runners-up are tried (see
         :data:`SEED_CANDIDATE_MIN_RATIO`). A frame where the first seed works
-        well costs one inference, as before.
+        well costs one inference, as before. Returns the landmarks, their crop
+        and its presence logit.
         """
         if not detections:
             return None
@@ -987,26 +1013,27 @@ class FaceMeshBackend(VisionBackend):
                 # Turning the crop did not help: the face is not merely rolled.
                 self._roll_retry_ts = timestamp
             if result is not None:
-                return result[0], seed
+                return result[0], seed, result[1]
         return None
 
     def _better_rolled(
         self, frame: np.ndarray, seed: Roi, logit_to_beat: float
-    ) -> tuple[np.ndarray, Roi] | None:
+    ) -> tuple[np.ndarray, Roi, float] | None:
         """``seed`` rolled by :data:`ROLL_RETRY_DEG` either way, if that looks more like a face.
 
         Both rotations are run; the one with the higher presence logit is
-        returned when it beats ``logit_to_beat`` (the unrotated seed's).
-        Passing the presence threshold is not enough: a crop 50-100° off can
-        pass with a confident, wrongly rolled fit, but measured on rolled photos
-        it scores a logit of about 2-14 against 18-28 for the right orientation.
+        returned (landmarks, crop, logit) when it beats ``logit_to_beat`` (the
+        unrotated seed's). Passing the presence threshold is not enough: a crop
+        50-100° off can pass with a confident, wrongly rolled fit, but measured
+        on rolled photos it scores a logit of about 2-14 against 18-28 for the
+        right orientation.
         """
-        best: tuple[np.ndarray, Roi] | None = None
+        best: tuple[np.ndarray, Roi, float] | None = None
         for turn in (ROLL_RETRY_DEG, -ROLL_RETRY_DEG):
             crop = Roi(seed.cx, seed.cy, seed.side, seed.angle + turn)
             result = self._infer(frame, crop)
             if result is not None and result[1] > logit_to_beat:
-                best, logit_to_beat = (result[0], crop), result[1]
+                best, logit_to_beat = (result[0], crop, result[1]), result[1]
         return best
 
     def _settle(
@@ -1014,46 +1041,54 @@ class FaceMeshBackend(VisionBackend):
         frame: np.ndarray,
         points: np.ndarray,
         used: Roi,
+        logit: float,
         detections: list[np.ndarray] | None,
         *,
         reseed: bool,
     ) -> tuple[np.ndarray, bool]:
         """Re-run the network until its crop sits on the face; returns landmarks and settledness.
 
+        ``points`` came from the crop ``used`` with the presence logit ``logit``.
         One pass on a crop chosen from the previous frame follows a face that
         moved by up to about 10 % of the crop almost completely, but after a
         larger jump (a posture shift between two frames at the idle frame
         rates) the landmarks stay biased towards the old position, upward jumps
-        especially, while the network still reports a confident face. So:
+        especially, while the network may still report a face. So:
 
         1. If the crop the landmarks ask for is close to ``used`` (within
-           :data:`ROI_CATCH_UP_SHIFT` and :data:`ROI_SETTLE_SCALE`), they are
-           final for this frame. This is the steady state, also for a steadily
-           moving head: no extra cost.
+           :data:`ROI_SETTLE_SHIFT`, or within :data:`ROI_CATCH_UP_SHIFT` with a
+           confident presence logit, see :func:`crop_caught_up`), they are final
+           for this frame. This is the steady state, also for a steadily moving
+           head: no extra cost.
         2. Otherwise one more pass on that crop, which suffices for moderate
            jumps (about 10 ms).
-        3. Still far off: a large jump, which the network follows only a
-           fraction of the way per pass. With ``reseed`` (tracking), YuNet finds
-           the face independently of the old crop (the detection nearest the
-           wanted crop, about 7 ms unless this frame already ran one) and the
-           network runs on its crop and once more on the crop its landmarks ask
-           for. Without (the face was just found by YuNet), one more plain pass.
+        3. Still not caught up, or that crop was rejected: a large jump, which
+           the network follows only a fraction of the way per pass. With
+           ``reseed`` (tracking), YuNet finds the face independently of the old
+           crop (the detection nearest the wanted crop, about 7 ms unless this
+           frame already ran one) and the network runs on its crop and once more
+           on the crop its landmarks ask for. Without (the face was just found
+           by YuNet), one more plain pass.
 
         Each step keeps the previous landmarks when the network rejects the new
-        crop. The result counts as settled when the last pass's crop matched
-        within the stricter :data:`ROI_SETTLE_SHIFT`.
+        crop, and a rejected crop is not tried twice. The result counts as
+        settled when the last pass's crop matched within the stricter
+        :data:`ROI_SETTLE_SHIFT`.
         """
         height, width = frame.shape[:2]
         wanted = roi_from_landmarks(points)
-        if crop_settled(used, wanted, shift=ROI_CATCH_UP_SHIFT) or not wanted.valid(width, height):
+        if crop_caught_up(used, wanted, logit) or not wanted.valid(width, height):
             return points, crop_settled(used, wanted)
         second = self._infer(frame, wanted)
-        if second is None:
+        if second is not None:
+            points, used = second[0], wanted
+            wanted = roi_from_landmarks(points)
+            if crop_caught_up(used, wanted, second[1]) or not wanted.valid(width, height):
+                return points, crop_settled(used, wanted)
+        elif not reseed:
             return points, False
-        points, used = second[0], wanted
-        wanted = roi_from_landmarks(points)
-        if crop_settled(used, wanted, shift=ROI_CATCH_UP_SHIFT) or not wanted.valid(width, height):
-            return points, crop_settled(used, wanted)
+        # Whether `wanted` still deserves a pass (the network just rejected it if not).
+        last_pass = second is not None
         if reseed:
             if detections is None:
                 detections = self._detect(frame, DETECT_WIDTH)
@@ -1070,7 +1105,8 @@ class FaceMeshBackend(VisionBackend):
                 if third is not None:
                     points, used = third[0], seed
                     wanted = roi_from_landmarks(points)
-        if wanted.valid(width, height):
+                    last_pass = True
+        if last_pass and wanted.valid(width, height):
             last = self._infer(frame, wanted)
             if last is not None:
                 points, used = last[0], wanted

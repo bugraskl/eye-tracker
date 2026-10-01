@@ -31,6 +31,7 @@ from eye_tracker.vision.backends.facemesh_backend import (
     PoseEstimator,
     Roi,
     camera_matrix,
+    crop_caught_up,
     crop_settled,
     eye_metrics,
     load_landmark_net,
@@ -193,7 +194,7 @@ def test_roi_transform_centres_scales_and_levels() -> None:
     m = roi.transform()
     centre = m @ (300.0, 200.0, 1.0)
     assert centre == pytest.approx((128.0, 128.0))
-    # Two points on a line descending at 20Â° towards image-right end up level,
+    # Two points on a line descending at 20° towards image-right end up level,
     # twice as far apart (256 / 128).
     d = (math.cos(math.radians(20.0)) * 30.0, math.sin(math.radians(20.0)) * 30.0)
     a = m @ (300.0 - d[0], 200.0 - d[1], 1.0)
@@ -242,6 +243,22 @@ def test_crop_settled() -> None:
     assert crop_settled(used, Roi(300.0, 190.0, 200.0, 0.0), shift=fm.ROI_CATCH_UP_SHIFT)
     assert not crop_settled(used, Roi(math.nan, 200.0, 200.0, 0.0))
     assert not crop_settled(Roi(300.0, 200.0, 0.0, 0.0), used)
+
+
+def test_crop_caught_up_needs_a_confident_face_while_catching_up() -> None:
+    used = Roi(300.0, 200.0, 200.0, 0.0)
+    jitter = Roi(306.0, 204.0, 205.0, 3.0)
+    catching_up = Roi(300.0, 186.0, 200.0, 0.0)  # 7 % shift
+    far = Roi(300.0, 180.0, 200.0, 0.0)  # 10 % shift
+    confident, doubtful = fm.CATCH_UP_MIN_LOGIT, fm.CATCH_UP_MIN_LOGIT - 0.1
+    # A settled crop ends the passes whatever the logit (a blurred, still face).
+    assert crop_caught_up(used, jitter, doubtful)
+    # A crop catching up with a moving face only with a confident logit: far
+    # behind a jump the network asks for small shifts while still off the face.
+    assert crop_caught_up(used, catching_up, confident)
+    assert not crop_caught_up(used, catching_up, doubtful)
+    assert not crop_caught_up(used, catching_up, math.nan)
+    assert not crop_caught_up(used, far, 30.0)
 
 
 def test_primary_score_prefers_large_then_central_faces() -> None:
@@ -619,19 +636,43 @@ def _converged_features(frame: np.ndarray) -> np.ndarray:
     return obs.features
 
 
-@pytest.mark.parametrize(("frac_x", "frac_y"), [(0.0, -0.25), (0.0, -0.2), (0.25, 0.0)])
+@pytest.mark.parametrize(
+    ("frac_x", "frac_y", "nudge", "noise_seed"),
+    [
+        (0.0, -0.25, (0, 0), None),
+        (0.0, -0.2, (0, 0), None),
+        (0.25, 0.0, (0, 0), None),
+        # The same upward jump one pixel further, or with a little sensor noise.
+        # Such details (and the CPU's floating-point rounding: Linux CI) decided
+        # whether a pass far behind the face that asked for only a small shift, or
+        # a rejected second pass, ended the frame with 12-20° of pitch off.
+        (0.0, -0.25, (0, 1), None),
+        (0.0, -0.25, (1, 0), None),
+        (0.0, -0.25, (0, 0), 0),
+        (0.0, -0.25, (1, 0), 1),
+    ],
+)
 def test_first_observation_after_a_jump_is_not_biased(
-    backend: FaceMeshBackend, frac_x: float, frac_y: float
+    backend: FaceMeshBackend,
+    frac_x: float,
+    frac_y: float,
+    nudge: tuple[int, int],
+    noise_seed: int | None,
 ) -> None:
     """A posture shift between two analysed frames (idle frame rates).
 
     One pass on the old crop gave confident landmarks pulled towards the old
-    position: 11-14Â° of pitch or yaw off for these jumps.
+    position: 11-14° of pitch or yaw off for these jumps.
     """
     _run(backend, draw_face(cy=260), n=6)
     assert backend._roi is not None
     side = backend._roi.side
-    moved = draw_face(cx=320 + round(frac_x * side), cy=260 + round(frac_y * side))
+    moved = draw_face(
+        cx=320 + round(frac_x * side) + nudge[0], cy=260 + round(frac_y * side) + nudge[1]
+    )
+    if noise_seed is not None:  # about one grey level, like a quiet webcam sensor
+        noise = np.random.default_rng(noise_seed).normal(0.0, 1.0, moved.shape)
+        moved = np.clip(moved + noise, 0, 255).astype(np.uint8)
     obs = backend.process(moved, 1.4)  # before the primary-face check is due
     assert obs.features is not None
     assert obs.quality == 1.0

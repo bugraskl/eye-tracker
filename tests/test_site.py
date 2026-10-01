@@ -115,7 +115,7 @@ def test_hero_demo_speaks_the_page_language(built: Path) -> None:
     english = (built / "index.html").read_text(encoding="utf-8")
     turkish = (built / "tr" / "index.html").read_text(encoding="utf-8")
     for html in (english, turkish):
-        for name in ("look", "away", "pick"):
+        for name in ("look", "away", "pick", "pane"):
             assert f'data-msg-{name}="' in html
     assert "Looking at display" in english
     assert "Looking at display" not in turkish

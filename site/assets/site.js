@@ -49,11 +49,15 @@
   document.querySelectorAll("[data-arrange]").forEach(arrange);
 
   // The hero demo: a display-arrangement panel whose selection follows a
-  // simulated gaze. The visitor can take over by pointing at or clicking a
-  // display. Nothing here uses the camera.
+  // simulated gaze. Display 2 holds a window split in two panes, so the loop
+  // also shows split-pane focus: the focus moves to the looked-at pane while
+  // the cursor stays put. The visitor can take over by pointing at or clicking
+  // a display or a pane. Nothing here uses the camera.
   function arrange(figure) {
     var canvas = figure.querySelector(".arrange-canvas");
     var tiles = Array.prototype.slice.call(figure.querySelectorAll(".tile"));
+    var panes = Array.prototype.slice.call(figure.querySelectorAll("[data-pane]"));
+    var paneTile = panes.length ? panes[0].closest(".tile") : null;
     var pointer = figure.querySelector(".pointer");
     var ray = figure.querySelector(".ray");
     var cam = figure.querySelector(".cam");
@@ -63,8 +67,11 @@
     var reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
     // Where the cursor was last left on each display (fractions of the tile).
-    var lastSpot = { 1: [0.66, 0.6], 2: [0.42, 0.5] };
-    var script = ["1", "away", "2"];
+    var lastSpot = { 1: [0.66, 0.6], 2: [0.3, 0.55] };
+    // Look at display 1, glance at the phone (ignored), look back at display 2,
+    // then at its other pane.
+    var script = panes.length > 1 ? ["1", "away", "2", "pane"] : ["1", "away", "2"];
+    var focusedPane = 0;
     var step = 0;
     var current = "2";
     var target = "2";
@@ -74,7 +81,10 @@
 
     function message(name, display) {
       var text = figure.getAttribute("data-msg-" + name) || "";
-      return text.replace("{n}", display);
+      var pane = panes[focusedPane];
+      return text
+        .replace("{n}", display)
+        .replace("{pane}", (pane && pane.getAttribute("data-label")) || "");
     }
 
     function centre(el) {
@@ -103,7 +113,9 @@
       // the stretch between the camera and the looked-at target shows.
       var from = centre(cam);
       var fromY = from.y + from.box.height / 2;
-      var to = target === "away" ? centre(desk) : t;
+      var to = t;
+      if (target === "away") to = centre(desk);
+      else if (target === "pane" && panes[focusedPane]) to = centre(panes[focusedPane]);
       var dx = to.x - from.x;
       var dy = to.y - fromY;
       ray.style.left = from.x.toFixed(1) + "px";
@@ -112,7 +124,31 @@
       ray.style.transform = "rotate(" + Math.atan2(dy, dx).toFixed(4) + "rad)";
     }
 
+    function showPane(index) {
+      focusedPane = index;
+      panes.forEach(function (pane, i) {
+        pane.classList.toggle("is-focus", i === index);
+      });
+    }
+
+    // Split-pane focus: only on the display already looked at; the cursor
+    // does not move.
+    function selectPane(index, reason) {
+      var display = paneTile ? paneTile.getAttribute("data-display") : null;
+      if (!display) return;
+      if (current !== display) select(display, reason);
+      showPane(index);
+      target = "pane";
+      figure.classList.remove("away");
+      if (status) status.textContent = message("pane", display);
+      layout();
+    }
+
     function select(display, reason) {
+      if (display === "pane") {
+        selectPane(panes.length > 1 ? 1 - focusedPane : 0, reason);
+        return;
+      }
       target = display;
       figure.classList.toggle("away", display === "away");
       if (display !== "away") {
@@ -152,12 +188,26 @@
       select(tile.getAttribute("data-display"), "pick");
     }
 
+    function takeOverPane(pane) {
+      resumeAt = Date.now() + 8000;
+      var index = panes.indexOf(pane);
+      if (target === "pane" && index === focusedPane) return;
+      selectPane(index, "pick");
+    }
+
     tiles.forEach(function (tile) {
-      tile.addEventListener("click", function () {
-        takeOver(tile);
+      tile.addEventListener("click", function (event) {
+        var pane = event.target.closest && event.target.closest("[data-pane]");
+        if (pane) takeOverPane(pane);
+        else takeOver(tile);
       });
       tile.addEventListener("pointerenter", function (event) {
         if (event.pointerType === "mouse") takeOver(tile);
+      });
+    });
+    panes.forEach(function (pane) {
+      pane.addEventListener("pointerenter", function (event) {
+        if (event.pointerType === "mouse") takeOverPane(pane);
       });
     });
 

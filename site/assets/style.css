@@ -660,6 +660,69 @@ pre {
 .win-doc .caret { left: 74%; top: 57%; }
 .win-code .caret { left: 62%; top: 59%; }
 
+/* Display 2 holds one window split in two panes: a terminal and an AI chat.
+   Only the focused pane carries the signal; the other stays grey. */
+.win-split {
+  inset: 9% 6% 13%;
+  flex-direction: row;
+  gap: 2px;
+  background: var(--bezel);
+}
+
+.pane {
+  position: relative;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--win);
+}
+
+.tile[aria-pressed="true"] .pane:not(.is-focus) .win-bar {
+  background: var(--win-bar);
+}
+
+.tile[aria-pressed="true"] .pane:not(.is-focus) .win-bar i {
+  background: var(--win-line);
+  opacity: 1;
+}
+
+.tile[aria-pressed="true"] .pane:not(.is-focus) .caret {
+  animation: none;
+  opacity: 0;
+}
+
+.pane-term .win-body i:nth-child(1) { width: 70%; background: var(--tok-3); }
+.pane-term .win-body i:nth-child(2) { width: 88%; }
+.pane-term .win-body i:nth-child(3) { width: 56%; background: var(--tok-1); }
+.pane-term .win-body i:nth-child(4) { width: 80%; }
+.pane-term .win-body i:nth-child(5) { width: 22%; background: var(--tok-3); }
+.pane-term .caret { left: 34%; top: 72%; }
+
+.pane-chat .win-body i:nth-child(1) { width: 62%; height: 9%; margin-left: auto; background: var(--tok-2); }
+.pane-chat .win-body i:nth-child(2) { width: 86%; height: 9%; }
+.pane-chat .win-body i:nth-child(3) { width: 70%; height: 9%; }
+
+.composer {
+  position: relative;
+  margin-top: auto;
+  height: 16%;
+  min-height: 8px;
+  border: 1px solid var(--win-line);
+  border-radius: 3px;
+  transition: border-color 250ms var(--ease);
+}
+
+.tile[aria-pressed="true"] .pane.is-focus .composer {
+  border-color: var(--accent);
+}
+
+.composer .caret {
+  left: 8%;
+  top: 18%;
+  height: 64%;
+}
+
 .tile[aria-pressed="true"] .caret {
   animation: caret 1.06s steps(1) infinite;
 }

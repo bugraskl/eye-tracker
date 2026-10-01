@@ -127,7 +127,8 @@
         <figure class="arrange" data-arrange
                 data-msg-look="Looking at display {n}. The cursor and keyboard focus moved there."
                 data-msg-away="A glance at your phone. Ignored, so nothing moves."
-                data-msg-pick="You picked display {n}. A glance does the same.">
+                data-msg-pick="You picked display {n}. A glance does the same."
+                data-msg-pane="Looking at the {pane} pane on display 2. Keyboard focus moved there; the cursor stays put.">
           <div class="arrange-bar">
             <span class="arrange-title">Displays</span>
             <span class="arrange-live"><span class="dot" aria-hidden="true"></span>Tracking</span>
@@ -142,9 +143,9 @@
                 </span>
                 <span class="tile-num" aria-hidden="true">1</span>
               </button>
-              <button type="button" class="tile" data-display="2" aria-pressed="true" aria-label="Display 2">
+              <button type="button" class="tile" data-display="2" aria-pressed="true" aria-label="Display 2, split into a terminal and an AI chat">
                 <span class="screen" aria-hidden="true">
-                  <span class="win win-code"><span class="win-bar"><i></i></span><span class="win-body"><i></i><i></i><i></i><i></i><i></i><span class="caret"></span></span></span>
+                  <span class="win win-split"><span class="pane pane-term is-focus" data-pane="0" data-label="left"><span class="win-bar"><i></i></span><span class="win-body"><i></i><i></i><i></i><i></i><i></i><span class="caret"></span></span></span><span class="pane pane-chat" data-pane="1" data-label="right"><span class="win-bar"><i></i></span><span class="win-body"><i></i><i></i><i></i><span class="composer"><span class="caret"></span></span></span></span></span>
                 </span>
                 <span class="tile-num" aria-hidden="true">2</span>
               </button>

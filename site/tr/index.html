@@ -128,7 +128,8 @@
         <figure class="arrange" data-arrange
                 data-msg-look="{n}. ekrana bakıyorsunuz. İmleç ve klavye odağı oraya taşındı."
                 data-msg-away="Telefona kısa bir bakış. Yok sayıldı, hiçbir şey kıpırdamıyor."
-                data-msg-pick="{n}. ekranı seçtiniz. Bir bakış da aynısını yapar.">
+                data-msg-pick="{n}. ekranı seçtiniz. Bir bakış da aynısını yapar."
+                data-msg-pane="2. ekranda {pane} bölmeye bakıyorsunuz. Klavye odağı oraya geçti, imleç yerinde kaldı.">
           <div class="arrange-bar">
             <span class="arrange-title">Ekranlar</span>
             <span class="arrange-live"><span class="dot" aria-hidden="true"></span>İzleniyor</span>
@@ -143,9 +144,9 @@
                 </span>
                 <span class="tile-num" aria-hidden="true">1</span>
               </button>
-              <button type="button" class="tile" data-display="2" aria-pressed="true" aria-label="Ekran 2">
+              <button type="button" class="tile" data-display="2" aria-pressed="true" aria-label="Ekran 2, terminal ve yapay zekâ sohbeti olarak bölünmüş">
                 <span class="screen" aria-hidden="true">
-                  <span class="win win-code"><span class="win-bar"><i></i></span><span class="win-body"><i></i><i></i><i></i><i></i><i></i><span class="caret"></span></span></span>
+                  <span class="win win-split"><span class="pane pane-term is-focus" data-pane="0" data-label="sol"><span class="win-bar"><i></i></span><span class="win-body"><i></i><i></i><i></i><i></i><i></i><span class="caret"></span></span></span><span class="pane pane-chat" data-pane="1" data-label="sağ"><span class="win-bar"><i></i></span><span class="win-body"><i></i><i></i><i></i><span class="composer"><span class="caret"></span></span></span></span></span>
                 </span>
                 <span class="tile-num" aria-hidden="true">2</span>
               </button>

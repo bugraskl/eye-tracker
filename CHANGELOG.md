@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Fixed
+
+- Face tracking: the first analysis after a large posture shift, an upward one especially, could
+  stop on a region still far off the face and report the head 12-20° off. Whether it did depended
+  on pixel-level details and even on the CPU. Such regions are now followed up until the face is
+  found.
+- Linux: on a desktop without a system tray (GNOME without an AppIndicator extension) Qt drops tray
+  notifications silently, yet they counted as shown, so a calibration hint was never repeated.
+- `eye-tracker doctor` on Linux and macOS: commands with the home directory shortened to `~` were
+  quoted so that a shell could not expand the `~` when they were pasted.
+
 ## [0.1.0] - 2026-10-01
 
 ### Added

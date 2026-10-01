@@ -52,6 +52,9 @@ class FakeUia:
         self.fail = fail
         self.calls: list[tuple[Any, ...]] = []
         self.focused: list[UiaElement] = []
+        #: Foreground windows answered first, one per call (then ``foreground``).
+        self.foreground_sequence: list[int | None] = []
+        self.closed = 0
 
     def find(self, hwnd: int, class_name: str) -> list[UiaElement]:
         self.calls.append(("find", hwnd, class_name))
@@ -59,19 +62,33 @@ class FakeUia:
             raise self.fail
         return list(self.elements)
 
-    def focus(self, hwnd: int, class_name: str, match: Callable[[UiaElement], bool]) -> bool:
+    def focus(
+        self,
+        hwnd: int,
+        class_name: str,
+        match: Callable[[UiaElement], bool],
+        *,
+        guard: Callable[[], bool] | None = None,
+    ) -> bool:
         self.calls.append(("focus", hwnd, class_name))
         if self.fail is not None:
             raise self.fail
         for element in self.elements:
             if match(element):
+                if guard is not None and not guard():
+                    return False
                 self.focused.append(element)
                 return True
         return False
 
     def foreground_window(self) -> int | None:
         self.calls.append(("foreground",))
+        if self.foreground_sequence:
+            return self.foreground_sequence.pop(0)
         return self.foreground
+
+    def close(self) -> None:
+        self.closed += 1
 
 
 def provider(client: FakeUia) -> WindowsTerminalProvider:
@@ -204,7 +221,8 @@ def test_focus_sets_focus_on_the_matching_pane() -> None:
     target = snapshot.panes[1]
     assert p.focus(WINDOW, target) is True
     assert client.focused == [RIGHT]
-    assert client.calls[-1] == ("focus", HWND, PANE_CLASS)
+    # The foreground is checked again inside the walk, right before SetFocus.
+    assert client.calls[-2:] == [("focus", HWND, PANE_CLASS), ("foreground",)]
 
 
 def test_focus_of_a_pane_that_is_gone_fails() -> None:
@@ -218,6 +236,61 @@ def test_focus_of_a_pane_that_is_gone_fails() -> None:
     assert p.focus(WINDOW, Pane(RIGHT.runtime_id, RIGHT.rect, False, "windows_terminal")) is False
     # Another provider's pane is not ours to focus.
     assert p.focus(WINDOW, Pane(RIGHT.runtime_id, RIGHT.rect, False, "tmux")) is False
+
+
+def test_no_focus_when_another_window_came_to_the_front_during_the_walk() -> None:
+    client = FakeUia()
+    p = provider(client)
+    target = Pane(RIGHT.runtime_id, RIGHT.rect, False, "windows_terminal")
+    client.foreground_sequence = [HWND, 0x1234]  # in front before the walk, not after it
+    assert p.focus(WINDOW, target) is False
+    assert client.focused == []
+    # The second check runs inside the walk, right before SetFocus.
+    assert client.calls == [("foreground",), ("focus", HWND, PANE_CLASS), ("foreground",)]
+    assert p.focus(WINDOW, target) is True  # still in front: focused
+
+
+def test_close_releases_the_automation_client() -> None:
+    client = FakeUia()
+    p = provider(client)
+    p.close()
+    assert client.closed == 1
+    p.close()  # nothing left to release
+    assert client.closed == 1
+
+
+def test_binding_focus_asks_the_guard_right_before_set_focus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """UiAutomation.focus with the COM layer replaced: SetFocus only if the guard agrees."""
+    calls: list[str] = []
+
+    def fake_method(ptr: int, index: int, *argtypes: Any, restype: Any = None) -> Any:
+        assert index == win_uia._EL_SET_FOCUS
+        return lambda: calls.append(f"SetFocus {ptr}") or 0
+
+    def fake_each(hwnd: int, class_name: str, visit: Callable[[int, UiaElement], bool]) -> None:
+        for ptr, info in ((11, LEFT), (12, RIGHT)):
+            calls.append(f"visit {ptr}")
+            if visit(ptr, info):
+                return
+
+    monkeypatch.setattr(win_uia, "_method", fake_method)
+    client = UiAutomation()
+    monkeypatch.setattr(client, "_each", fake_each)
+
+    def is_right(element: UiaElement) -> bool:
+        return element is RIGHT
+
+    def refuse() -> bool:
+        calls.append("guard")
+        return False
+
+    assert client.focus(HWND, PANE_CLASS, is_right, guard=refuse) is False
+    assert calls == ["visit 11", "visit 12", "guard"]  # no SetFocus
+    calls.clear()
+    assert client.focus(HWND, PANE_CLASS, is_right, guard=lambda: True) is True
+    assert calls == ["visit 11", "visit 12", "SetFocus 12"]
 
 
 def test_com_errors_become_pane_errors() -> None:

@@ -386,16 +386,31 @@ class UiAutomation:
         self._each(hwnd, class_name, collect)
         return found
 
-    def focus(self, hwnd: int, class_name: str, match: Callable[[UiaElement], bool]) -> bool:
+    def focus(
+        self,
+        hwnd: int,
+        class_name: str,
+        match: Callable[[UiaElement], bool],
+        *,
+        guard: Callable[[], bool] | None = None,
+    ) -> bool:
         """Give the keyboard focus to the first such descendant ``match`` accepts.
 
-        False when none does; :class:`ComError` when ``SetFocus`` fails.
+        ``guard`` is asked right before ``SetFocus`` (after the walk that found
+        the element): when it returns False nothing is focused. Callers pass a
+        check that the window is still in the foreground, since ``SetFocus`` on
+        a background window could bring it to the front.
+
+        False when no element matches or the guard refuses; :class:`ComError`
+        when ``SetFocus`` fails.
         """
         done: list[bool] = []
 
         def set_focus(element: int, info: UiaElement) -> bool:
             if not match(info):
                 return False
+            if guard is not None and not guard():
+                return True  # stop: the window lost the foreground meanwhile
             _check(_method(element, _EL_SET_FOCUS)(), "IUIAutomationElement::SetFocus")
             done.append(True)
             return True

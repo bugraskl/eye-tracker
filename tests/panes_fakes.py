@@ -5,6 +5,7 @@ Nothing here starts a process: command lines are answered from a table.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -64,6 +65,7 @@ class RecordingProvider:
         self._focus_ok = focus_ok
         self.fail = fail
         self.calls: list[tuple[str, Any]] = []
+        self.closed_on: list[str] = []
 
     def applies(self, app: AppIdentity) -> bool:
         self.calls.append(("applies", app))
@@ -80,6 +82,10 @@ class RecordingProvider:
         if self.fail is not None:
             raise self.fail
         return self._focus_ok
+
+    def close(self) -> None:
+        """Records the name of the thread it was closed on."""
+        self.closed_on.append(threading.current_thread().name)
 
 
 def two_panes(

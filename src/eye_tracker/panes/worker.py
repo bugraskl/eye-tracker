@@ -12,6 +12,11 @@ started yet, and a focus request goes before any detection. A provider whose
 calls fail (raise, or take longer than the call timeout) :data:`FAILURE_LIMIT`
 times in a row is switched off for the rest of the session.
 
+Providers may hold system resources (UI Automation COM objects, which belong
+to the thread that made them). Their ``close()``, where they have one, runs on
+the worker's thread: for the old providers when :meth:`PaneWorker.set_registry`
+replaces them, and for the current ones when the thread ends.
+
 ``synchronous=True`` runs every request on the calling thread instead, for tests.
 """
 
@@ -100,6 +105,8 @@ class PaneWorker(QObject):
         self._detect: _Detect | None = None
         self._focus: _Focus | None = None
         self._stopping = False
+        #: Registries replaced by set_registry whose providers are still to be closed.
+        self._retired: list[PaneRegistry] = []
         self._thread: threading.Thread | None = None
         self._failures: dict[str, int] = {}
         self._disabled: set[str] = set()
@@ -123,13 +130,26 @@ class PaneWorker(QObject):
         self._thread = thread
         thread.start()
 
-    def stop(self, timeout: float = JOIN_TIMEOUT_S) -> None:
-        """Drop pending requests and end the thread (waits for a call in progress)."""
+    def request_stop(self) -> None:
+        """Drop pending requests and tell the thread to end, without waiting.
+
+        Nothing is delivered after this. The thread finishes a provider call in
+        progress, closes the providers and ends; without a running thread (or
+        when synchronous) the providers are closed here.
+        """
         with self._cond:
             self._stopping = True
             self._detect = None
             self._focus = None
             self._cond.notify_all()
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            self._close_retired()
+            self._registry.close()
+
+    def stop(self, timeout: float = JOIN_TIMEOUT_S) -> None:
+        """:meth:`request_stop`, then wait up to ``timeout`` for the thread to end."""
+        self.request_stop()
         thread, self._thread = self._thread, None
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)
@@ -137,10 +157,20 @@ class PaneWorker(QObject):
                 log.warning("A pane provider call did not finish while stopping")
 
     def set_registry(self, registry: PaneRegistry) -> None:
-        """Use other providers from the next request on (settings changed)."""
+        """Use other providers from the next request on (settings changed).
+
+        The replaced providers are closed on the worker's thread before its next
+        request (at once when synchronous).
+        """
         with self._cond:
-            self._registry = registry
+            old, self._registry = self._registry, registry
             self._detect = None
+            if old is registry:
+                return
+            self._retired.append(old)
+            self._cond.notify_all()
+        if self._synchronous:
+            self._close_retired()
 
     @property
     def disabled_providers(self) -> frozenset[str]:
@@ -176,12 +206,30 @@ class PaneWorker(QObject):
 
     # --------------------------------------------------------------- thread
     def _run(self) -> None:
-        while True:
+        try:
+            self._serve()
+        finally:
+            # On this thread: UI Automation objects belong to the thread that made them.
+            self._close_retired()
             with self._cond:
-                while not self._stopping and self._detect is None and self._focus is None:
+                registry = self._registry
+            registry.close()
+
+    def _serve(self) -> None:
+        while True:
+            self._close_retired()
+            with self._cond:
+                while (
+                    not self._stopping
+                    and self._detect is None
+                    and self._focus is None
+                    and not self._retired
+                ):
                     self._cond.wait()
                 if self._stopping:
                     return
+                if self._retired:
+                    continue  # close them first
                 job: _Detect | _Focus
                 if self._focus is not None:
                     job, self._focus = self._focus, None
@@ -243,6 +291,12 @@ class PaneWorker(QObject):
         log.debug("Pane provider %s failed (%d in a row): %s", name, count, why)
         if count == FAILURE_LIMIT:
             log.info("Pane provider %s keeps failing; off until the next start", name)
+
+    def _close_retired(self) -> None:
+        with self._cond:
+            retired, self._retired = self._retired, []
+        for registry in retired:
+            registry.close()
 
     def _is_disabled(self, name: str) -> bool:
         with self._cond:

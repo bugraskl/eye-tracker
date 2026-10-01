@@ -63,7 +63,10 @@ class PaneProvider(Protocol):
     """Finds and focuses the split panes of one kind of terminal.
 
     Providers run on the pane worker's thread (:mod:`.worker`), never on the GUI
-    thread, and may block for at most their command timeout. They must never
+    thread, and may block for at most their command timeout. A provider that
+    holds system resources may also have a ``close()`` method (not part of the
+    protocol, so others need none); the worker calls it on its thread when the
+    provider is replaced or the worker ends. They must never
     synthesise input: they talk to the terminal or multiplexer through its own
     command-line interface or an accessibility API (UI Automation).
     """

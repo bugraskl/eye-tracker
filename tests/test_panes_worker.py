@@ -195,3 +195,61 @@ def test_stop_does_not_wait_forever_for_a_hung_provider(qapp: Any) -> None:
     worker.stop(timeout=0.2)
     assert time.monotonic() - started < 1.0
     hang.set()
+
+
+# ------------------------------------------------------------ closing providers
+def test_replaced_and_final_providers_are_closed_on_the_worker_thread(qapp: Any) -> None:
+    old = RecordingProvider("old", snapshot=lambda ref: two_panes(ref.handle))
+    new = RecordingProvider("new", snapshot=lambda ref: two_panes(ref.handle))
+    worker = PaneWorker(PaneRegistry([old]))
+    worker.start()
+    try:
+        worker.request_detect(REF, APP)
+        assert _wait(lambda: bool(old.calls))
+        worker.set_registry(PaneRegistry([new]))
+        assert _wait(lambda: old.closed_on == ["eye-tracker-panes"])
+        assert new.closed_on == []
+    finally:
+        worker.stop()
+    assert new.closed_on == ["eye-tracker-panes"]  # before the thread ended
+    assert old.closed_on == ["eye-tracker-panes"]  # once
+
+
+def test_request_stop_returns_at_once_and_the_thread_closes_up(qapp: Any) -> None:
+    release = threading.Event()
+    provider = RecordingProvider(snapshot=lambda ref: release.wait(5.0) and None)
+    worker = PaneWorker(PaneRegistry([provider]))
+    results: list[Any] = []
+    worker.detected.connect(results.append)
+    worker.start()
+    worker.request_detect(REF, APP)
+    assert _wait(lambda: bool(provider.calls))  # busy in the provider
+    started = time.monotonic()
+    worker.request_stop()
+    assert time.monotonic() - started < 0.1  # no join
+    assert provider.closed_on == []  # still in use on the thread
+    release.set()
+    assert _wait(lambda: provider.closed_on == ["eye-tracker-panes"])
+    assert _wait(lambda: not worker.running)
+    assert results == []  # nothing is delivered after a stop
+
+
+def test_synchronous_worker_closes_on_the_calling_thread(qapp: Any) -> None:
+    old = RecordingProvider("old")
+    new = RecordingProvider("new")
+    worker = PaneWorker(PaneRegistry([old]), synchronous=True)
+    worker.set_registry(PaneRegistry([new]))
+    assert old.closed_on == [threading.current_thread().name]
+    worker.stop()
+    assert new.closed_on == [threading.current_thread().name]
+
+
+def test_a_failing_close_is_contained(qapp: Any) -> None:
+    class Broken(RecordingProvider):
+        def close(self) -> None:
+            raise OSError("CoUninitialize said no")
+
+    after = RecordingProvider("after")
+    registry = PaneRegistry([Broken("broken"), after])
+    registry.close()
+    assert after.closed_on == [threading.current_thread().name]

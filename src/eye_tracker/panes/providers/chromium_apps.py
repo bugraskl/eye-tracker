@@ -239,6 +239,8 @@ class UiaTreeClient(Protocol):
 
     def foreground_window(self) -> int | None: ...
 
+    def close(self) -> None: ...
+
 
 class _Budget:
     """Counts the elements a walk steps to."""
@@ -384,7 +386,7 @@ class ChromiumAppProvider:
         self._client = client
         self._profiles = profiles
         #: The profile each window was detected with (``focus`` gets no app).
-        self._window_profiles: dict[int, AppProfile] = {}
+        self._window_profiles: dict[tuple[int, int | None], AppProfile] = {}
 
     def applies(self, app: AppIdentity) -> bool:
         return self._profile(app) is not None
@@ -408,7 +410,7 @@ class ChromiumAppProvider:
                 view.close()
         except OSError as exc:
             raise PaneError(f"UI Automation: {exc}") from exc
-        self._window_profiles = {hwnd: profile}
+        self._window_profiles = {(hwnd, ref.pid): profile}
         panes = [
             Pane(f.id, f.rect, focus_rect is not None and _within(focus_rect, f.rect), self.name)
             for f in found
@@ -420,7 +422,7 @@ class ChromiumAppProvider:
         hwnd = _hwnd(ref)
         if hwnd is None or pane.provider != self.name or pane.id is None:
             return False
-        profile = self._window_profiles.get(hwnd)
+        profile = self._window_profiles.get((hwnd, ref.pid))
         if profile is None:
             return False
         client = self._uia()
@@ -436,6 +438,8 @@ class ChromiumAppProvider:
                 if composer is None:
                     log.debug("No message box found in the %s pane", profile.name)
                     return False
+                if client.foreground_window() != hwnd:
+                    return False  # another window came to the front during the walk
                 view.set_focus(composer)
                 return True
             finally:
@@ -490,6 +494,13 @@ class ChromiumAppProvider:
         if not expected or view.process_id(element) != expected:
             return None
         return view.rect(element)
+
+    def close(self) -> None:
+        """Release the UI Automation client (on the pane worker's thread)."""
+        client, self._client = self._client, None
+        self._window_profiles = {}
+        if client is not None:
+            client.close()
 
     def _uia(self) -> UiaTreeClient:
         """The UI Automation client, created on first use (on the worker thread)."""

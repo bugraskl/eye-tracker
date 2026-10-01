@@ -135,6 +135,20 @@ class PaneRegistry:
     def provider(self, name: str) -> PaneProvider | None:
         return next((p for p in self._providers if p.name == name), None)
 
+    def close(self) -> None:
+        """Call ``close()`` of every provider that has one (failures are logged).
+
+        Called on the pane worker's thread (see ``..worker``).
+        """
+        for provider in self._providers:
+            close = getattr(provider, "close", None)
+            if close is None:
+                continue
+            try:
+                close()
+            except Exception:
+                log.debug("Closing pane provider %s failed", provider.name, exc_info=True)
+
 
 #: Optional providers implemented in their own module: (setting, module, class,
 #: platforms (``sys.platform`` values) it runs on). A slot whose module does not

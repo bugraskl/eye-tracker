@@ -53,9 +53,18 @@ class UiaClient(Protocol):
 
     def find(self, hwnd: int, class_name: str) -> list[UiaElement]: ...
 
-    def focus(self, hwnd: int, class_name: str, match: Callable[[UiaElement], bool]) -> bool: ...
+    def focus(
+        self,
+        hwnd: int,
+        class_name: str,
+        match: Callable[[UiaElement], bool],
+        *,
+        guard: Callable[[], bool] | None = None,
+    ) -> bool: ...
 
     def foreground_window(self) -> int | None: ...
+
+    def close(self) -> None: ...
 
 
 def pane_id(element: UiaElement) -> Hashable:
@@ -141,12 +150,22 @@ class WindowsTerminalProvider:
         def match(element: UiaElement) -> bool:
             return not element.offscreen and pane_id(element) == pane.id
 
+        def still_in_front() -> bool:
+            # Asked again right before SetFocus: the walk takes a moment.
+            return client.foreground_window() == hwnd
+
         try:
             if client.foreground_window() != hwnd:
                 return False  # SetFocus could bring a background window to the front
-            return bool(client.focus(hwnd, PANE_CLASS, match))
+            return bool(client.focus(hwnd, PANE_CLASS, match, guard=still_in_front))
         except OSError as exc:
             raise PaneError(f"UI Automation: {exc}") from exc
+
+    def close(self) -> None:
+        """Release the UI Automation client (on the pane worker's thread)."""
+        client, self._client = self._client, None
+        if client is not None:
+            client.close()
 
     def _uia(self) -> UiaClient:
         """The UI Automation client, created on first use (on the worker thread)."""

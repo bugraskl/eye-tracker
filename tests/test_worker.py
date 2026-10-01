@@ -295,11 +295,15 @@ def test_interval_limits_frame_rate(harness: Harness) -> None:
     harness.worker.set_motion_gate(False, 2.0)
     harness.worker.set_interval(0.04)
     harness.worker.start()
-    assert harness.recorder.wait_for(lambda: len(harness.recorder.observations) >= 4)
-    stamps = [o.timestamp for o in harness.obs[:4]]
-    gaps = np.diff(stamps)
-    # time.monotonic() may tick in ~16 ms steps on Windows, so allow some slack.
-    assert gaps.min() >= 0.02
+    n = 6
+    assert harness.recorder.wait_for(lambda: len(harness.recorder.observations) >= n)
+    stamps = [o.timestamp for o in harness.obs[:n]]
+    # Frames follow a grid (slot, slot + interval, ...): a frame that starts late
+    # (a timer overshoot) is followed by an earlier one, so a single gap can be
+    # short (Windows CI saw 63, 16 and 31 ms), but n frames never take less than
+    # n - 1 intervals. time.monotonic() may tick in ~16 ms steps on Windows
+    # (before Python 3.13): allow a tick at either end.
+    assert stamps[-1] - stamps[0] >= (n - 1) * 0.04 - 2 * 0.016
     assert harness.worker.stats.target_fps == pytest.approx(25.0)
 
 

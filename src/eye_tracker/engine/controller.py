@@ -731,6 +731,10 @@ class Controller(QObject):
         self._pane_app: AppIdentity | None = None
         self._pane_snapshot: PaneSnapshot | None = None
         self._pane_requested_at = -math.inf
+        # Detection results are accepted only for requests made after the last
+        # window change or provider swap (ids come from the current worker).
+        self._pane_last_request = 0
+        self._pane_valid_from = 0
         self._pane_sigma_cache: tuple[CalibrationData, int, Rect, tuple[float, float] | None] | (
             None
         ) = None
@@ -946,7 +950,7 @@ class Controller(QObject):
                 self._worker.stop()
             except Exception:
                 log.warning("Stopping the vision worker failed", exc_info=True)
-        self._stop_pane_worker()
+        self._stop_pane_worker(wait=True)
         lock_thread = self._lock_thread
         if lock_thread is not None and lock_thread.is_alive():
             # Let a lock in progress finish before this object may be deleted.
@@ -1554,15 +1558,24 @@ class Controller(QObject):
                 log.warning("Split-pane focus could not start", exc_info=True)
                 return None
             self._pane_worker = worker
+            # A new worker numbers its requests from 1 again.
+            self._pane_last_request = 0
+            self._pane_valid_from = 0
             log.info("Split-pane focus is on (experimental)")
         return self._pane_worker
 
-    def _stop_pane_worker(self) -> None:
+    def _stop_pane_worker(self, *, wait: bool) -> None:
+        """Stop the pane worker. Only :meth:`shutdown` waits for a provider call
+        in progress; a settings change must not block the GUI thread, and a
+        stopped worker delivers nothing more."""
         worker, self._pane_worker = self._pane_worker, None
         if worker is None:
             return
         try:
-            worker.stop(PANE_JOIN_TIMEOUT_S)
+            if wait:
+                worker.stop(PANE_JOIN_TIMEOUT_S)
+            else:
+                worker.request_stop()
         except Exception:
             log.debug("Stopping the pane worker failed", exc_info=True)
 
@@ -1571,7 +1584,7 @@ class Controller(QObject):
         if not self._panes_wanted():
             if self._pane_worker is not None:
                 log.info("Split-pane focus is off")
-            self._stop_pane_worker()
+            self._stop_pane_worker(wait=False)
             self._forget_pane_window()
             self._pane_decider.reset()
             return
@@ -1580,12 +1593,14 @@ class Controller(QObject):
             worker.set_registry(self._pane_registry_factory(self._settings))
             self._pane_snapshot = None
             self._pane_requested_at = -math.inf
+            self._pane_valid_from = self._pane_last_request + 1
 
     def _forget_pane_window(self) -> None:
         self._pane_window = None
         self._pane_app = None
         self._pane_snapshot = None
         self._pane_requested_at = -math.inf
+        self._pane_valid_from = self._pane_last_request + 1
 
     def _follow_pane_window(self, ref: WindowRef, now: float) -> None:
         """Track the focused window and ask for its panes when useful.
@@ -1595,10 +1610,15 @@ class Controller(QObject):
         denied applications (see ``panes.registry``) are never asked about.
         """
         current = self._pane_window
-        if current is None or not self._platform_call("same_window", current, ref, default=False):
+        if (
+            current is None
+            or current.pid != ref.pid  # a handle reused by another process's window
+            or not self._platform_call("same_window", current, ref, default=False)
+        ):
             self._pane_window = ref
             self._pane_snapshot = None
             self._pane_requested_at = -math.inf
+            self._pane_valid_from = self._pane_last_request + 1
             app = self._platform_call("window_app", ref)
             self._pane_app = app if isinstance(app, AppIdentity) else None
             fresh = True
@@ -1621,12 +1641,14 @@ class Controller(QObject):
         if worker is None or window is None:
             return
         self._pane_requested_at = now
-        worker.request_detect(window, app)
+        self._pane_last_request = worker.request_detect(window, app)
 
     def _on_pane_detected(self, result: DetectResult) -> None:
         window = self._pane_window
         if self._closed or window is None or not _same_handle(result.window_handle, window.handle):
             return  # the user moved on to another window meanwhile
+        if result.request_id < self._pane_valid_from:
+            return  # asked before a window change or with the providers since replaced
         self._pane_snapshot = result.snapshot
 
     def _on_pane_focused(self, result: FocusResult) -> None:

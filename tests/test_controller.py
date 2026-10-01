@@ -14,7 +14,7 @@ import sys
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import pytest
@@ -2857,6 +2857,7 @@ def make_pane_controller(
     settings: Settings | None = None,
     *,
     app: AppIdentity = TERMINAL_APP,
+    worker_cls: type[PaneWorker] = PaneWorker,
     **kwargs: Any,
 ) -> tuple[Harness, PaneProviderFake]:
     """A controller whose pane worker is synchronous and whose provider is a fake."""
@@ -2868,7 +2869,7 @@ def make_pane_controller(
 
     def worker(registry: PaneRegistry) -> PaneWorker:
         # Created on the first window poll, once the harness (and its clock) exists.
-        return PaneWorker(registry, clock=holder["h"].clock, synchronous=True)
+        return worker_cls(registry, clock=holder["h"].clock, synchronous=True)
 
     h = make_controller(
         settings or pane_settings(),
@@ -3080,6 +3081,73 @@ def test_results_for_a_window_left_meanwhile_are_ignored(
     h.controller._pane_snapshot = None
     h.controller._on_pane_detected(stale)
     assert h.controller._pane_snapshot is None
+
+
+class RecordingPaneWorker(PaneWorker):
+    """Records how it was stopped (``stop`` joins the thread, ``request_stop`` does not)."""
+
+    stops: ClassVar[list[str]] = []
+
+    def stop(self, timeout: float = 3.0) -> None:
+        RecordingPaneWorker.stops.append("stop")
+        super().stop(timeout)
+
+    def request_stop(self) -> None:
+        RecordingPaneWorker.stops.append("request_stop")
+        super().request_stop()
+
+
+def test_turning_split_panes_off_does_not_wait_for_the_worker(
+    make_controller: Callable[..., Harness],
+) -> None:
+    RecordingPaneWorker.stops.clear()
+    h, _provider = make_pane_controller(make_controller, worker_cls=RecordingPaneWorker)
+    settle_mouse(h)
+    off = h.controller.settings.copy()
+    off.panes.enabled = False
+    h.controller.apply_settings(off)  # on the GUI thread: no join
+    assert RecordingPaneWorker.stops == ["request_stop"]
+    on = off.copy()
+    on.panes.enabled = True
+    h.controller.apply_settings(on)
+    settle_mouse(h)
+    assert h.controller._pane_worker is not None
+    h.controller.shutdown()  # quitting waits for a provider call in progress
+    assert RecordingPaneWorker.stops[1:] == ["stop", "request_stop"]
+
+
+def test_a_reused_window_handle_of_another_process_is_another_window(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h, _provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    assert h.platform.names().count("window_app") == 1
+    h.platform.foreground = dataclasses.replace(TERMINAL, pid=31337)
+    h.tick(0.6)
+    # Identified again (and with it the deny-list checked again), panes asked again.
+    assert h.platform.names().count("window_app") == 2
+    assert h.controller._pane_window is not None
+    assert h.controller._pane_window.pid == 31337
+
+
+def test_detections_from_before_a_provider_swap_are_dropped(
+    make_controller: Callable[..., Harness],
+) -> None:
+    h, _provider = make_pane_controller(make_controller)
+    settle_mouse(h)
+    snapshot = h.controller._pane_snapshot
+    assert snapshot is not None
+    before = h.controller._pane_last_request
+    swapped = h.controller.settings.copy()
+    swapped.panes.tmux = False  # another set of providers
+    h.controller.apply_settings(swapped)
+    assert h.controller._pane_snapshot is None
+    # An answer to a request made with the old providers arrives late: ignored.
+    h.controller._on_pane_detected(DetectResult(TERMINAL.handle, snapshot, before))
+    assert h.controller._pane_snapshot is None
+    # The next request's answer counts.
+    h.controller._on_pane_detected(DetectResult(TERMINAL.handle, snapshot, before + 1))
+    assert h.controller._pane_snapshot is snapshot
 
 
 def test_trace_records_pane_decisions(

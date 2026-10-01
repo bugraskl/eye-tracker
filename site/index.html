@@ -128,7 +128,7 @@
                 data-msg-look="Looking at display {n}. The cursor and keyboard focus moved there."
                 data-msg-away="A glance at your phone. Ignored, so nothing moves."
                 data-msg-pick="You picked display {n}. A glance does the same."
-                data-msg-pane="Looking at the {pane} pane on display 2. Keyboard focus moved there; the cursor stays put.">
+                data-msg-pane="Looking at the {pane} pane on display 2. Keyboard focus and the cursor moved there.">
           <div class="arrange-bar">
             <span class="arrange-title">Displays</span>
             <span class="arrange-live"><span class="dot" aria-hidden="true"></span>Tracking</span>
@@ -151,6 +151,8 @@
               </button>
             </div>
             <span class="desk" aria-hidden="true"><svg><use href="#i-phone"/></svg>Phone, desk</span>
+            <span class="gaze-dot" aria-hidden="true"><svg viewBox="0 0 40 40"><circle class="gaze-track" cx="20" cy="20" r="16"/><circle class="gaze-fill" cx="20" cy="20" r="16"/></svg></span>
+            <span class="eyes" aria-hidden="true"><span class="eye"><i></i></span><span class="eye"><i></i></span><b>Your eyes</b></span>
             <svg class="pointer" viewBox="0 0 17 25" aria-hidden="true"><path d="M1.5 1.5v19.2l4.6-4.4 3.1 7.1 3.2-1.4-3.1-7h6.4L1.5 1.5Z" fill="#fff" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/></svg>
           </div>
           <figcaption class="arrange-foot">

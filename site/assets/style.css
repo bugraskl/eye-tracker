@@ -479,7 +479,7 @@ pre {
 
 .arrange-canvas {
   position: relative;
-  padding: 80px clamp(16px, 3vw, 36px) 64px;
+  padding: 80px clamp(16px, 3vw, 36px) 112px;
   background-color: var(--canvas);
   /* A test card's convergence grid */
   background-image: linear-gradient(var(--canvas-grid) 1px, transparent 1px),
@@ -802,8 +802,8 @@ pre {
 
 .js .desk {
   position: absolute;
-  left: 50%;
-  bottom: 16px;
+  left: clamp(16px, 3vw, 36px);
+  bottom: 20px;
   z-index: 2;
   display: flex;
   align-items: center;
@@ -814,9 +814,141 @@ pre {
   color: var(--text-3);
   font-size: 12px;
   white-space: nowrap;
-  transform: translateX(-50%);
   transition: color 250ms var(--ease), border-color 250ms var(--ease),
     background-color 250ms var(--ease);
+}
+
+/* The viewer's eyes, where you sit: the irises turn towards what is looked
+   at, and the gaze ray starts between them. */
+.eyes,
+.gaze-dot {
+  display: none;
+}
+
+.js .eyes {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  z-index: 3;
+  display: grid;
+  grid-template-columns: auto auto;
+  justify-items: center;
+  gap: 4px 8px;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.eye {
+  position: relative;
+  width: 34px;
+  height: 20px;
+  overflow: hidden;
+  border-radius: 50%;
+  background: #ececee;
+  box-shadow: 0 0 0 2px var(--canvas), 0 0 0 3px var(--border-strong);
+}
+
+.eye i {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border-radius: 50%;
+  background: radial-gradient(circle, #050506 0 30%, var(--bar-cyan) 34% 66%, #0d4a52 70%);
+  transition: transform 300ms var(--ease-in-out);
+}
+
+/* An occasional blink */
+.eye::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: #2a2c33;
+  transform: scaleY(0);
+  transform-origin: top;
+  animation: blink 6.5s infinite;
+}
+
+@keyframes blink {
+  0%, 95%, 100% { transform: scaleY(0); }
+  97% { transform: scaleY(1); }
+}
+
+.eyes b {
+  grid-column: 1 / -1;
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* The gaze point: the ring fills while a glance dwells; the switch follows. */
+.js .gaze-dot {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 3;
+  display: block;
+  width: 40px;
+  height: 40px;
+  margin: -20px 0 0 -20px;
+  pointer-events: none;
+}
+
+.gaze-dot svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  transform: rotate(-90deg);
+}
+
+.gaze-track {
+  fill: rgba(245, 217, 10, 0.16);
+  stroke: var(--accent);
+  stroke-opacity: 0.35;
+  stroke-width: 2;
+}
+
+.gaze-fill {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-dasharray: 101;
+  stroke-dashoffset: 101;
+}
+
+.gaze-dot.dwelling .gaze-fill {
+  animation: dwell var(--dwell, 700ms) linear forwards;
+}
+
+.gaze-dot.settled .gaze-fill {
+  stroke-dashoffset: 0;
+}
+
+.gaze-dot.settled svg {
+  animation: settle 420ms var(--ease);
+}
+
+@keyframes dwell {
+  to { stroke-dashoffset: 0; }
+}
+
+@keyframes settle {
+  0% { transform: rotate(-90deg) scale(1); }
+  45% { transform: rotate(-90deg) scale(1.25); }
+  100% { transform: rotate(-90deg) scale(1); }
+}
+
+.arrange.away .gaze-track {
+  fill: rgba(255, 255, 255, 0.08);
+  stroke: var(--text-2);
+}
+
+.arrange.away .gaze-fill {
+  stroke: var(--text-2);
 }
 
 .desk svg {
@@ -1661,7 +1793,7 @@ thead th.us {
   }
 
   .arrange-canvas {
-    padding: 70px 12px 58px;
+    padding: 70px 12px 104px;
   }
 
   .tile-num {
@@ -1739,6 +1871,10 @@ thead th.us {
    does not open with them flying in from the corner. */
 .arrange.ready .pointer {
   transition: transform 560ms var(--ease-in-out);
+}
+
+.arrange.ready .gaze-dot {
+  transition: transform 380ms var(--ease-in-out);
 }
 
 .arrange.ready .ray {

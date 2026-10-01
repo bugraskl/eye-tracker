@@ -17,6 +17,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   calibration's gaze error take part; the typing, reading and mouse graces apply, and Electron and
   Chromium apps are never inspected. Turn it on with **Follow split panes** in the tray menu or in
   **Settings → Switching**; see [split-pane focus](docs/panes.md).
+- Split-pane focus for the Claude desktop app on Windows (opt-in with `panes.desktop_apps` or
+  **Settings → Switching → Split panes**, off by default): with two chat sessions side by side,
+  the one you look at gets the keyboard focus in its message box. The app's accessibility tree is
+  walked through UI Automation in a few dozen bounded steps (never more than 400), reading only
+  element types, class names and rectangles. Asking for that tree makes the app build it, which can
+  cost it some CPU and memory while the setting is on. Every other Chromium and Electron app stays
+  on the deny-list.
 - The calibration now measures the gaze error on each monitor across and down; calibrations made
   with earlier versions get it from their saved samples when it is first needed.
 - `eye-tracker ctl status` reports split-pane focus in a `panes` block, and `--trace` records the

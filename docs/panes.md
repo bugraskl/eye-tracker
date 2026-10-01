@@ -17,6 +17,7 @@ It is **off by default**. Turn it on with **Follow split panes** in the tray men
 | tmux | `tmux list-clients`, `list-panes`, `select-pane` | In Windows Terminal, WezTerm, Alacritty, kitty, GNOME Terminal, Konsole, xterm, iTerm2, Terminal, foot, Ghostty, Tilix and the Xfce terminal. The tmux client running in the focused window is found through the window's processes. On Windows, tmux inside WSL is used when the window runs WSL and exactly one tmux client is attached there. Only the default tmux server is asked. |
 | WezTerm | `wezterm cli --no-auto-start list`, `list-clients`, `activate-pane` | WezTerm's own split panes, in the tab on screen. Never starts a WezTerm server. |
 | Windows Terminal | UI Automation: the `TermControl` elements of the window, `SetFocus` | Windows only. Windows Terminal's own split panes, in the tab on screen. Which pane is active can only be seen while Windows Terminal is the foreground window, so its panes are asked for (and focused) only then. With a single Windows Terminal pane, tmux running in it is followed instead; tmux panes inside one of several Windows Terminal panes are not followed yet. |
+| Claude desktop app | UI Automation: the session panes of the window, `SetFocus` on a session's message box | Windows only, **opt-in** (`panes.desktop_apps`, see [below](#claude-desktop-app-sessions)). Two chat sessions side by side. |
 | VS Code, Cursor, JetBrains IDEs | planned | Editors need purpose-built support (see below). |
 
 Supported platforms: Windows, macOS and Linux on X11. Wayland does not tell applications which
@@ -28,9 +29,37 @@ with the panes split-pane focus takes part in (next section).
 Electron and Chromium applications (VS Code, Cursor, the Claude and ChatGPT apps, Chrome, Edge,
 Firefox, Slack, Teams, Discord, Obsidian, and on Windows every window of the class
 `Chrome_WidgetWin_1`) are **never inspected**, not even to ask whether they have panes: asking them
-about their contents can switch them into a slower screen-reader mode. A zoomed pane (tmux `Ctrl+B
-z`, WezTerm's and Windows Terminal's zoom) fills the window, so nothing happens while one is
-zoomed.
+about their contents can switch them into a slower screen-reader mode. The one exception is the
+Claude desktop app, and only when you turn it on (next section). A zoomed pane (tmux `Ctrl+B z`,
+WezTerm's and Windows Terminal's zoom) fills the window, so nothing happens while one is zoomed.
+
+### Claude desktop app sessions
+
+The Claude desktop app for Windows can show two chat sessions side by side. With
+`panes.desktop_apps` on (**Settings → Switching → Split panes → Also switch between Claude desktop
+app sessions**), they are followed like terminal panes: look at the other session and its message
+box gets the keyboard focus, so you can type there at once. It is **off by default**, also when
+split-pane focus is on, because of what it costs the app:
+
+- Eye Tracker reads the app's accessibility tree through UI Automation. Chromium builds that tree
+  only once someone asks for it and then keeps it up to date, which can cost the app some CPU and
+  memory while the setting is on (the app may keep the tree until it restarts). Right after you turn it
+  on, the first look may find no sessions yet; they are found a second later.
+- Only the Claude app is opened up this way, matched by its program name (`claude.exe`) *and* its
+  window class. VS Code, Cursor, Antigravity, Windsurf, browsers, the ChatGPT app and every other
+  Chromium or Electron app stay on the deny-list whatever the setting.
+- The tree is never walked as a whole. From the window, Eye Tracker steps down through the native
+  views to the web content, then only through groups (at most 8 levels), and stops at each session
+  pane without looking inside; on a tree like the app's that is about 25 steps, and never more than
+  400. To focus a session, it looks for the message box inside that one pane, from the bottom up,
+  again at most 400 steps.
+- Of the elements on the way only the control type is read, plus the class name of groups and
+  editors and the automation id of the web-content document; of the session panes their rectangle,
+  visibility and runtime id; of an editor whether it can take the focus. Names, text and messages
+  are never read. The session that has the focus is the one containing the element with the
+  keyboard focus (its process and rectangle are read).
+- As with Windows Terminal, sessions are looked at and focused only while the Claude window is the
+  foreground window.
 
 ## How it decides
 
@@ -73,6 +102,9 @@ tmux and WezTerm are asked through their command-line tools, which talk to the m
 its local socket on your computer (inside WSL for tmux there); nothing reaches the network. Windows
 Terminal is asked through UI Automation, the Windows accessibility interface, inside your session;
 only the bounding rectangle, keyboard focus, visibility and runtime id of its terminal controls are
-read, never their text or names. Only pane positions, sizes and ids are read: pane titles,
+read, never their text or names. For the Claude desktop app (opt-in), only the control type, class
+name, rectangle, visibility and runtime id of the elements on the way to the session panes are
+read, plus the process of the focused element; never names, text or messages. Only pane positions,
+sizes and ids are read: pane titles,
 commands, working directories and contents are never stored, logged or shown. See
 [privacy](privacy.md#what-the-app-does-not-do).

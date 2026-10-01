@@ -1,6 +1,6 @@
 """Eye Tracker: look at a monitor and your cursor and keyboard focus follow."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 APP_NAME = "Eye Tracker"
 APP_SLUG = "eye-tracker"

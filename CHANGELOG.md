@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-01
+
 ### Added
 
 - Project website at https://bugraskl.github.io/eye-tracker/ in English and Turkish, rebuilt
@@ -15,7 +17,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   tools' own command-line interfaces (tmux also inside WSL) or, for Windows Terminal, UI Automation
   (while it is the foreground window). Only panes several times larger than your
   calibration's gaze error take part; the typing, reading and mouse graces apply, and Electron and
-  Chromium apps are never inspected. Turn it on with **Follow split panes** in the tray menu or in
+  Chromium apps are never inspected (except the opt-in desktop apps below). Turn it on with **Follow split panes** in the tray menu or in
   **Settings → Switching**; see [split-pane focus](docs/panes.md).
 - Split-pane focus for the Claude and ChatGPT desktop apps on Windows (opt-in with
   `panes.desktop_apps` or **Settings → Switching → Split panes**, off by default): with two Claude
@@ -86,5 +88,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - A privacy gate that fails CI on networking or frame-writing code and scans every bundled native
   library and Python module of the release builds.
 
-[Unreleased]: https://github.com/bugraskl/eye-tracker/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/bugraskl/eye-tracker/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/bugraskl/eye-tracker/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bugraskl/eye-tracker/releases/tag/v0.1.0

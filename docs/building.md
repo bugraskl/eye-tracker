@@ -1,8 +1,9 @@
 # Building from source
 
-Releases are built by [`.github/workflows/release.yml`](../.github/workflows/release.yml) on GitHub's
-runners whenever a `v*` tag is pushed. You can run the same steps locally. Every build must be made
-on the operating system it targets: PyInstaller does not cross-compile.
+Releases are built on GitHub's runners whenever a `v*` tag is pushed, by the steps in
+[`.github/workflows/build.yml`](../.github/workflows/build.yml) (see
+[Continuous integration](#continuous-integration)). You can run the same steps locally. Every build
+must be made on the operating system it targets: PyInstaller does not cross-compile.
 
 ## Prerequisites
 
@@ -29,6 +30,9 @@ The output lands in `dist/`:
 | macOS | `dist/Eye Tracker.app` (menu-bar app) with `Contents/MacOS/eye-tracker-cli` |
 | Linux | `dist/eye-tracker/eye-tracker` (one executable for the app and the command line) |
 
+The build fails if the output contains a symbolic link to a file that is not bundled: on macOS such
+a link breaks signing. The spec drops the links to every library it leaves out (see below).
+
 Then run the privacy gate on the bundle. It reads every native library, and with PyInstaller's own
 archive readers every Python module inside the executables and inside ZIP files such as
 `base_library.zip`. It fails on telemetry markers, networking packages, Qt's network plugins (TLS,
@@ -48,7 +52,19 @@ library that the app does not need is left out by the spec instead of being allo
 plugins and what only they link, OpenSSL libraries that nothing imports, and on macOS every library
 that no bundled binary binds a symbol to. OpenCV's macOS wheel ships FFmpeg as Homebrew builds it,
 which links libraries it never uses (libX11, and libssl through libsrt); the spec makes those links
-weak in the copies it bundles and leaves the libraries out.
+weak in the copies it bundles and leaves the libraries out, together with the symbolic links that
+PyInstaller made to them.
+
+Finally, smoke-test the command-line tool as CI does. The script checks the version, that the build
+is frozen with every face model present and verified, that both backends analyse an image, that
+the bundled FFmpeg decodes an AVI and an MP4 file (written on the spot with the build environment's
+OpenCV), and that camera probing runs (AVFoundation on macOS). It writes only to a temporary folder:
+
+```bash
+uv run python scripts/smoke_test_bundle.py --version 0.1.0 dist/EyeTracker/eye-tracker-cli.exe
+uv run python scripts/smoke_test_bundle.py --version 0.1.0 "dist/Eye Tracker.app/Contents/MacOS/eye-tracker-cli"
+uv run python scripts/smoke_test_bundle.py --version 0.1.0 dist/eye-tracker/eye-tracker
+```
 
 ## Packages
 
@@ -63,8 +79,16 @@ The installer is per user (no administrator rights), creates a Start menu shortc
 registers start at sign-in. It also installs the command-line tool a second time as
 `eye-tracker.exe` and, with the task *Add the "eye-tracker" command to PATH* (on by default;
 `/MERGETASKS=!addtopath` turns it off in a silent install), adds the installation folder to the
-user's PATH; uninstalling removes that entry. Upgrades keep your choices, and a silent upgrade
-(winget, `/SILENT`, `/VERYSILENT`) restarts Eye Tracker in the background if it had to close it.
+user's PATH; uninstalling removes that entry. A user PATH that is not stored as a string value
+(some tools write it as `REG_MULTI_SZ`) cannot be read, and is left as it is. Upgrades keep your
+choices, and a silent upgrade (winget, `/SILENT`, `/VERYSILENT`) restarts Eye Tracker in the
+background if it had to close it.
+
+Start at sign-in is never turned back on by an upgrade: it stays as you left it in the app or in
+Task Manager (which can disable it without removing it), whatever the first installation chose. An
+explicit choice wins, also in a silent upgrade: `/MERGETASKS=startup` turns it on (and clears Task
+Manager's "disabled" flag), `/MERGETASKS=!startup` turns it off, and `/TASKS=...` turns it on only
+when it lists `startup`.
 
 **macOS disk image**
 
@@ -73,7 +97,9 @@ bash packaging/macos/make_dmg.sh --app "dist/Eye Tracker.app" --version 0.1.0 \
   --out dist/EyeTracker-0.1.0-macos-arm64.dmg
 ```
 
-The app is signed ad hoc unless you provide a certificate. With a stable identity (a Developer ID,
+The script refuses an app that contains a symbolic link to a missing file, and names the links,
+before it signs anything; rebuild the app with the spec. The app is signed ad hoc unless you
+provide a certificate. With a stable identity (a Developer ID,
 or a self-signed certificate as described at the top of `make_dmg.sh`), the Camera and Accessibility
 permissions survive updates. In CI, set the repository secrets `MACOS_SIGNING_CERT_P12`,
 `MACOS_SIGNING_CERT_PASSWORD` and optionally `MACOS_SIGNING_IDENTITY`.
@@ -105,21 +131,47 @@ altered (restore it from git), and the PyInstaller spec refuses to build without
 
 - [`ci.yml`](../.github/workflows/ci.yml) runs Ruff, mypy (also as on Windows and macOS), the
   source privacy check, the model check and the tests on Linux, Windows and macOS.
-- [`bundle.yml`](../.github/workflows/bundle.yml) builds the three bundles like the release does
-  whenever a pull request or a push to `main` changes `packaging/`, the privacy gate, the model or
-  icon scripts, `pyproject.toml` or `uv.lock`. It runs the bundle privacy gate, checks that the
-  Linux bundle contains no GTK or GIO libraries and that the macOS bundle's minimum version is the
-  documented one, and smoke-tests the command-line tool: it analyses an image and two video files
-  (AVI and MP4, read by the bundled FFmpeg) and probes the cameras (AVFoundation on macOS). It
-  publishes nothing.
+- [`build.yml`](../.github/workflows/build.yml) is the one definition of how the packages are
+  built and tested. It is a reusable workflow, never run on its own: the Bundle check and the
+  release both call it, so a pull request checks exactly what a release ships. It reads the version
+  and writes the release notes, then builds each platform on its own runner (`windows-latest`,
+  `macos-14`, and `ubuntu-22.04` for the oldest supported glibc):
+  - **every platform:** PyInstaller, the bundle privacy gate, the packages, and
+    `scripts/smoke_test_bundle.py` on each package the way users get it;
+  - **Windows:** the bundle (the portable ZIP's contents), then the installer, which a disposable
+    runner installs, upgrades and uninstalls: start at sign-in after silent upgrades, with and
+    without `/MERGETASKS=startup` or `!startup` and with Task Manager's "disabled" flag, the PATH
+    entry (also with an unreadable PATH value), and the installed copy smoke-tested through the
+    `eye-tracker` command;
+  - **macOS:** the minimum macOS version, signing (with the optional certificate) and the disk
+    image; the app is then checked inside the mounted image: no symbolic link without a target,
+    `codesign --verify --deep --strict`, the Info.plist, and the smoke test of its
+    `eye-tracker-cli`;
+  - **Linux:** that `libxcb-cursor` is bundled and GTK and GIO are not, then the AppImage (smoke
+    test) and the tarball (its links and its launcher).
+- [`bundle.yml`](../.github/workflows/bundle.yml) runs `build.yml` whenever a pull request or a push
+  to `main` changes the app (`src/`), `packaging/`, the privacy gate, the model, icon or smoke-test
+  scripts, `pyproject.toml`, `uv.lock` or the release workflows. It passes no secret (the macOS app
+  is signed ad hoc), keeps no artifact and publishes nothing. Start it by hand on any branch with
+  `gh workflow run bundle.yml --ref <branch>`.
+- [`release.yml`](../.github/workflows/release.yml) runs `build.yml` for a `v*` tag, or by hand to
+  try a release without publishing it; it keeps the packages and the release notes as workflow
+  artifacts. Only for a tag does its publishing job (the only one with write access) compute
+  `SHA256SUMS.txt`, attach build-provenance attestations and publish the GitHub release.
+
+Every workflow has read-only permissions unless a job needs more, uses actions pinned to commit
+SHAs (kept current by Dependabot), and runs in a concurrency group: a newer push cancels an older
+check, while release runs never cancel each other.
 
 ## Releasing
 
 1. Update `__version__` in `src/eye_tracker/__init__.py` and move the **Unreleased** notes in
-   `CHANGELOG.md` under a new `## [x.y.z] - YYYY-MM-DD` heading.
+   `CHANGELOG.md` under a new `## [x.y.z] - YYYY-MM-DD` heading, leaving `## [Unreleased]` empty.
 2. Commit, then tag and push: `git tag v0.1.0 && git push origin v0.1.0`.
-3. The release workflow builds all platforms, smoke-tests each package, runs the privacy gate,
-   writes `SHA256SUMS.txt`, attaches build-provenance attestations and publishes the GitHub release
-   with the notes from `CHANGELOG.md`. The oldest macOS the DMG runs on follows from the bundled
-   wheels (`MACOS_MINIMUM` in the workflows, currently 14.0); the smoke test fails when it changes,
-   so that the README, these docs and the release notes are updated with it.
+3. The release workflow builds and tests every package as described above and publishes the GitHub
+   release with the notes from `CHANGELOG.md`. It fails before building anything when the tag does
+   not match `__version__`, when `CHANGELOG.md` has no section for the version, or when notes are
+   still under **Unreleased** (they would be missing from the release notes). A run that is not
+   for a tag only reports the two `CHANGELOG.md` problems. The oldest macOS the DMG runs on follows from the bundled wheels
+   (`MACOS_MINIMUM` in `build.yml`, currently 14.0); the smoke test fails when it changes, so that
+   the README, these docs and the release notes are updated with it.

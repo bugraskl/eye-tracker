@@ -218,8 +218,15 @@ def axis_error(data: CalibrationData, monitor: Monitor) -> tuple[float, float] |
 
     ``monitor`` is matched to the calibration's monitors by its rectangle (Qt may
     number the same screens differently after a restart), then by index.
-    ``None`` when nothing is known. Runs a few small least-squares fits the first
-    time an old profile is asked about; later calls are dictionary lookups.
+    ``None`` when nothing is known.
+
+    The first call for an old profile recomputes on the calling thread (the GUI
+    thread, from the controller), on purpose: the leave-one-point-out
+    predictions cost one design matrix and one small ``p x p`` solve per
+    calibration dot, about 2 ms for a two-monitor calibration of 360 samples and
+    4 ms for 960 (degree 3, measured on a desktop; ``tests/test_store.py`` keeps
+    a generous bound). It happens once per profile and session; later calls are
+    dictionary lookups. A background thread would cost more than it saves.
     """
     errors = _AXIS_ERRORS.get(data)
     if errors is None:

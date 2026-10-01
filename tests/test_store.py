@@ -705,3 +705,36 @@ def test_axis_error_without_any_information() -> None:
     data = _linear_data({"mean_error_px": 42.0})
     data.samples = []
     assert axis_error(data, data.monitors[0]) == pytest.approx((29.7, 29.7), abs=0.01)
+
+
+def test_recomputing_an_old_profile_is_cheap_enough_for_the_gui_thread() -> None:
+    """The first axis_error of an old profile runs on the GUI thread (see its docs):
+    a realistic two-monitor calibration (16 dots per monitor, 30 samples each,
+    degree 3, the face-mesh gaze features nonlinear) must take milliseconds."""
+    import time
+
+    from eye_tracker.gaze.calibration import evaluate
+    from gaze_synth import GAZE, TWO, calibration_samples
+
+    samples = calibration_samples(
+        TWO, np.random.default_rng(3), noise=1.0, per_point=30, points_per_monitor=16
+    )
+    model, report = evaluate(samples, TWO, degree=3, nonlinear=GAZE)
+    saved = report.to_dict()
+    expected = saved.pop("per_monitor_error_px")  # as written by an earlier version
+    data = CalibrationData(
+        backend="facemesh",
+        feature_version="v",
+        layout_signature=layout_signature(TWO),
+        monitors=list(TWO),
+        samples=samples,
+        implicit_samples=[],
+        model=model,
+        report=saved,
+    )
+    started = time.perf_counter()
+    sigma = axis_error(data, TWO[1])
+    elapsed = time.perf_counter() - started
+    assert sigma == pytest.approx(tuple(expected["1"]), rel=1e-6)  # same as a new report
+    # Measured: ~4 ms on a desktop. The bound leaves room for slow CI machines.
+    assert elapsed < 0.25, f"{elapsed * 1000:.0f} ms"

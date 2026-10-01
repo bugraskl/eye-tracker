@@ -94,7 +94,10 @@ class PaneConfig:
     reading_grace_s: float = 8.0
     cooldown_s: float = 1.0
     mouse_grace_s: float = 1.5
-    #: Grace after the focused pane changed without us.
+    #: Grace after the focused pane changed without us. Set from
+    #: ``panes.typing_grace_ms`` (documented there): switching panes by hand is
+    #: a keyboard shortcut or a click, so it gets the grace of typing, without a
+    #: setting of its own.
     manual_grace_s: float = 3.0
     #: Minimum pane extent in units of the gaze error on the separating axis.
     precision: float = 2.5

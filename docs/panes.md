@@ -88,7 +88,8 @@ from their saved samples the first time it is needed.
    new pane. A stray sample does not restart the wait.
 5. **Not while you work.** No pane switch for 3 s after you type (`panes.typing_grace_ms`), for the
    mouse grace of the switching settings after you use the mouse, for 1 s after the previous pane
-   switch, and for the typing grace after you switched panes yourself.
+   switch. Switching panes yourself (a shortcut, a click) counts like typing: no pane switch
+   for the same `panes.typing_grace_ms` after it, so your choice is not undone.
 6. **Reading is not switching.** If you keep typing in one pane while looking at another (reading
    a log or a man page next to your editor), that other pane becomes a *reading pane*: reading pauses
    do not move the focus there until 8 s after your last keystroke (`panes.reading_grace_ms`). This

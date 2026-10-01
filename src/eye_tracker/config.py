@@ -180,7 +180,11 @@ class PaneSettings:
         400, lo=100, hi=5000, doc="How long you must look at another pane before it gets focus."
     )
     typing_grace_ms: int = _opt(
-        3000, lo=0, hi=20000, doc="No pane switching for this long after you type."
+        3000,
+        lo=0,
+        hi=20000,
+        doc="No pane switching for this long after you type, or after you switched panes "
+        "yourself (a keyboard shortcut or a click in the terminal).",
     )
     reading_grace_ms: int = _opt(
         8000,

@@ -82,6 +82,7 @@ of 120 px that is 300 px. Supported terminals and the full rules: [split-pane fo
 | `panes.tmux` | `true` |  | Follow tmux panes (through the tmux command, also in WSL). |
 | `panes.wezterm` | `true` |  | Follow WezTerm panes (through the wezterm command). |
 | `panes.windows_terminal` | `true` |  | Follow Windows Terminal panes (Windows only, through UI Automation). |
+| `panes.desktop_apps` | `false` |  | Also follow the Claude desktop app's two chat sessions side by side (Windows only): the session you look at gets the keyboard focus in its message box. Reads the app's accessibility tree, which makes the app build that tree; this may cost the app some CPU and memory while it is on. |
 
 ## Walk-away (presence)
 

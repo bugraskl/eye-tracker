@@ -219,6 +219,13 @@ class PaneSettings:
     windows_terminal: bool = _opt(
         True, doc="Follow Windows Terminal panes (Windows only, through UI Automation)."
     )
+    desktop_apps: bool = _opt(
+        False,
+        doc="Also follow the Claude desktop app's two chat sessions side by side (Windows "
+        "only): the session you look at gets the keyboard focus in its message box. Reads "
+        "the app's accessibility tree, which makes the app build that tree; this may cost "
+        "the app some CPU and memory while it is on.",
+    )
 
 
 @dataclass

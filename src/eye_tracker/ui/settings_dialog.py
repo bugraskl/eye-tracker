@@ -1311,7 +1311,16 @@ class SettingsDialog(QDialog):
                 "is."
             )
         )
-        self._depends(follow, [precision])
+        desktop = self._check(
+            panes, "panes.desktop_apps", "Also switch between Claude desktop app sessions"
+        )
+        desktop_hint = self._hint(
+            "Two Claude chats side by side: the one you look at gets the focus in its message "
+            "box. Windows only. Asks the app for its accessibility tree, which can cost the app "
+            "some CPU and memory."
+        )
+        panes.addRow(desktop_hint)
+        self._depends(follow, [precision, desktop, desktop_hint])
 
         learn = self._group(layout, "Adaptive accuracy")
         adaptive = self._check(learn, "learning.adaptive", "Learn from how I use the mouse")

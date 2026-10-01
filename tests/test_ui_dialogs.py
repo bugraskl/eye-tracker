@@ -327,6 +327,8 @@ UNBOUND = {
         )
     ),
 }
+# ``panes.desktop_apps`` has a checkbox: it reads another app's accessibility
+# tree, so it is a visible, deliberate choice (off by default).
 
 
 def test_every_setting_has_a_widget(dialog: SettingsDialog) -> None:
@@ -374,7 +376,17 @@ def test_split_pane_options_on_the_switching_page(
         new = controller.applied[-1]
         assert new.panes.enabled is True
         assert new.panes.precision == pytest.approx(4.0)
-        assert new.panes.dwell_ms == 600  # not in the dialog: kept as it was
+        assert new.panes.dwell_ms == 400  # not in the dialog: kept as it was
+        assert new.panes.desktop_apps is False  # opt-in, not switched on with the rest
+        desktop = dlg.widget_for("panes.desktop_apps")
+        assert isinstance(desktop, QCheckBox)
+        assert desktop.isEnabled()
+        assert "Claude" in desktop.text()
+        desktop.setChecked(True)
+        assert dlg.apply()
+        assert controller.applied[-1].panes.desktop_apps is True
+        follow.setChecked(False)
+        assert not desktop.isEnabled()
     finally:
         _dispose(dlg)
     caps = dict.fromkeys(PlatformServices().capabilities(), True)

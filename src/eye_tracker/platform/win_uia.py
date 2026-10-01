@@ -1,10 +1,15 @@
 """A minimal UI Automation client through hand-written ctypes COM calls.
 
-Only what the Windows Terminal pane provider needs is bound: find the
+Only what the pane providers need is bound. For Windows Terminal: find the
 descendants of a window with a given class name, read four properties of each
 (runtime id, bounding rectangle, keyboard focus, off-screen) and give one of
-them the keyboard focus. There is no pywin32 or comtypes: interface pointers
-are plain integers and methods are called through their vtable slot.
+them the keyboard focus. For desktop apps built on Chromium:
+:class:`ControlView`, a step-by-step walk of the control view of one window
+(first/last child, next/previous sibling), the focused element, and a few
+properties per element (control type, class name, automation id, keyboard
+focusability, process id). Names, values and text of elements are never read.
+There is no pywin32 or comtypes: interface pointers are plain integers and
+methods are called through their vtable slot.
 
 Vtable slots
 ------------
@@ -72,6 +77,11 @@ COINIT_MULTITHREADED = 0x0
 RPC_E_CHANGED_MODE = 0x80010106
 TREE_SCOPE_DESCENDANTS = 0x4
 UIA_CLASS_NAME_PROPERTY_ID = 30012
+#: Control type ids (``UIA_...ControlTypeId`` in ``UIAutomationClient.h``).
+UIA_EDIT_CONTROL_TYPE_ID = 50004
+UIA_GROUP_CONTROL_TYPE_ID = 50026
+UIA_DOCUMENT_CONTROL_TYPE_ID = 50030
+UIA_PANE_CONTROL_TYPE_ID = 50033
 VT_I4 = 3
 VT_BSTR = 8
 GA_ROOT = 2
@@ -80,16 +90,28 @@ GA_ROOT = 2
 _RELEASE = 2
 # IUIAutomation (IUIAutomation2 adds 58-63 after it)
 _UIA_ELEMENT_FROM_HANDLE = 6
+_UIA_GET_FOCUSED_ELEMENT = 8
+_UIA_GET_CONTROL_VIEW_WALKER = 14
 _UIA_CREATE_PROPERTY_CONDITION = 23
 _UIA2_GET_CONNECTION_TIMEOUT = 60
 _UIA2_PUT_CONNECTION_TIMEOUT = 61
 _UIA2_GET_TRANSACTION_TIMEOUT = 62
 _UIA2_PUT_TRANSACTION_TIMEOUT = 63
+# IUIAutomationTreeWalker
+_WALKER_FIRST_CHILD = 4
+_WALKER_LAST_CHILD = 5
+_WALKER_NEXT_SIBLING = 6
+_WALKER_PREVIOUS_SIBLING = 7
 # IUIAutomationElement
 _EL_SET_FOCUS = 3
 _EL_GET_RUNTIME_ID = 4
 _EL_FIND_ALL = 6
+_EL_PROCESS_ID = 20
+_EL_CONTROL_TYPE = 21
 _EL_HAS_KEYBOARD_FOCUS = 26
+_EL_IS_KEYBOARD_FOCUSABLE = 27
+_EL_AUTOMATION_ID = 29
+_EL_CLASS_NAME = 30
 _EL_IS_OFFSCREEN = 38
 _EL_BOUNDING_RECTANGLE = 43
 # IUIAutomationElementArray
@@ -98,6 +120,9 @@ _ARRAY_GET_ELEMENT = 4
 
 #: Longest runtime id accepted (real ones have 2-4 parts).
 _MAX_RUNTIME_ID = 32
+#: Longest class name or automation id read (characters); the rest is cut off.
+_MAX_BSTR = 4096
+E_POINTER = 0x80004003
 
 
 class ComError(OSError):
@@ -192,6 +217,7 @@ class _Api:
         )
         self.SysAllocString = bind(oleaut32, "SysAllocString", c_void_p, ctypes.c_wchar_p)
         self.SysFreeString = bind(oleaut32, "SysFreeString", None, c_void_p)
+        self.SysStringLen = bind(oleaut32, "SysStringLen", c_uint, c_void_p)
         self.SafeArrayGetDim = bind(oleaut32, "SafeArrayGetDim", c_uint, c_void_p)
         self.SafeArrayGetElemsize = bind(oleaut32, "SafeArrayGetElemsize", c_uint, c_void_p)
         self.SafeArrayGetVartype = bind(
@@ -253,9 +279,45 @@ def _out_ptr(ptr: int, index: int, what: str, *args: Any, argtypes: tuple[Any, .
 
 
 def _read_bool(ptr: int, index: int, what: str) -> bool:
+    return bool(_read_int(ptr, index, what))
+
+
+def _read_int(ptr: int, index: int, what: str) -> int:
     value = c_int()
     _check(_method(ptr, index, POINTER(c_int))(byref(value)), what)
-    return bool(value.value)
+    return int(value.value)
+
+
+def _read_bstr(api: _Api, ptr: int, index: int, what: str) -> str:
+    """Call a ``get_...`` method returning a ``BSTR``, which is freed; ``""`` if null."""
+    out = c_void_p()
+    _check(_method(ptr, index, POINTER(c_void_p))(byref(out)), what)
+    bstr = out.value
+    if not bstr:
+        return ""
+    try:
+        length = min(int(api.SysStringLen(bstr)), _MAX_BSTR)
+        return ctypes.wstring_at(bstr, length)
+    finally:
+        api.SysFreeString(bstr)
+
+
+def _read_rect(element: int) -> Rect | None:
+    rect = RECT()
+    _check(
+        _method(element, _EL_BOUNDING_RECTANGLE, POINTER(RECT))(byref(rect)),
+        "get_CurrentBoundingRectangle",
+    )
+    width, height = rect.right - rect.left, rect.bottom - rect.top
+    return Rect(rect.left, rect.top, width, height) if width > 0 and height > 0 else None
+
+
+def _read_runtime_id(api: _Api, element: int) -> tuple[int, ...] | None:
+    psa = c_void_p()
+    hr = _method(element, _EL_GET_RUNTIME_ID, POINTER(c_void_p))(byref(psa))
+    if hr < 0:
+        return None
+    return read_int_safearray(api, psa.value or 0) or None
 
 
 def read_int_safearray(api: _Api, psa: int) -> tuple[int, ...] | None:
@@ -341,6 +403,12 @@ class UiAutomation:
         self._each(hwnd, class_name, set_focus)
         return bool(done)
 
+    def control_view(self, hwnd: int) -> ControlView:
+        """A walk of the control view of window ``hwnd``; close it when done
+        (it is a context manager)."""
+        api = _api()
+        return ControlView(api, self._automation(), hwnd)
+
     def foreground_window(self) -> int | None:
         """The top-level window in the foreground (``None`` if there is none)."""
         api = _api()
@@ -415,7 +483,7 @@ class UiAutomation:
         )
         _check(hr, "CoCreateInstance(CUIAutomation)")
         if not out.value:
-            raise ComError("CoCreateInstance(CUIAutomation)", 0x80004003)  # E_POINTER
+            raise ComError("CoCreateInstance(CUIAutomation)", E_POINTER)
         self._has_timeouts = False
         return int(out.value)
 
@@ -452,7 +520,7 @@ class UiAutomation:
         finally:
             api.SysFreeString(bstr)  # the condition keeps its own copy
         if not condition:
-            raise ComError("IUIAutomation::CreatePropertyCondition", 0x80004003)
+            raise ComError("IUIAutomation::CreatePropertyCondition", E_POINTER)
         with self._lock:
             if class_name in self._conditions:  # another thread was quicker
                 _release(condition)
@@ -514,22 +582,154 @@ class UiAutomation:
 
     @staticmethod
     def _describe(api: _Api, element: int) -> UiaElement:
-        runtime_id: tuple[int, ...] | None = None
-        psa = c_void_p()
-        hr = _method(element, _EL_GET_RUNTIME_ID, POINTER(c_void_p))(byref(psa))
-        if hr >= 0:
-            runtime_id = read_int_safearray(api, psa.value or 0) or None
-        rect = RECT()
-        _check(
-            _method(element, _EL_BOUNDING_RECTANGLE, POINTER(RECT))(byref(rect)),
-            "get_CurrentBoundingRectangle",
-        )
-        width, height = rect.right - rect.left, rect.bottom - rect.top
         return UiaElement(
-            runtime_id=runtime_id,
-            rect=Rect(rect.left, rect.top, width, height) if width > 0 and height > 0 else None,
+            runtime_id=_read_runtime_id(api, element),
+            rect=_read_rect(element),
             has_keyboard_focus=_read_bool(
                 element, _EL_HAS_KEYBOARD_FOCUS, "get_CurrentHasKeyboardFocus"
             ),
             offscreen=_read_bool(element, _EL_IS_OFFSCREEN, "get_CurrentIsOffscreen"),
+        )
+
+
+# -------------------------------------------------------------- tree walk
+@dataclass(frozen=True, slots=True)
+class UiaNode:
+    """An element handed out by a :class:`ControlView` (valid until it closes)."""
+
+    ptr: int
+
+
+class ControlView:
+    """Step through the control view of one window, one element at a time.
+
+    Every element handed out is held until :meth:`close` (or the end of a
+    ``with`` block) releases it, together with the tree walker; nothing is
+    released earlier, so a caller bounds what it holds by bounding its walk.
+    Only the properties below are read: never names, values or text.
+    """
+
+    def __init__(self, api: _Api, uia: int, hwnd: int) -> None:
+        self._api = api
+        self._uia = uia
+        self._held: list[int] = []
+        self._walker = 0
+        self._closed = False
+        self.root: UiaNode | None = None
+        try:
+            self._walker = _out_ptr(
+                uia, _UIA_GET_CONTROL_VIEW_WALKER, "IUIAutomation::get_ControlViewWalker"
+            )
+            if not self._walker:
+                raise ComError("IUIAutomation::get_ControlViewWalker", E_POINTER)
+            self.root = self._hold(
+                _out_ptr(
+                    uia,
+                    _UIA_ELEMENT_FROM_HANDLE,
+                    "IUIAutomation::ElementFromHandle",
+                    c_void_p(hwnd),
+                    argtypes=(c_void_p,),
+                )
+            )
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self) -> ControlView:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    @property
+    def held(self) -> int:
+        """How many elements are held (released by :meth:`close`)."""
+        return len(self._held)
+
+    def close(self) -> None:
+        """Release every element handed out and the walker (idempotent)."""
+        self._closed = True
+        held, self._held = self._held, []
+        walker, self._walker = self._walker, 0
+        for ptr in reversed(held):
+            _release(ptr)
+        _release(walker)
+
+    # ------------------------------------------------------------ navigation
+    def first_child(self, node: UiaNode) -> UiaNode | None:
+        return self._step(node, _WALKER_FIRST_CHILD, "GetFirstChildElement")
+
+    def last_child(self, node: UiaNode) -> UiaNode | None:
+        return self._step(node, _WALKER_LAST_CHILD, "GetLastChildElement")
+
+    def next_sibling(self, node: UiaNode) -> UiaNode | None:
+        return self._step(node, _WALKER_NEXT_SIBLING, "GetNextSiblingElement")
+
+    def previous_sibling(self, node: UiaNode) -> UiaNode | None:
+        return self._step(node, _WALKER_PREVIOUS_SIBLING, "GetPreviousSiblingElement")
+
+    def focused(self) -> UiaNode | None:
+        """The element with the keyboard focus, on the whole desktop."""
+        self._ensure_open()
+        return self._hold(
+            _out_ptr(self._uia, _UIA_GET_FOCUSED_ELEMENT, "IUIAutomation::GetFocusedElement")
+        )
+
+    # ------------------------------------------------------------ properties
+    def control_type(self, node: UiaNode) -> int:
+        return _read_int(self._ptr(node), _EL_CONTROL_TYPE, "get_CurrentControlType")
+
+    def process_id(self, node: UiaNode) -> int:
+        return _read_int(self._ptr(node), _EL_PROCESS_ID, "get_CurrentProcessId")
+
+    def class_name(self, node: UiaNode) -> str:
+        return _read_bstr(self._api, self._ptr(node), _EL_CLASS_NAME, "get_CurrentClassName")
+
+    def automation_id(self, node: UiaNode) -> str:
+        return _read_bstr(self._api, self._ptr(node), _EL_AUTOMATION_ID, "get_CurrentAutomationId")
+
+    def is_keyboard_focusable(self, node: UiaNode) -> bool:
+        return _read_bool(
+            self._ptr(node), _EL_IS_KEYBOARD_FOCUSABLE, "get_CurrentIsKeyboardFocusable"
+        )
+
+    def is_offscreen(self, node: UiaNode) -> bool:
+        return _read_bool(self._ptr(node), _EL_IS_OFFSCREEN, "get_CurrentIsOffscreen")
+
+    def rect(self, node: UiaNode) -> Rect | None:
+        """Bounding rectangle in physical pixels, global coordinates; ``None`` if empty."""
+        return _read_rect(self._ptr(node))
+
+    def runtime_id(self, node: UiaNode) -> tuple[int, ...] | None:
+        return _read_runtime_id(self._api, self._ptr(node))
+
+    def set_focus(self, node: UiaNode) -> None:
+        """Give ``node`` the keyboard focus (:class:`ComError` if that fails)."""
+        _check(_method(self._ptr(node), _EL_SET_FOCUS)(), "IUIAutomationElement::SetFocus")
+
+    # ------------------------------------------------------------- internals
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise ComError("ControlView (closed)", E_POINTER)
+
+    def _ptr(self, node: UiaNode) -> int:
+        self._ensure_open()
+        return node.ptr
+
+    def _hold(self, ptr: int) -> UiaNode | None:
+        if not ptr:
+            return None
+        self._held.append(ptr)
+        return UiaNode(ptr)
+
+    def _step(self, node: UiaNode, index: int, what: str) -> UiaNode | None:
+        ptr = self._ptr(node)
+        return self._hold(
+            _out_ptr(
+                self._walker,
+                index,
+                f"IUIAutomationTreeWalker::{what}",
+                c_void_p(ptr),
+                argtypes=(c_void_p,),
+            )
         )

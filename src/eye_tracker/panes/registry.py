@@ -6,6 +6,11 @@ Asking those about their contents through accessibility interfaces can switch
 them into a slower screen-reader mode, so they are never inspected at all, not
 even by a provider's :meth:`~.types.PaneProvider.applies`. Editors such as VS
 Code get their own, purpose-built support later instead.
+
+The one exception is opt-in: with ``panes.desktop_apps`` on, the desktop apps
+that have a profile in :mod:`.providers.chromium_apps` (matched by process
+name *and* window class; today only the Claude app) skip the deny-list and go
+to that provider alone. Every other denied app stays denied.
 """
 
 from __future__ import annotations
@@ -17,6 +22,8 @@ from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 from ..types import AppIdentity, Rect, WindowRef
+from .providers.chromium_apps import PROVIDER_NAME as DESKTOP_APPS_PROVIDER
+from .providers.chromium_apps import profile_for
 from .types import PaneProvider
 
 if TYPE_CHECKING:
@@ -33,6 +40,8 @@ DENIED_PROCESSES: frozenset[str] = frozenset(
         "cursor",
         "claude",
         "chatgpt",
+        "antigravity",
+        "windsurf",
         "chrome",
         "google chrome",
         "chromium",
@@ -71,16 +80,29 @@ DENIED_APP_IDS: frozenset[str] = frozenset(
 )
 
 
-def is_denied(app: AppIdentity) -> bool:
-    """Whether windows of ``app`` must never be inspected for panes."""
+def is_denied(app: AppIdentity, *, desktop_apps: bool = False) -> bool:
+    """Whether windows of ``app`` must never be inspected for panes.
+
+    ``desktop_apps`` is the ``panes.desktop_apps`` setting: when it is on, an
+    app with a desktop-app profile is not denied (and only the desktop-app
+    provider is asked about it, see :meth:`PaneRegistry.providers_for`).
+    """
+    if desktop_apps and profile_for(app) is not None:
+        return False
     return app.process.strip().lower() in DENIED_PROCESSES or app.app_id in DENIED_APP_IDS
 
 
 class PaneRegistry:
-    """The enabled providers, in order of preference."""
+    """The enabled providers, in order of preference.
 
-    def __init__(self, providers: Iterable[PaneProvider] = ()) -> None:
+    ``desktop_apps`` is the ``panes.desktop_apps`` setting (see :func:`is_denied`).
+    """
+
+    def __init__(
+        self, providers: Iterable[PaneProvider] = (), *, desktop_apps: bool = False
+    ) -> None:
         self._providers: tuple[PaneProvider, ...] = tuple(providers)
+        self._desktop_apps = desktop_apps
 
     @property
     def providers(self) -> tuple[PaneProvider, ...]:
@@ -89,12 +111,20 @@ class PaneRegistry:
     def providers_for(self, app: AppIdentity | None) -> list[PaneProvider]:
         """The providers that may know panes of ``app``; none for a denied app.
 
-        The deny-list is checked before any provider is asked anything.
+        The deny-list is checked before any provider is asked anything. An app
+        with a desktop-app profile, when ``desktop_apps`` is on, goes to the
+        desktop-app provider and to no other; no other app goes to that one.
         """
-        if app is None or is_denied(app):
+        if app is None:
             return []
+        if self._desktop_apps and profile_for(app) is not None:
+            candidates = [p for p in self._providers if p.name == DESKTOP_APPS_PROVIDER]
+        elif is_denied(app):
+            return []
+        else:
+            candidates = [p for p in self._providers if p.name != DESKTOP_APPS_PROVIDER]
         found: list[PaneProvider] = []
-        for provider in self._providers:
+        for provider in candidates:
             try:
                 if provider.applies(app):
                     found.append(provider)
@@ -112,6 +142,7 @@ class PaneRegistry:
 #: like the built-in ones, and must not touch the system before it is used.
 _OPTIONAL_PROVIDERS: tuple[tuple[str, str, str, frozenset[str]], ...] = (
     ("windows_terminal", "windows_terminal", "WindowsTerminalProvider", frozenset({"win32"})),
+    ("desktop_apps", "chromium_apps", "ChromiumAppProvider", frozenset({"win32"})),
 )
 
 

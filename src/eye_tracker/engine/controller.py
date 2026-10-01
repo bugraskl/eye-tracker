@@ -539,10 +539,10 @@ def _layout_key(monitors: list[Monitor]) -> tuple[tuple[int, int, int, int, int]
     return tuple((m.index, m.rect.x, m.rect.y, m.rect.w, m.rect.h) for m in monitors)
 
 
-def _pane_providers(settings: Settings) -> tuple[bool, bool, bool]:
+def _pane_providers(settings: Settings) -> tuple[bool, bool, bool, bool]:
     """The provider switches of the split-pane settings."""
     p = settings.panes
-    return (p.tmux, p.wezterm, p.windows_terminal)
+    return (p.tmux, p.wezterm, p.windows_terminal, p.desktop_apps)
 
 
 def _trace_id(value: Any) -> str | int | None:
@@ -1534,7 +1534,10 @@ class Controller(QObject):
         return bool(s.panes.enabled and s.switching.enabled and self._panes_supported())
 
     def _default_pane_registry(self, settings: Settings) -> PaneRegistry:
-        return PaneRegistry(default_providers(settings.panes, client_rect=self._pane_client_rect))
+        return PaneRegistry(
+            default_providers(settings.panes, client_rect=self._pane_client_rect),
+            desktop_apps=settings.panes.desktop_apps,
+        )
 
     def _pane_client_rect(self, ref: WindowRef) -> Rect | None:  # pane worker thread
         rect = self._platform_call("window_client_rect", ref)
@@ -1605,7 +1608,7 @@ class Controller(QObject):
                 self._pane_window = dataclasses.replace(current, rect=ref.rect)
             fresh = False
         app = self._pane_app
-        if app is None or is_denied(app):
+        if app is None or is_denied(app, desktop_apps=self._settings.panes.desktop_apps):
             return
         if not fresh:
             gaze = self._last_gaze

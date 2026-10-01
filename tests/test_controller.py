@@ -2874,7 +2874,7 @@ def make_pane_controller(
         settings or pane_settings(),
         platform=platform,
         start=False,
-        pane_registry_factory=lambda s: PaneRegistry([provider]),
+        pane_registry_factory=lambda s: PaneRegistry([provider], desktop_apps=s.panes.desktop_apps),
         pane_worker_factory=worker,
         **kwargs,
     )
@@ -2947,6 +2947,37 @@ def test_denied_apps_are_never_inspected(make_controller: Callable[..., Harness]
     h.feed(gaze_obs(RIGHT_PANE), 3.0)
     assert provider.calls == []  # not even applies()
     assert h.controller.status()["panes"]["panes"] == 0
+
+
+def test_the_claude_app_is_inspected_only_when_desktop_apps_is_on(
+    make_controller: Callable[..., Harness],
+) -> None:
+    claude = AppIdentity("claude", "Chrome_WidgetWin_1")
+    h, provider = make_pane_controller(make_controller, app=claude)
+    provider.name = "desktop_apps"
+    settle_mouse(h)
+    h.feed(gaze_obs(RIGHT_PANE), 3.0)
+    assert provider.calls == []  # denied: not even applies()
+    on = h.controller.settings.copy()
+    on.panes.desktop_apps = True
+    h.controller.apply_settings(on)
+    h.feed(gaze_obs(RIGHT_PANE), 3.0)
+    assert ("detect", TERMINAL.handle) in provider.calls
+    assert ("focus", "%1") in provider.calls
+
+
+def test_desktop_apps_never_opens_other_chromium_apps(
+    make_controller: Callable[..., Harness],
+) -> None:
+    s = pane_settings()
+    s.panes.desktop_apps = True
+    h, provider = make_pane_controller(
+        make_controller, s, app=AppIdentity("code", "Chrome_WidgetWin_1")
+    )
+    provider.name = "desktop_apps"
+    settle_mouse(h)
+    h.feed(gaze_obs(RIGHT_PANE), 3.0)
+    assert provider.calls == []
 
 
 def test_pane_dwell_raises_the_frame_rate(make_controller: Callable[..., Harness]) -> None:

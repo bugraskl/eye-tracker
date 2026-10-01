@@ -43,6 +43,11 @@ _SESSION_VARS = (
     "XDG_RUNTIME_DIR",
 )
 
+#: The real ``subprocess.run``: the autouse ``tools`` fixture replaces it (it is
+#: the same function as ``linux.subprocess.run``), but the tests against the
+#: real kernel need real child processes.
+_real_subprocess_run = subprocess.run
+
 
 class Clock:
     def __init__(self, now: float = 1000.0) -> None:
@@ -90,6 +95,8 @@ class FakeTools:
         if isinstance(best, BaseException):
             raise best
         rc, out = best(argv) if callable(best) else best
+        if kwargs.get("check") and rc:  # like the real one: never fail silently
+            raise subprocess.CalledProcessError(rc, argv, out, "")
         return subprocess.CompletedProcess(argv, rc, out, "")
 
     def names(self) -> list[str]:
@@ -2037,8 +2044,11 @@ def test_real_notifier_reports_opens(tmp_path: Path, kind: str) -> None:
     try:
         with open(node, "rb"):
             pass
-        # The child opens read-write, like a capture attempt.
-        subprocess.run([sys.executable, "-c", f"open({str(node)!r}, 'r+b').close()"], check=True)
+        # The child opens read-write, like a capture attempt. (A real process: the
+        # faked subprocess.run never started it, and only our own open was seen.)
+        _real_subprocess_run(
+            [sys.executable, "-c", f"open({str(node)!r}, 'r+b').close()"], check=True, timeout=60
+        )
         events: list[linux._CameraEvent] = []
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline and not any(e.wrote for e in events):

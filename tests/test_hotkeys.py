@@ -802,14 +802,18 @@ def test_last_error_explains_failures(
         assert not loopback.register("t", "ctrl+alt+t", lambda: None)
     assert loopback.last_error("t") == reason
     assert reason in caplog.text
-    # … otherwise a generic message is recorded.
+    # … otherwise a generic message is recorded. Messages name a combination the
+    # way this system shows it (macOS: modifier glyphs).
+    mac = sys.platform == "darwin"
     loopback.taken.add(parse_hotkey(COMBO))
     assert not loopback.register("t", COMBO, lambda: None)
-    assert loopback.last_error("t") == "Ctrl+Alt+Shift+F24 could not be registered"
+    combo = "⌃⌥⇧F24" if mac else "Ctrl+Alt+Shift+F24"
+    assert loopback.last_error("t") == f"{combo} could not be registered"
     # A clash inside this manager names the other action.
     assert loopback.register("a", COMBO_2, lambda: None)
     assert not loopback.register("b", COMBO_2, lambda: None)
-    assert loopback.last_error("b") == "Ctrl+Alt+Shift+F21 is already used for a"
+    combo_2 = "⌃⌥⇧F21" if mac else "Ctrl+Alt+Shift+F21"
+    assert loopback.last_error("b") == f"{combo_2} is already used for a"
     # Success clears the error.
     assert loopback.register("t", "ctrl+alt+shift+f20", lambda: None)
     assert loopback.last_error("t") is None

@@ -443,7 +443,13 @@ class TestHelpers:
         assert boot <= created
         exe = WindowsPlatform._process_exe(os.getpid())
         assert exe is not None
-        assert Path(exe).name.lower() == own.name
+        assert Path(exe).is_absolute()
+        if sys.platform == "win32":
+            assert Path(exe).name.lower() == own.name  # Windows names a process after its image
+        else:
+            # The kernel's process name: a `#!` script's own name (pytest started
+            # through its launcher script), else the executable's.
+            assert own.name in {Path(exe).name.lower(), Path(sys.argv[0]).name.lower()}
         assert WindowsPlatform._process_exe(-1) is None
         assert WindowsPlatform._process_created(-1) is None
 

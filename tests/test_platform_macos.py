@@ -79,6 +79,8 @@ def recorder(monkeypatch: pytest.MonkeyPatch) -> Recorder:
 
     monkeypatch.setattr(macos, "_load_library", no_library)
     monkeypatch.setattr(macos, "_IS_MACOS", False)
+    # Behaviour that depends on the macOS release must not depend on the test host.
+    monkeypatch.setattr(macos, "_macos_major_version", lambda: 0)
     return rec
 
 
@@ -691,8 +693,9 @@ def test_activate_window_refuses_minimised(
 
 
 def test_activate_app_without_accessibility(
-    plat: macos.MacPlatform, ax: FakeAX, appkit: FakeAppKit
+    plat: macos.MacPlatform, ax: FakeAX, appkit: FakeAppKit, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(macos, "_macos_major_version", lambda: 13)
     ax.trusted = False
     assert plat.activate_window(WindowRef(handle=(PID, None))) is True
     assert appkit.apps[PID].activations == [2]
@@ -701,6 +704,12 @@ def test_activate_app_without_accessibility(
     assert plat.activate_window(WindowRef(handle=(PID, None))) is False
     assert plat.activate_window(WindowRef(handle=(OTHER_PID, None))) is False  # not running
     assert plat.activate_window(WindowRef(handle="bogus")) is False
+    # macOS 14+ ignores activation requests from an inactive (menu-bar) app while
+    # still reporting success: asked anyway, but reported as failed.
+    monkeypatch.setattr(macos, "_macos_major_version", lambda: 14)
+    appkit.apps[PID].activate_result = True
+    assert plat.activate_window(WindowRef(handle=(PID, None))) is False
+    assert appkit.apps[PID].activations == [2, 2, 2]
 
 
 def test_is_window_valid(plat: macos.MacPlatform, ax: FakeAX, appkit: FakeAppKit) -> None:

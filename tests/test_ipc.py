@@ -12,6 +12,7 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -222,7 +223,14 @@ def test_server_name_depends_on_the_config_dir(qapp: Any, tmp_path: Path) -> Non
     finally:
         paths.set_base_override(None)
     assert first != second
-    assert first.startswith("eye-tracker-")
+    for name in (first, second):
+        directory, base = os.path.split(name)
+        assert base.startswith("eye-tracker-")
+        # A bare name (Qt chooses the place) or, on Linux, a socket path in the
+        # private runtime directory (the autouse fixture's), unless that is too long.
+        if directory:
+            assert sys.platform.startswith("linux")
+            assert directory == str(tmp_path)
 
 
 def test_server_name_uses_the_runtime_dir_on_linux(
@@ -314,9 +322,14 @@ def test_send_command_hands_over_the_foreground_right(
 # ------------------------------------------------------------------ instance lock
 def test_instance_lock_is_exclusive(app_dirs: Path) -> None:
     first, second = ipc.InstanceLock(), ipc.InstanceLock()
-    # In the config directory, or next to the socket when that is a path (Linux).
-    assert first.path.name == f"{os.path.basename(ipc.server_name())}.lock"
-    assert first.path.parent in (app_dirs, Path(ipc.server_name()).parent)
+    name = ipc.server_name()
+    assert first.path.name == f"{os.path.basename(name)}.lock"
+    if os.path.isabs(name):  # Linux: next to the socket
+        assert first.path.parent == Path(name).parent
+    elif sys.platform == "darwin":  # next to Qt's socket in the private, local $TMPDIR
+        assert first.path.parent == Path(tempfile.gettempdir())
+    else:  # Windows: in the (local) config directory
+        assert first.path.parent == app_dirs
     assert first.acquire()
     assert first.acquire()  # idempotent
     assert first.is_held
@@ -592,17 +605,19 @@ def test_client_of_another_account_is_refused(
     handled: list[str] = []
     server = server_factory(recorder(handled))
     assert server.listen()
-    monkeypatch.setattr(ipc, "_client_is_trusted", lambda socket: False)
-    with caplog.at_level(logging.DEBUG, logger="eye_tracker.ipc"):
-        assert ipc.send_command("privacy-on", timeout_ms=300) is None
-        assert ipc.send_command("quit", timeout_ms=300) is None
-    for _ in range(3):
-        QCoreApplication.processEvents()
+    # Its own context: undoing the test's whole monkeypatch would also restore the
+    # real $XDG_RUNTIME_DIR (autouse fixture), and with it move the Linux socket path.
+    with monkeypatch.context() as patch:
+        patch.setattr(ipc, "_client_is_trusted", lambda socket: False)
+        with caplog.at_level(logging.DEBUG, logger="eye_tracker.ipc"):
+            assert ipc.send_command("privacy-on", timeout_ms=300) is None
+            assert ipc.send_command("quit", timeout_ms=300) is None
+        for _ in range(3):
+            QCoreApplication.processEvents()
     assert handled == []
     refusals = [r for r in caplog.records if "Refused a command connection" in r.getMessage()]
     # Loud once, quiet afterwards: a client retrying in a loop must not flood the log.
     assert [r.levelno for r in refusals] == [logging.WARNING, logging.DEBUG]
-    monkeypatch.undo()
     assert ipc.send_command("status") == "ok"  # our own clients still get through
 
 

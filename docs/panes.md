@@ -3,8 +3,8 @@
 Eye Tracker moves the cursor and the keyboard focus to the monitor you look at. With split-pane
 focus on, it goes one step further: when you look at another pane of the focused terminal window,
 on the monitor you are already working on, that pane gets the keyboard focus. Nothing is typed or
-clicked for you: Eye Tracker asks the terminal itself, through its own command-line tool, to focus
-the pane. The cursor stays where it is.
+clicked for you: Eye Tracker asks the terminal itself to focus the pane, through its own
+command-line tool or, for Windows Terminal, through UI Automation. The cursor stays where it is.
 
 It is **off by default**. Turn it on with **Follow split panes** in the tray menu, under
 **Settings → Switching → Split panes (experimental)**, or with `panes.enabled` in
@@ -16,7 +16,7 @@ It is **off by default**. Turn it on with **Follow split panes** in the tray men
 |---|---|---|
 | tmux | `tmux list-clients`, `list-panes`, `select-pane` | In Windows Terminal, WezTerm, Alacritty, kitty, GNOME Terminal, Konsole, xterm, iTerm2, Terminal, foot, Ghostty, Tilix and the Xfce terminal. The tmux client running in the focused window is found through the window's processes. On Windows, tmux inside WSL is used when the window runs WSL and exactly one tmux client is attached there. Only the default tmux server is asked. |
 | WezTerm | `wezterm cli --no-auto-start list`, `list-clients`, `activate-pane` | WezTerm's own split panes, in the tab on screen. Never starts a WezTerm server. |
-| Windows Terminal | coming | The setting `panes.windows_terminal` is already there. |
+| Windows Terminal | UI Automation: the `TermControl` elements of the window, `SetFocus` | Windows only. Windows Terminal's own split panes, in the tab on screen. Which pane is active can only be seen while Windows Terminal is the foreground window, so its panes are asked for (and focused) only then. With a single Windows Terminal pane, tmux running in it is followed instead; tmux panes inside one of several Windows Terminal panes are not followed yet. |
 | VS Code, Cursor, JetBrains IDEs | planned | Editors need purpose-built support (see below). |
 
 Supported platforms: Windows, macOS and Linux on X11. Wayland does not tell applications which
@@ -29,7 +29,8 @@ Electron and Chromium applications (VS Code, Cursor, the Claude and ChatGPT apps
 Firefox, Slack, Teams, Discord, Obsidian, and on Windows every window of the class
 `Chrome_WidgetWin_1`) are **never inspected**, not even to ask whether they have panes: asking them
 about their contents can switch them into a slower screen-reader mode. A zoomed pane (tmux `Ctrl+B
-z`, WezTerm's zoom) fills the window, so nothing happens while one is zoomed.
+z`, WezTerm's and Windows Terminal's zoom) fills the window, so nothing happens while one is
+zoomed.
 
 ## How it decides
 
@@ -69,6 +70,9 @@ enough, the gaze error in use and how many pane switches happened.
 ## Privacy
 
 tmux and WezTerm are asked through their command-line tools, which talk to the multiplexer over
-its local socket on your computer (inside WSL for tmux there); nothing reaches the network. Only
-pane positions, sizes and ids are read: pane titles, commands, working directories and contents are
-never stored, logged or shown. See [privacy](privacy.md#what-the-app-does-not-do).
+its local socket on your computer (inside WSL for tmux there); nothing reaches the network. Windows
+Terminal is asked through UI Automation, the Windows accessibility interface, inside your session;
+only the bounding rectangle, keyboard focus, visibility and runtime id of its terminal controls are
+read, never their text or names. Only pane positions, sizes and ids are read: pane titles,
+commands, working directories and contents are never stored, logged or shown. See
+[privacy](privacy.md#what-the-app-does-not-do).

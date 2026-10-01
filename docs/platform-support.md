@@ -13,7 +13,7 @@ feature matrix for your machine. Commands on this page are written as `eye-track
 | Cursor follows your gaze | ✅ | ✅ | ✅ | ⚠️ sway / Hyprland exact; others via `ydotool` |
 | Cursor returns to where you left it on a monitor | ✅ | ✅ | ✅ | ❌ lands in the middle² |
 | Keyboard focus follows | ✅ | ✅ needs Accessibility | ✅ | ❌ not allowed by Wayland |
-| Split-pane focus (experimental, tmux and WezTerm)⁴ | ✅ | ✅ | ✅ | ❌ |
+| Split-pane focus (experimental: tmux, WezTerm; Windows Terminal on Windows)⁴ | ✅ | ✅ | ✅ | ❌ |
 | Learns from your mouse use | ✅ | ✅ | ✅ | ❌² |
 | Walk-away lock | ✅ | ✅ | ✅ | ✅ |
 | Displays off / wake | ✅ | ✅ | ✅ DPMS | ✅ GNOME, KDE, sway, Hyprland |

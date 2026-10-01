@@ -80,6 +80,8 @@ share a short one.
 - With the experimental [split-pane focus](panes.md) on, it asks tmux and WezTerm where their panes
   are through their own command-line tools (`tmux`, `wezterm cli`). Those talk to the multiplexer
   over its local socket on your computer (for tmux in WSL, inside WSL); nothing reaches the network.
+  Windows Terminal is asked through UI Automation (Windows' accessibility interface), on your
+  computer as well, and only for the position, focus and id of its terminal panes, never their text.
   Only pane positions, sizes and ids are read: pane titles, commands, working directories and
   contents are never stored, logged, traced or shown in `eye-tracker ctl status`. Electron and
   Chromium apps are never asked anything.

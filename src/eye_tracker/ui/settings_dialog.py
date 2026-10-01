@@ -1306,8 +1306,9 @@ class SettingsDialog(QDialog):
         )
         panes.addRow(
             self._hint(
-                "Works with tmux and WezTerm panes on the monitor you are on. Small panes are "
-                "left alone: how small depends on how accurate your calibration is."
+                "Works with tmux, WezTerm and Windows Terminal panes on the monitor you are on. "
+                "Small panes are left alone: how small depends on how accurate your calibration "
+                "is."
             )
         )
         self._depends(follow, [precision])

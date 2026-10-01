@@ -76,7 +76,7 @@ _PRIVACY_REMEMBERED_TIP = "; it stays on after a restart"
 _CALIBRATE_TIP = "Look at a few dots so the tracker learns your monitors"
 _PANES_TIP = (
     "Experimental: keyboard focus also follows your gaze between large split panes "
-    "of tmux and WezTerm"
+    "of tmux, WezTerm and Windows Terminal"
 )
 
 

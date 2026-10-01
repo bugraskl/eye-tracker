@@ -46,7 +46,7 @@ network.
 | 🧠 | **Head pose + iris fusion** | 478 face landmarks, including both irises, not just head direction. Works with glasses. |
 | 🛡️ | **No accidental switches** | Dwell time, hysteresis at the bezels, typing and mouse grace periods, and glances at your phone or desk are ignored. |
 | 📖 | **Reading-aware** | Copying from a document on the other screen? Focus stays in your editor while you read. |
-| 🪟 | **Split-pane focus** (experimental) | Off by default. Look at another pane of a tmux or WezTerm window and it gets the keyboard focus; panes too small for your calibration's accuracy are left alone ([details](docs/panes.md)). |
+| 🪟 | **Split-pane focus** (experimental) | Off by default. Look at another pane of a tmux, WezTerm or Windows Terminal window and it gets the keyboard focus; panes too small for your calibration's accuracy are left alone ([details](docs/panes.md)). |
 | 🎯 | **Learns as you work** | Every time you move the mouse somewhere and stop, the calibration gets a little better. |
 | 🚶 | **Walk-away lock** | No face and no input for 45 s: lock and/or displays off, announced by a 10 s countdown during the last seconds. Displays wake when you return. Until the setup assistant is finished, it only shows a notification. |
 | 🙈 | **Privacy mode** | One hotkey releases the camera completely; the webcam light goes out. It stays on after a restart or an update until you turn it off. |
@@ -222,7 +222,7 @@ Glance Switch inspired this project. This comparison uses the features listed on
 | Source code | Open | Closed |
 | Network use | None | Licence key check + daily update check |
 | Tracking | Head pose + iris landmarks | Head pose (+ eye position for panes) |
-| Split-pane focus in terminals and editors | Not yet | ✅ |
+| Split-pane focus in terminals and editors | Terminals (experimental) | ✅ |
 | Learns from your mouse use | ✅ | ✅ (from clicks) |
 | Walk-away lock / displays off | ✅ | Not listed |
 | Shoulder-surfer guard | ✅ | Not listed |
@@ -291,7 +291,7 @@ if you move it.
 
 ## Roadmap
 
-- Split-pane focus beyond tmux and WezTerm: Windows Terminal, VS Code and Cursor, JetBrains IDEs
+- Split-pane focus in editors (VS Code and Cursor, JetBrains IDEs) and for tmux in a split Windows Terminal
 - Signed and notarised builds
 - Intel macOS builds
 - Translations of the user interface

@@ -173,8 +173,8 @@ class PaneSettings:
     enabled: bool = _opt(
         False,
         doc="Experimental: also move keyboard focus between split panes of supported "
-        "terminals (tmux, WezTerm) on the monitor you are already on. Only panes large "
-        "enough for your calibration's accuracy take part.",
+        "terminals (tmux, WezTerm, Windows Terminal) on the monitor you are already on. "
+        "Only panes large enough for your calibration's accuracy take part.",
     )
     dwell_ms: int = _opt(
         600, lo=100, hi=5000, doc="How long you must look at another pane before it gets focus."
@@ -217,7 +217,7 @@ class PaneSettings:
     tmux: bool = _opt(True, doc="Follow tmux panes (through the tmux command, also in WSL).")
     wezterm: bool = _opt(True, doc="Follow WezTerm panes (through the wezterm command).")
     windows_terminal: bool = _opt(
-        True, doc="Follow Windows Terminal panes (once supported; ignored until then)."
+        True, doc="Follow Windows Terminal panes (Windows only, through UI Automation)."
     )
 
 

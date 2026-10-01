@@ -70,7 +70,7 @@ of 120 px that is 300 px. Supported terminals and the full rules: [split-pane fo
 
 | Key | Default | Allowed | Description |
 |---|---|---|---|
-| `panes.enabled` | `false` |  | Experimental: also move keyboard focus between split panes of supported terminals (tmux, WezTerm) on the monitor you are already on. Only panes large enough for your calibration's accuracy take part. |
+| `panes.enabled` | `false` |  | Experimental: also move keyboard focus between split panes of supported terminals (tmux, WezTerm, Windows Terminal) on the monitor you are already on. Only panes large enough for your calibration's accuracy take part. |
 | `panes.dwell_ms` | `600` | 100 – 5000 | How long you must look at another pane before it gets focus. |
 | `panes.typing_grace_ms` | `3000` | 0 – 20000 | No pane switching for this long after you type. |
 | `panes.reading_grace_ms` | `8000` | 0 – 60000 | After you typed while looking at another pane (e.g. reading its output), switching to that pane waits this long after your last keystroke instead of the typing grace. 0 turns this off. |
@@ -81,7 +81,7 @@ of 120 px that is 300 px. Supported terminals and the full rules: [split-pane fo
 | `panes.min_pane_px` | `240` | 0 – 4000 | Panes narrower (or lower) than this many pixels never take part. |
 | `panes.tmux` | `true` |  | Follow tmux panes (through the tmux command, also in WSL). |
 | `panes.wezterm` | `true` |  | Follow WezTerm panes (through the wezterm command). |
-| `panes.windows_terminal` | `true` |  | Follow Windows Terminal panes (once supported; ignored until then). |
+| `panes.windows_terminal` | `true` |  | Follow Windows Terminal panes (Windows only, through UI Automation). |
 
 ## Walk-away (presence)
 

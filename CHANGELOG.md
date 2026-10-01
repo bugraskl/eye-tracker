@@ -10,9 +10,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 - Project website at https://bugraskl.github.io/eye-tracker/ in English and Turkish, rebuilt
   with the download links of every release.
-- Split-pane focus (experimental, off by default): looking at another pane of a tmux or WezTerm
-  window on the monitor you work on gives that pane the keyboard focus, through the tools' own
-  command-line interfaces (tmux also inside WSL). Only panes several times larger than your
+- Split-pane focus (experimental, off by default): looking at another pane of a tmux, WezTerm or
+  Windows Terminal window on the monitor you work on gives that pane the keyboard focus, through the
+  tools' own command-line interfaces (tmux also inside WSL) or, for Windows Terminal, UI Automation
+  (while it is the foreground window). Only panes several times larger than your
   calibration's gaze error take part; the typing, reading and mouse graces apply, and Electron and
   Chromium apps are never inspected. Turn it on with **Follow split panes** in the tray menu or in
   **Settings → Switching**; see [split-pane focus](docs/panes.md).

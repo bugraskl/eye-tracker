@@ -394,6 +394,32 @@ def test_first_run_wizard_then_calibration(
     assert fake_autostart == ["refresh"]  # "Start at login" was left unticked
 
 
+def test_putting_off_the_offered_calibration_says_what_that_means(
+    build: Callable[..., Harness], qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """r3-ux-docs-01: Esc on the calibration the setup assistant opened left no hint."""
+    h = build(settings=Settings(), monitors=TWO_MONITORS, background=False)
+    titles = _tray_messages(h, monkeypatch)
+    settle(qapp)
+    wizard = h.app.wizard
+    assert wizard is not None
+    wizard.accept()  # "Calibrate now" is ticked with two monitors
+    settle(qapp)
+    window = h.app.calibration_window
+    assert window is not None
+    window.cancel()
+    settle(qapp)
+    assert titles == ["Calibration needed"]
+    # One the user asked for and cancelled needs no such hint (even unannounced).
+    h.app._announced.clear()
+    h.tray.open_calibration.emit()
+    window = h.app.calibration_window
+    assert window is not None
+    window.cancel()
+    settle(qapp)
+    assert titles == ["Calibration needed"]
+
+
 def test_background_start_skips_the_wizard(
     build: Callable[..., Harness], qapp: QApplication
 ) -> None:

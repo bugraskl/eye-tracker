@@ -367,6 +367,13 @@ def test_calibrate_subcommand_runs_the_app_in_calibration_mode(
     assert args.background is True
 
 
+def _pretend_platform(monkeypatch: pytest.MonkeyPatch, platform: str) -> None:
+    """Pretend to run on ``platform`` (``sys.platform``). ``shutil.which`` takes
+    Windows-only code paths when that says win32, so it finds nothing here."""
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(cli.shutil, "which", lambda name, *args, **kwargs: None)
+
+
 @pytest.fixture
 def popen(monkeypatch: pytest.MonkeyPatch) -> list[tuple[list[str], dict[str, Any]]]:
     """Records what would be started; never starts anything (no GUI on this desktop)."""
@@ -389,7 +396,7 @@ def test_the_windows_console_command_starts_the_app_on_its_own(
 ) -> None:
     """r3-ux-docs-06: run in the terminal, the app died with the terminal window."""
     folder = package("eye-tracker.exe", "eye-tracker-cli.exe", "EyeTracker.exe")
-    monkeypatch.setattr(sys, "platform", "win32")
+    _pretend_platform(monkeypatch, "win32")
     monkeypatch.setattr(cli, "_instance_running", lambda: False)
     trace = env / "trace.jsonl"
     assert cli.main(["--camera", "1", "--log-level", "debug", "--trace", str(trace)]) == 0
@@ -422,7 +429,7 @@ def test_the_console_command_hands_over_to_a_running_app_itself(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     package("eye-tracker-cli.exe", "EyeTracker.exe")
-    monkeypatch.setattr(sys, "platform", "win32")
+    _pretend_platform(monkeypatch, "win32")
     monkeypatch.setattr(cli, "_instance_running", lambda: True)
     assert cli.main(["--camera", "1"]) == 0
     assert popen == []
@@ -443,7 +450,7 @@ def test_other_executables_run_the_app_in_place(
     running: str,
 ) -> None:
     package(running, "EyeTracker.exe", "Eye Tracker")
-    monkeypatch.setattr(sys, "platform", platform)
+    _pretend_platform(monkeypatch, platform)
     monkeypatch.setattr(cli, "_instance_running", lambda: False)
     assert cli.main([]) == 0
     assert popen == []
@@ -457,7 +464,7 @@ def test_a_failed_detached_start_runs_the_app_in_place(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     package("eye-tracker-cli.exe", "EyeTracker.exe")
-    monkeypatch.setattr(sys, "platform", "win32")
+    _pretend_platform(monkeypatch, "win32")
     monkeypatch.setattr(cli, "_instance_running", lambda: False)
 
     def refuse(args: list[str], **kwargs: Any) -> None:

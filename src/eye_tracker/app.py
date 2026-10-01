@@ -83,6 +83,9 @@ log = logging.getLogger(__name__)
 #: unannounced could hide a dialog the user is working with, such as the
 #: operating system's "keep these display settings?" countdown.
 EXPLICIT_CALIBRATION_REASONS = frozenset({"hotkey", "ipc", "user"})
+#: Calibrations the app offered rather than the user asked for (``open_calibration``
+#: reasons): closing one without saving brings the "Calibration needed" notice.
+_OFFERED_CALIBRATIONS = frozenset({"wizard", "cli"})
 #: With ``--background`` (login start) notifications stay quiet this long.
 STARTUP_QUIET_S = 20.0
 #: Clicking a "calibration needed" or "finish setup" notification later than
@@ -639,7 +642,7 @@ class EyeTrackerApp(QObject):
         log.info("Opening the calibration (%s)", reason)
         self._prompt = None
         window = CalibrationWindow(self._controller, self)
-        window.finished.connect(functools.partial(self._on_calibration_finished, window))
+        window.finished.connect(functools.partial(self._on_calibration_finished, window, reason))
         # Assigned before start(): start() emits finished(False) at once when
         # there is no monitor, and the slot clears this reference.
         self._calibration = window
@@ -732,11 +735,16 @@ class EyeTrackerApp(QObject):
     def _on_wizard_calibrate(self) -> None:
         self.open_calibration("wizard")
 
-    def _on_calibration_finished(self, window: CalibrationWindow, saved: bool) -> None:
+    def _on_calibration_finished(self, window: CalibrationWindow, reason: str, saved: bool) -> None:
         if self._calibration is window:
             self._calibration = None
         window.deleteLater()
         log.info("Calibration %s", "saved" if saved else "closed without saving")
+        controller = self._controller
+        if not saved and reason in _OFFERED_CALIBRATIONS and controller is not None:
+            # Offered rather than asked for (setup assistant, --calibrate): whoever
+            # put it off learns what that means, and that a click brings it back.
+            self._suggest_calibration(controller.calibration_reason)
 
     def _on_settings_closed(self, dialog: SettingsDialog, _result: int) -> None:
         if self._settings_dialog is dialog:

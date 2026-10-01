@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Eye Tracker: look at a monitor, your cursor follows</title>
+  <meta name="description" content="Free, open-source app that moves your mouse cursor and keyboard focus to the monitor you look at, using any webcam. Fully offline, for Windows, macOS and Linux.">
+  <link rel="canonical" href="{{SITE_URL}}">
+  <link rel="alternate" hreflang="en" href="{{SITE_URL}}">
+  <link rel="alternate" hreflang="tr" href="{{SITE_URL}}tr/">
+  <link rel="alternate" hreflang="x-default" href="{{SITE_URL}}">
+  <meta name="theme-color" content="#0b1022">
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Eye Tracker">
+  <meta property="og:title" content="Eye Tracker: look at a monitor, your cursor follows">
+  <meta property="og:description" content="Free, open-source glance-to-switch for multi-monitor setups. Any webcam, fully offline, Windows, macOS and Linux.">
+  <meta property="og:url" content="{{SITE_URL}}">
+  <meta property="og:image" content="{{SITE_URL}}assets/og.png">
+  <meta property="og:image:width" content="1920">
+  <meta property="og:image:height" content="960">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:locale:alternate" content="tr_TR">
+  <meta name="twitter:card" content="summary_large_image">
+  <script>document.documentElement.classList.add("js");</script>
+  <link rel="stylesheet" href="assets/style.css">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Eye Tracker",
+    "applicationCategory": "UtilitiesApplication",
+    "operatingSystem": "Windows 10, Windows 11, macOS 14+, Linux",
+    "softwareVersion": "{{VERSION}}",
+    "description": "Moves the mouse cursor and keyboard focus to the monitor you look at, using any webcam. Fully offline.",
+    "url": "{{SITE_URL}}",
+    "downloadUrl": "{{RELEASE_URL}}",
+    "license": "https://opensource.org/licenses/MIT",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+    "author": { "@type": "Person", "name": "Buğra Şıkel", "url": "https://github.com/bugraskl" }
+  }
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-github" viewBox="0 0 24 24"><path fill="currentColor" d="M12 .5a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2.1c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.7-.3-5.5-1.3-5.5-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.7 1.7.2 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .5Z"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></symbol>
+    <symbol id="i-keyboard" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6l-8-3Z"/><path d="m9 12 2 2 4-4"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2V5Z"/><path d="M4 19a2 2 0 0 0 2 2h13"/><path d="M8 7h7M8 11h5"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M5.6 18.4l2.8-2.8M15.6 8.4l2.8-2.8"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></symbol>
+    <symbol id="i-eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l18 18"/><path d="M10.6 5.1A10.4 10.4 0 0 1 12 5c6 0 10 7 10 7a17 17 0 0 1-3.2 3.9M6.6 6.6C3.9 8.4 2 12 2 12s4 7 10 7c1.6 0 3-.4 4.3-1"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></symbol>
+    <symbol id="i-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14a6 6 0 0 1 3.5 6"/></symbol>
+    <symbol id="i-video" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="m16 10 6-3v10l-6-3"/></symbol>
+    <symbol id="i-monitors" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="4" width="9.5" height="7.5" rx="1.2"/><rect x="13" y="4" width="9.5" height="7.5" rx="1.2"/><rect x="7" y="14" width="10" height="6.5" rx="1.2"/></symbol>
+    <symbol id="i-power" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/></symbol>
+    <symbol id="i-cpu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5" stroke-width="1.8"/><path d="m8 12.5 2.7 2.7L16.5 9.5"/></symbol>
+    <symbol id="i-windows" viewBox="0 0 24 24"><path fill="currentColor" d="M3 5.1 10.4 4v7.2H3V5.1Zm0 13.8 7.4 1.1v-7.1H3v6Zm8.3 1.2L21 21.5V13h-9.7v7.1Zm0-16.2v7.3H21V2.5l-9.7 1.4Z"/></symbol>
+    <symbol id="i-apple" viewBox="0 0 24 24"><path fill="currentColor" d="M16.4 12.6c0-2.6 2.1-3.8 2.2-3.9-1.2-1.8-3.1-2-3.7-2-1.6-.2-3.1.9-3.9.9-.8 0-2-.9-3.4-.9a5 5 0 0 0-4.2 2.6c-1.8 3.1-.5 7.7 1.3 10.2.8 1.2 1.8 2.6 3.1 2.5 1.2 0 1.7-.8 3.2-.8s1.9.8 3.2.8c1.3 0 2.2-1.2 3-2.4a10 10 0 0 0 1.4-2.8 4.2 4.2 0 0 1-2.2-4.2ZM14 5c.7-.8 1.1-1.9 1-3-1 0-2.1.6-2.8 1.4-.6.7-1.2 1.8-1 2.9 1.1.1 2.1-.5 2.8-1.3Z"/></symbol>
+    <symbol id="i-linux" viewBox="0 0 24 24"><path fill="currentColor" d="M12 2c-2.2 0-3.6 1.8-3.6 4.3 0 1.2.2 2.1-.4 3.2-.9 1.6-2.8 3.8-3 6.3-.1 1.2.3 2 .9 2.4-.3.5-.4 1.2.2 1.7.9.8 2.6.2 3.6.7.9.5 1.4.4 2-.1.3-.3.7-.4 1.3-.4s1 .1 1.3.4c.6.5 1.1.6 2 .1 1-.5 2.7.1 3.6-.7.6-.5.5-1.2.2-1.7.6-.4 1-1.2.9-2.4-.2-2.5-2.1-4.7-3-6.3-.6-1.1-.4-2-.4-3.2C15.6 3.8 14.2 2 12 2Zm-1.4 4.3c.4 0 .7.5.7 1.1s-.3 1.1-.7 1.1-.7-.5-.7-1.1.3-1.1.7-1.1Zm2.8 0c.4 0 .7.5.7 1.1s-.3 1.1-.7 1.1-.7-.5-.7-1.1.3-1.1.7-1.1ZM12 9.4c.9 0 2 .6 2 1 0 .5-1.1 1.1-2 1.1s-2-.6-2-1.1c0-.4 1.1-1 2-1Z"/></symbol>
+  </svg>
+
+  <header class="site-header">
+    <nav class="container nav" aria-label="Main">
+      <a class="brand" href="./" aria-label="Eye Tracker home">
+        <img src="assets/favicon.png" alt="" width="30" height="30">
+        Eye Tracker
+      </a>
+      <ul class="nav-links">
+        <li><a href="#how">How it works</a></li>
+        <li><a href="#features">Features</a></li>
+        <li><a href="#privacy">Privacy</a></li>
+        <li><a href="#download">Download</a></li>
+        <li><a href="https://github.com/bugraskl/eye-tracker/tree/main/docs">Docs</a></li>
+      </ul>
+      <div class="nav-actions">
+        <div class="lang-switch" role="group" aria-label="Language">
+          <span aria-current="true" lang="en">EN</span>
+          <a href="tr/" lang="tr" hreflang="tr">TR</a>
+        </div>
+        <a class="btn btn-ghost btn-small" href="https://github.com/bugraskl/eye-tracker">
+          <svg aria-hidden="true"><use href="#i-github"/></svg>GitHub
+        </a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="container hero-grid">
+        <div>
+          <span class="eyebrow">Open source · Free · 100% offline</span>
+          <h1><span>Look at a screen.</span> <span class="accent-text">Your cursor follows.</span></h1>
+          <p class="lead">Eye Tracker watches your head and eyes through the webcam you already have and moves the mouse cursor, and keyboard focus, to the monitor you are looking at. Stop dragging the mouse across screens before you can type.</p>
+          <div class="hero-cta">
+            <a class="btn btn-primary" href="#download" data-download
+               data-windows-href="{{WIN_SETUP_URL}}" data-windows-label="Download for Windows" data-windows-meta="{{WIN_SETUP_SIZE}}"
+               data-macos-href="{{MAC_DMG_URL}}" data-macos-label="Download for macOS" data-macos-meta="{{MAC_DMG_SIZE}}"
+               data-linux-href="{{LINUX_APPIMAGE_URL}}" data-linux-label="Download for Linux" data-linux-meta="{{LINUX_APPIMAGE_SIZE}}">
+              <svg aria-hidden="true"><use href="#i-download"/></svg>
+              <span class="btn-label">Download</span>
+              <span class="btn-meta"></span>
+            </a>
+            <a class="btn btn-ghost" href="https://github.com/bugraskl/eye-tracker">
+              <svg aria-hidden="true"><use href="#i-github"/></svg>View on GitHub
+            </a>
+          </div>
+          <p class="hero-meta">Version {{VERSION}} · Windows 10/11 · macOS 14+ · Linux · <a href="https://github.com/bugraskl/eye-tracker/blob/main/LICENSE">MIT licence</a></p>
+        </div>
+        <div class="demo-frame">
+          <div class="demo-bar" aria-hidden="true"><i></i><i></i><i></i><span>Tracking</span></div>
+          <img src="assets/demo.svg" width="960" height="420"
+               alt="Animation: looking at the left monitor moves the cursor and keyboard focus there; looking right brings them back.">
+        </div>
+      </div>
+    </section>
+
+    <section class="stats" aria-label="At a glance">
+      <div class="container stats-grid">
+        <div class="stat"><strong>0.55%</strong><span>CPU on an 8-core desktop</span></div>
+        <div class="stat"><strong>0</strong><span>network connections, verified in CI</span></div>
+        <div class="stat"><strong>478</strong><span>face landmarks, including both irises</span></div>
+        <div class="stat"><strong>~15 s</strong><span>calibration per monitor</span></div>
+      </div>
+    </section>
+
+    <section class="section" id="how">
+      <div class="container">
+        <div class="section-head reveal">
+          <span class="kicker">How it works</span>
+          <h2>Calibrate once. Then just look.</h2>
+          <p>A personal gaze model learns how your head and eyes move when you look at each of your monitors.</p>
+        </div>
+        <div class="steps">
+          <article class="step reveal">
+            <h3>Calibrate</h3>
+            <p>Follow a few dots with your eyes, about 15 seconds per monitor. Every desk setup gets its own profile, so docking at home and at work just works.</p>
+          </article>
+          <article class="step reveal">
+            <h3>Glance</h3>
+            <p>Look at another monitor for 0.3 s. Head pose and iris position are combined, and quick glances at your phone or keyboard are ignored.</p>
+          </article>
+          <article class="step reveal">
+            <h3>Type</h3>
+            <p>The cursor lands where you left it on that monitor, and the last window you used there gets keyboard focus. No synthetic clicks.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-alt" id="features">
+      <div class="container">
+        <div class="section-head reveal">
+          <span class="kicker">Features</span>
+          <h2>Built for people who live on more than one screen</h2>
+          <p>Everything a glance-to-switch tool needs, plus presence and privacy features you won't find elsewhere.</p>
+        </div>
+        <div class="features">
+          <article class="feature reveal">
+            <span class="icon"><svg aria-hidden="true"><use href="#i-keyboard"/></svg></span>
+            <h3>Keyboard focus follows</h3>
+            <p>Start typing right after you look. The last window you used on that monitor is focused for you.</p>
+          </article>
+          <article class="feature reveal">
+            <span class="icon"><svg aria-hidden="true"><use href="#i-shield"/></svg></span>
+            <h3>No accidental switches</h3>
+            <p>Dwell time, hysteresis at the bezels, and grace periods while you type or use the mouse keep focus where you want it.</p>
+          </article>
+          <article class="feature reveal">
+            <span class="icon"><svg aria-hidden="true"><use href="#i-book"/></svg></span>
+            <h3>Reading-aware</h3>
+            <p>Copying from a document on the other screen? Focus stays in your editor while you pause to read.</p>
+          </article>
+          <article class="feature reveal">
+            <span class="icon"><svg aria-hidden="true"><use href="#i-spark"/></svg></span>
+            <h3>Learns as you work</h3>
+            <p>Every time you move the mouse somewhere and stop, the calibration gets a little better.</p>
+          </article>
+          <article class="feature reveal">
+            <span class="icon"><svg aria-hidden="true"><use href="#i-lock"/></svg></span>
+            <h3>Walk-away lock</h3>
+            <p>Leave your desk and the screen locks or the displays switch off after a short countdown. They wake when you return.</p>
+          </article>
+          <article class="feature reveal">
+            <span class="icon"><svg aria-hidden="true"><use href="#i-eye-off"/></svg></span>
+            <h3>Privacy mode</h3>
+            <p>One hotkey releases the camera completely, and the webcam light goes out. It stays off across restarts.</p>
+          </article>
+          <article class="feature reveal">
+            <span class="icon"><svg aria-hidden="true"><use href="#i-users"/></svg></span>
+            <h3>Shoulder guard</h3>
+            <p>Someone looking over your shoulder? Blank the screens, get a notification, or lock. Faces are counted, never recognised.</p>
+          </article>
+          <article class="feature reveal">
+            <span class="icon"><svg aria-hidden="true"><use href="#i-video"/></svg></span>
+            <h3>Plays nice with calls</h3>
+            <p>When Teams, Zoom or another app needs the camera, Eye Tracker steps aside and comes back when the call ends.</p>
+          </article>
+          <article class="feature reveal">
+            <span class="icon"><svg aria-hidden="true"><use href="#i-monitors"/></svg></span>
+            <h3>Any layout</h3>
+            <p>Two, three or more monitors, side by side, stacked, or a laptop below an external screen.</p>
+          </article>
+          <article class="feature reveal">
+            <span class="icon"><svg aria-hidden="true"><use href="#i-cpu"/></svg></span>
+            <h3>Tiny CPU footprint</h3>
+            <p>An adaptive frame rate and a motion gate that skips unchanged frames keep it around half a percent of CPU.</p>
+          </article>
+          <article class="feature reveal">
+            <span class="icon"><svg aria-hidden="true"><use href="#i-power"/></svg></span>
+            <h3>Starts with your computer</h3>
+            <p>Optional start at login on all three platforms, quietly in the background.</p>
+          </article>
+          <article class="feature reveal">
+            <span class="icon"><svg aria-hidden="true"><use href="#i-keyboard"/></svg></span>
+            <h3>Hotkeys and command line</h3>
+            <p>Layout-safe global hotkeys, plus <code>eye-tracker ctl</code> to bind actions to your own shortcuts.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="privacy">
+      <div class="container privacy-grid">
+        <div class="reveal">
+          <div class="section-head">
+            <span class="kicker">Privacy</span>
+            <h2>A camera app you can actually trust</h2>
+            <p>Eye Tracker sees your face all day, so privacy is designed in, and anyone can check it.</p>
+          </div>
+          <div class="callout">
+            <h3>We removed MediaPipe's runtime because it phones home</h3>
+            <p>The face-landmark model comes from Google's MediaPipe (Apache-2.0), but its runtime contains a usage logger that connects to Google's servers. Eye Tracker runs the same model through OpenCV instead, with identical results, and the runtime is not shipped.</p>
+            <span class="verified"><svg aria-hidden="true"><use href="#i-check"/></svg>Every release is scanned for networking code</span>
+          </div>
+        </div>
+        <ul class="promise-list reveal">
+          <li><svg aria-hidden="true"><use href="#i-check"/></svg><div><strong>No network access at all</strong><p>No telemetry, no update checks, no accounts. CI fails on any networking code, in the source and in every bundled library.</p></div></li>
+          <li><svg aria-hidden="true"><use href="#i-check"/></svg><div><strong>Frames are never stored</strong><p>Camera frames are analysed in memory for a few milliseconds and never written to disk.</p></div></li>
+          <li><svg aria-hidden="true"><use href="#i-check"/></svg><div><strong>Only numbers are kept</strong><p>The calibration file holds head angles, iris ratios and screen points. It is plain JSON you can read.</p></div></li>
+          <li><svg aria-hidden="true"><use href="#i-check"/></svg><div><strong>Off means off</strong><p>Privacy mode, pause and a locked screen release the camera device, so the webcam light goes out.</p></div></li>
+          <li><svg aria-hidden="true"><use href="#i-check"/></svg><div><strong>No key logging</strong><p>Typing is detected from the system's idle timer, never by reading keys.</p></div></li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="section section-alt" id="compare">
+      <div class="container">
+        <div class="section-head reveal">
+          <span class="kicker">Compared</span>
+          <h2>Open, free and on every desktop</h2>
+          <p>Glance Switch inspired this project. Here is how they differ, based on the features listed on glanceswitch.com in October 2026.</p>
+        </div>
+        <div class="table-wrap reveal">
+          <table>
+            <thead><tr><th scope="col"></th><th scope="col">Eye Tracker</th><th scope="col">Glance Switch</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Platforms</th><td class="us">Windows, macOS 14+ (Apple silicon; Intel from source), Linux</td><td>macOS 14+ (Apple silicon and Intel)</td></tr>
+              <tr><th scope="row">Price</th><td class="us">Free, MIT licence</td><td>$14.99 one-time</td></tr>
+              <tr><th scope="row">Source code</th><td class="us">Open</td><td>Closed</td></tr>
+              <tr><th scope="row">Network use</th><td class="us">None</td><td>Licence key check and daily update check</td></tr>
+              <tr><th scope="row">Tracking</th><td class="us">Head pose + iris landmarks</td><td>Head pose (+ eye position for panes)</td></tr>
+              <tr><th scope="row">Split-pane focus in terminals and editors</th><td class="no">Not yet</td><td class="yes">Yes</td></tr>
+              <tr><th scope="row">Learns from your mouse use</th><td class="yes">Yes</td><td class="yes">Yes (from clicks)</td></tr>
+              <tr><th scope="row">Walk-away lock / displays off</th><td class="yes">Yes</td><td class="no">Not listed</td></tr>
+              <tr><th scope="row">Shoulder-surfer guard</th><td class="yes">Yes</td><td class="no">Not listed</td></tr>
+              <tr><th scope="row">Automatic camera hand-off to calls</th><td class="yes">Windows, Linux (app list on macOS)</td><td class="no">Not listed</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="download">
+      <div class="container">
+        <div class="section-head center reveal">
+          <span class="kicker">Download</span>
+          <h2>Get Eye Tracker {{VERSION}}</h2>
+          <p>Free and open source. Released {{RELEASE_DATE}}.</p>
+        </div>
+        <div class="downloads">
+          <article class="download reveal" id="download-windows">
+            <div class="download-head">
+              <svg aria-hidden="true"><use href="#i-windows"/></svg>
+              <h3>Windows</h3>
+              <span class="badge">Your system</span>
+            </div>
+            <p class="req">Windows 10 or 11, 64-bit</p>
+            <div class="download-files">
+              <a class="btn btn-primary" href="{{WIN_SETUP_URL}}"><span>Installer (.exe)</span><span class="btn-meta">{{WIN_SETUP_SIZE}}</span></a>
+              <a class="btn btn-ghost" href="{{WIN_ZIP_URL}}"><span>Portable (.zip)</span><span class="btn-meta">{{WIN_ZIP_SIZE}}</span></a>
+            </div>
+            <p class="note">Per-user install, no administrator rights. Builds are not code-signed yet: if SmartScreen warns, choose <em>More info → Run anyway</em>.</p>
+          </article>
+          <article class="download reveal" id="download-macos">
+            <div class="download-head">
+              <svg aria-hidden="true"><use href="#i-apple"/></svg>
+              <h3>macOS</h3>
+              <span class="badge">Your system</span>
+            </div>
+            <p class="req">macOS 14 or later, Apple silicon</p>
+            <div class="download-files">
+              <a class="btn btn-primary" href="{{MAC_DMG_URL}}"><span>Disk image (.dmg)</span><span class="btn-meta">{{MAC_DMG_SIZE}}</span></a>
+            </div>
+            <p class="note">Not notarised yet: the first time, right-click the app and choose <em>Open</em>. Intel Macs can <a href="https://github.com/bugraskl/eye-tracker#run-from-source">run from source</a>.</p>
+          </article>
+          <article class="download reveal" id="download-linux">
+            <div class="download-head">
+              <svg aria-hidden="true"><use href="#i-linux"/></svg>
+              <h3>Linux</h3>
+              <span class="badge">Your system</span>
+            </div>
+            <p class="req">x86_64, glibc 2.35+ (Ubuntu 22.04 or newer)</p>
+            <div class="download-files">
+              <a class="btn btn-primary" href="{{LINUX_APPIMAGE_URL}}"><span>AppImage</span><span class="btn-meta">{{LINUX_APPIMAGE_SIZE}}</span></a>
+              <a class="btn btn-ghost" href="{{LINUX_TAR_URL}}"><span>Tarball (.tar.gz)</span><span class="btn-meta">{{LINUX_TAR_SIZE}}</span></a>
+            </div>
+            <p class="note">Full features on X11. On Wayland the cursor follows on sway and Hyprland (or with ydotool); see the <a href="https://github.com/bugraskl/eye-tracker/blob/main/docs/platform-support.md">platform notes</a>.</p>
+          </article>
+        </div>
+        <div class="download-foot">
+          <a href="{{SHA256SUMS_URL}}">SHA256SUMS.txt</a>
+          <a href="{{RELEASE_URL}}">Release notes</a>
+          <a href="https://github.com/bugraskl/eye-tracker/releases">All releases</a>
+          <a href="https://github.com/bugraskl/eye-tracker/blob/main/docs/calibration.md">Calibration guide</a>
+        </div>
+        <div class="source-install reveal">
+          Prefer to run from source? You need <a href="https://docs.astral.sh/uv/">uv</a>:
+          <pre><code>git clone https://github.com/bugraskl/eye-tracker.git
+cd eye-tracker
+uv sync
+uv run eye-tracker</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section-alt" id="faq">
+      <div class="container">
+        <div class="section-head center reveal">
+          <span class="kicker">FAQ</span>
+          <h2>Questions people ask</h2>
+        </div>
+        <div class="faq reveal">
+          <details>
+            <summary>Does it work with glasses?</summary>
+            <p>Yes. Strong reflections can hide the irises; if the calibration grade is poor, tilt the camera or the lamp slightly.</p>
+          </details>
+          <details>
+            <summary>I have one monitor. Is this useful?</summary>
+            <p>Switching needs two or more monitors, but walk-away lock, privacy mode and the shoulder guard work with one.</p>
+          </details>
+          <details>
+            <summary>Will it steal focus while I'm typing?</summary>
+            <p>No. Nothing switches while you type (and for 2 s after), while you use the mouse (1.5 s), or while you pause to read the other monitor during typing (6 s). All of these are adjustable.</p>
+          </details>
+          <details>
+            <summary>What happens when I look at my phone?</summary>
+            <p>Glances away from every monitor are recognised from your calibrated range of head and eye movement, and ignored.</p>
+          </details>
+          <details>
+            <summary>Does it record me?</summary>
+            <p>No. Frames exist only in memory for a few milliseconds while they are analysed. Nothing is written to disk or sent anywhere.</p>
+          </details>
+          <details>
+            <summary>Which webcam do I need?</summary>
+            <p>Any webcam works, built-in or external. Place it where it stays, ideally centred above your monitors, and recalibrate if you move it.</p>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="container">
+        <div class="cta reveal">
+          <h2>Give your mouse a break</h2>
+          <p>Free, open source, and private by design. Takes a minute to set up.</p>
+          <div class="hero-cta">
+            <a class="btn btn-primary" href="#download" data-download
+               data-windows-href="{{WIN_SETUP_URL}}" data-windows-label="Download for Windows" data-windows-meta="{{WIN_SETUP_SIZE}}"
+               data-macos-href="{{MAC_DMG_URL}}" data-macos-label="Download for macOS" data-macos-meta="{{MAC_DMG_SIZE}}"
+               data-linux-href="{{LINUX_APPIMAGE_URL}}" data-linux-label="Download for Linux" data-linux-meta="{{LINUX_APPIMAGE_SIZE}}">
+              <svg aria-hidden="true"><use href="#i-download"/></svg>
+              <span class="btn-label">Download</span>
+              <span class="btn-meta"></span>
+            </a>
+            <a class="btn btn-ghost" href="https://github.com/bugraskl/eye-tracker">
+              <svg aria-hidden="true"><use href="#i-github"/></svg>Star on GitHub
+            </a>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">
+      <div class="footer-grid">
+        <div class="footer-about">
+          <a class="brand" href="./"><img src="assets/favicon.png" alt="" width="30" height="30">Eye Tracker</a>
+          <p>Look at a monitor and your cursor and keyboard focus follow. This site uses no cookies and no analytics either.</p>
+        </div>
+        <div>
+          <h4>Project</h4>
+          <ul>
+            <li><a href="https://github.com/bugraskl/eye-tracker">GitHub</a></li>
+            <li><a href="https://github.com/bugraskl/eye-tracker/releases">Releases</a></li>
+            <li><a href="https://github.com/bugraskl/eye-tracker/blob/main/CHANGELOG.md">Changelog</a></li>
+            <li><a href="https://github.com/bugraskl/eye-tracker/issues">Report an issue</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Docs</h4>
+          <ul>
+            <li><a href="https://github.com/bugraskl/eye-tracker/blob/main/docs/calibration.md">Calibration</a></li>
+            <li><a href="https://github.com/bugraskl/eye-tracker/blob/main/docs/platform-support.md">Platform support</a></li>
+            <li><a href="https://github.com/bugraskl/eye-tracker/blob/main/docs/troubleshooting.md">Troubleshooting</a></li>
+            <li><a href="https://github.com/bugraskl/eye-tracker/blob/main/docs/architecture.md">Architecture</a></li>
+          </ul>
+        </div>
+        <div>
+          <h4>Trust</h4>
+          <ul>
+            <li><a href="https://github.com/bugraskl/eye-tracker/blob/main/docs/privacy.md">Privacy</a></li>
+            <li><a href="https://github.com/bugraskl/eye-tracker/blob/main/SECURITY.md">Security</a></li>
+            <li><a href="https://github.com/bugraskl/eye-tracker/blob/main/LICENSE">MIT licence</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© {{YEAR}} Buğra Şıkel · MIT licence</span>
+        <span>Face model: MediaPipe Face Landmarker (Apache-2.0) · YuNet (MIT)</span>
+      </div>
+    </div>
+  </footer>
+
+  <script src="assets/site.js" defer></script>
+</body>
+</html>

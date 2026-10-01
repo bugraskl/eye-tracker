@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <b>English</b> · <a href="README.tr.md">Türkçe</a>
+  <a href="https://bugraskl.github.io/eye-tracker/"><b>Website</b></a> · <b>English</b> · <a href="README.tr.md">Türkçe</a>
 </p>
 
 <p align="center">

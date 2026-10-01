@@ -6,6 +6,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+
+- Project website at https://bugraskl.github.io/eye-tracker/ in English and Turkish, rebuilt
+  with the download links of every release.
+
 ## [0.1.0] - 2026-10-01
 
 ### Added

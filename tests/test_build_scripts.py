@@ -660,7 +660,7 @@ def _joined(text: str) -> str:
     return re.sub(r" *\\\n *", " ", text)
 
 
-_WORKFLOW_FILES = ["ci.yml", "build.yml", "release.yml", "bundle.yml"]
+_WORKFLOW_FILES = ["ci.yml", "build.yml", "release.yml", "bundle.yml", "pages.yml"]
 #: How release.yml and bundle.yml run the one build definition (same commit, no tag).
 _BUILD_CALL = "./.github/workflows/build.yml"
 

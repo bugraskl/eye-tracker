@@ -163,6 +163,22 @@ Every workflow has read-only permissions unless a job needs more, uses actions p
 SHAs (kept current by Dependabot), and runs in a concurrency group: a newer push cancels an older
 check, while release runs never cancel each other.
 
+## Website
+
+The project website, https://bugraskl.github.io/eye-tracker/, is built from [`site/`](../site/)
+(an English and a Turkish page sharing one stylesheet and script). It loads nothing from other
+sites: no web fonts, no analytics, no cookies. The download buttons are filled in from the latest
+GitHub release at build time, so [`pages.yml`](../.github/workflows/pages.yml) rebuilds and
+deploys it on every published release and on changes to the site.
+
+To build and preview it locally:
+
+```bash
+gh api repos/bugraskl/eye-tracker/releases/latest > release.json   # optional
+uv run python scripts/build_site.py --release release.json --out _site
+uv run python -m http.server 8000 --directory _site
+```
+
 ## Releasing
 
 1. Update `__version__` in `src/eye_tracker/__init__.py` and move the **Unreleased** notes in

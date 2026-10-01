@@ -281,6 +281,112 @@ def test_allows_legitimate_code(source: str) -> None:
     assert _rules(source) == []
 
 
+@pytest.mark.parametrize(
+    ("source", "rule"),
+    [
+        # r3-packaging-05: Foundation does HTTP(S) on its own, and the app's macOS code
+        # already loads Foundation through pyobjc (importlib.import_module).
+        (
+            "import importlib\nF = importlib.import_module('Foundation')\n"
+            "F.NSURLSession.sharedSession().dataTaskWithRequest_(r).resume()",
+            "macos-network",
+        ),
+        ("from Foundation import NSURLSession", "macos-network"),
+        ("Foundation.NSURLSessionConfiguration.defaultSessionConfiguration()", "macos-network"),
+        ("task = x.NSURLSessionDataTask", "macos-network"),
+        ("Foundation.NSMutableURLRequest.requestWithURL_(url)", "macos-network"),
+        (
+            "NSURLConnection.sendSynchronousRequest_returningResponse_error_(r, None, None)",
+            "macos-network",
+        ),
+        ("Foundation.NSURLDownload.alloc()", "macos-network"),
+        ("Foundation.NSHost.hostWithName_('example.org')", "macos-network"),
+        ("Foundation.NSNetServiceBrowser.new()", "macos-network"),
+        ("getattr(load(), 'NSURLSession')", "macos-network"),
+        ("import objc\nobjc.lookUpClass('NSURLConnection')", "macos-network"),
+        ("NSClassFromString('NSURLSession')", "macos-network"),
+        # Reading whatever a URL names: a web address is fetched over the network.
+        (
+            "from Foundation import NSData, NSURL\n"
+            "NSData.dataWithContentsOfURL_(NSURL.URLWithString_('https://example.org/c.json'))",
+            "macos-network",
+        ),
+        ("def get(url):\n    return NSData.dataWithContentsOfURL_(url)", "macos-network"),
+        ("NSData.alloc().initWithContentsOfURL_options_error_(url, 0, None)", "macos-network"),
+        ("NSString.stringWithContentsOfURL_encoding_error_(url, 4, None)", "macos-network"),
+        ("NSDictionary.dictionaryWithContentsOfURL_(url)", "macos-network"),
+        ("AppKit.NSImage.alloc().initByReferencingURL_(url)", "macos-network"),
+        ("NSData.dataWithContentsOfURL_()", "macos-network"),
+        ("read = NSData.dataWithContentsOfURL_", "macos-network"),
+        ("getattr(NSData, 'dataWithContentsOfURL_')(url)", "macos-network"),
+        # A name that may hold a web address is not a file URL.
+        (
+            "url = NSURL.fileURLWithPath_(path)\nif remote:\n    url = NSURL.URLWithString_(s)\n"
+            "NSData.dataWithContentsOfURL_(url)",
+            "macos-network",
+        ),
+        # Core Foundation's sockets to hosts and HTTP streams (pyobjc's CoreFoundation).
+        (
+            "import CoreFoundation as cf\n"
+            "cf.CFStreamCreatePairWithSocketToHost(None, host, 80, None, None)",
+            "macos-network",
+        ),
+        ("from CoreFoundation import CFReadStreamCreateForHTTPRequest", "macos-network"),
+        # Apple's networking frameworks, imported or loaded.
+        ("import CFNetwork", "network-import"),
+        ("import importlib\nimportlib.import_module('Network')", "network-import"),
+        ("from WebKit import WKWebView", "network-import"),
+        (
+            "import objc\nobjc.loadBundle('CFNetwork', globals(), "
+            "bundle_path='/System/Library/Frameworks/CFNetwork.framework')",
+            "macos-network",
+        ),
+        (
+            "objc.loadBundle('X', {}, bundle_path='/System/Library/Frameworks/WebKit.framework')",
+            "macos-network",
+        ),
+        ("Foundation.NSBundle.bundleWithIdentifier_('com.apple.Network')", "macos-network"),
+        (
+            "import ctypes\nctypes.CDLL('/System/Library/Frameworks/WebKit.framework/WebKit')",
+            "native-network",
+        ),
+    ],
+)
+def test_detects_macos_networking(source: str, rule: str) -> None:
+    assert rule in _rules(source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # What the app's macOS code does with pyobjc (platform/macos.py).
+        "import importlib\nappkit = importlib.import_module('AppKit')\n"
+        "appkit.NSWorkspace.sharedWorkspace().frontmostApplication()",
+        "foundation.NSProcessInfo.processInfo().beginActivityWithOptions_reason_(o, 'x')",
+        "import objc\nobjc.loadBundle('AVFoundation', {}, bundle_path=AVF, scan_classes=False)\n"
+        "objc.lookUpClass('AVCaptureDevice')",
+        "objc.loadBundle('AVFoundation', {}, "
+        "bundle_path='/System/Library/Frameworks/AVFoundation.framework')",
+        "av.AVCaptureDevice.authorizationStatusForMediaType_(media)",
+        "app = appkit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)",
+        # File URLs are read locally.
+        "NSData.dataWithContentsOfURL_(NSURL.fileURLWithPath_(path))",
+        "NSData.alloc().initWithContentsOfURL_(NSURL.fileURLWithPath_isDirectory_(p, False))",
+        "url = NSURL.fileURLWithPath_(path)\n"
+        "NSString.stringWithContentsOfURL_encoding_error_(url, 4, None)",
+        "self.url = NSURL.fileURLWithPath_(p)\nother = self.url\n"
+        "NSData.dataWithContentsOfURL_(other)",
+        "NSImage.alloc().initByReferencingURL_(NSURL.URLWithString_('file:///tmp/icon.png'))",
+        # A URL object that is not read, and look-alike names.
+        "NSURL.URLWithString_('x-apple.systempreferences:com.apple.preference.security')",
+        "manager.contentsOfDirectoryAtURL_includingPropertiesForKeys_options_error_(u, None, 0, e)",
+        "NSURLRequestUseProtocolCachePolicy = 0\nhostname = 'NSHostName'",
+    ],
+)
+def test_allows_the_apps_pyobjc_code(source: str) -> None:
+    assert _rules(source) == []
+
+
 def test_reports_location(tmp_path: Path) -> None:
     bad = tmp_path / "leaky.py"
     bad.write_text("import os\n\nimport socket\n", encoding="utf-8")
@@ -850,10 +956,36 @@ def test_macos_allowlist_is_per_file_and_per_indicator(tmp_path: Path) -> None:
     assert result.allowed == []
 
 
-@pytest.mark.parametrize("framework", ["CFNetwork", "GSS", "Kerberos", "LDAP", "Network"])
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "OBJC_CLASS_$_NSURLSession",
+        "OBJC_CLASS_$_NSURLSessionConfiguration",
+        "OBJC_CLASS_$_NSURLConnection",
+        "OBJC_CLASS_$_NSURLDownload",
+        "CFReadStreamCreateForHTTPRequest",
+    ],
+)
+def test_foundation_url_loading_fails_the_gate(tmp_path: Path, symbol: str) -> None:
+    """r3-packaging-05: Foundation does HTTP(S) without CFNetwork being linked, so a
+    library that uploads with NSURLSession shows only in the classes it imports. A
+    URL or a request alone loads nothing."""
+    foundation = _SYSTEM + "Foundation.framework/Versions/C/Foundation"
+    others = ["OBJC_CLASS_$_NSURL", "OBJC_CLASS_$_NSMutableURLRequest", "objc_msgSend"]
+    binary = _macho([foundation, "/usr/lib/libobjc.A.dylib"], [symbol, *others])
+    root = _bundle(tmp_path, {_MAC + "somepkg/libuploader.dylib": binary})
+    result = check_privacy.scan_bundle(root)
+    assert [(f.rule, f.detail) for f in result.violations] == [
+        ("network-symbol", f"imports {symbol}")
+    ]
+    clean = _bundle(tmp_path / "clean", {_MAC + "lib.dylib": _macho([foundation], others)})
+    assert check_privacy.scan_bundle(clean).ok
+
+
+@pytest.mark.parametrize("framework", ["CFNetwork", "GSS", "Kerberos", "LDAP", "Network", "WebKit"])
 def test_macos_network_frameworks_are_networking_libraries(framework: str) -> None:
-    """Apple's network frameworks, and the counterparts of libgssapi, libkrb5 and
-    libldap, which the gate reports on Linux."""
+    """Apple's network frameworks, the counterparts of libgssapi, libkrb5 and libldap,
+    which the gate reports on Linux, and WebKit, a web browser engine."""
     path = f"{_SYSTEM}{framework}.framework/Versions/A/{framework}"
     binary = check_privacy.parse_binary(_macho([path, _SYSTEM + "Security.framework/Security"]))
     assert binary is not None

@@ -40,6 +40,22 @@ reports:
     A network command-line tool started as a subprocess (``curl``, ``wget``,
     ``ssh``...), also behind a shell or wrapper (``sh -c "curl ..."``,
     ``powershell -c "iwr ..."``, ``sudo wget``).
+``macos-network``
+    Apple's networking APIs as pyobjc exposes them, which the app's macOS code
+    could reach through the Foundation and Core Foundation modules it loads: the
+    URL-loading, host-name and Bonjour classes (``NSURLSession`` and its tasks,
+    ``NSURLConnection``, ``NSURLDownload``, ``NSURLRequest``, ``NSHost``,
+    ``NSNetService``...) and Core Foundation's host, socket and HTTP stream
+    functions (``CFStreamCreatePairWithSocketToHost``...), however they are
+    reached (attribute, import, ``getattr``, ``objc.lookUpClass``,
+    ``NSClassFromString``); a call of a ``...WithContentsOfURL_`` selector
+    (``NSData.dataWithContentsOfURL_``, ``NSString.stringWithContentsOfURL_...``,
+    ``initWithContentsOfURL_``, ``NSImage.initByReferencingURL_``), which reads a
+    web address as readily as a file, unless its URL is a file URL made with
+    ``NSURL.fileURLWithPath_`` (in place, or in a name that only ever holds one);
+    and ``objc.loadBundle`` (or ``NSBundle``) loading ``CFNetwork``, ``Network`` or
+    ``WebKit``. Importing pyobjc's ``CFNetwork``, ``Network`` or ``WebKit``
+    modules is a ``network-import``.
 ``syntax-error``
     A file that cannot be parsed, and therefore cannot be verified.
 
@@ -71,14 +87,17 @@ needed), and the bundle fails on:
     A binary that links a networking library (``WS2_32``, ``WININET``,
     ``WINHTTP``, ``DNSAPI``... on Windows; ``libcurl``, ``libssl``,
     ``libresolv``, ``libkrb5``... elsewhere; the ``CFNetwork``, ``Network``,
-    ``GSS`` and ``Kerberos`` frameworks on macOS) or Qt's own ``QtNetwork``,
-    and is not on the allow-list.
+    ``GSS``, ``Kerberos``, ``LDAP`` and ``WebKit`` frameworks on macOS) or Qt's
+    own ``QtNetwork``, and is not on the allow-list.
 ``network-symbol``
     An ELF or Mach-O binary that imports host-name resolution or remote
     connection functions (``getaddrinfo``, ``gethostbyname``...; on Linux and
-    macOS sockets live in libc, so the imported *symbols* are what matter) and
-    is not on the allow-list. Plain ``socket``/``connect`` are not flagged:
-    Qt, D-Bus and X11 use them for local (AF_UNIX) connections.
+    macOS sockets live in libc, so the imported *symbols* are what matter), or
+    Foundation's URL-loading classes (``_OBJC_CLASS_$_NSURLSession``,
+    ``NSURLConnection``, ``NSURLDownload``: Foundation is linked by every macOS
+    binary, so the classes it imports are what matter) and is not on the
+    allow-list. Plain ``socket``/``connect`` are not flagged: Qt, D-Bus and X11
+    use them for local (AF_UNIX) connections.
 ``unreadable-binary``
     A native binary whose headers cannot be parsed, so it cannot be verified.
 ``unreadable-archive``
@@ -188,6 +207,10 @@ NETWORK_MODULES: frozenset[str] = frozenset(
         "websockets",
         "zeroconf",
         "zmq",
+        # pyobjc's wrappers of Apple's networking frameworks.
+        "CFNetwork",
+        "Network",
+        "WebKit",
         # Telemetry, analytics and crash-reporting SDKs.
         "amplitude",
         "bugsnag",
@@ -275,6 +298,53 @@ QT_BANNED_MODULES: frozenset[str] = frozenset(
     }
 )
 
+#: Apple's networking classes and functions as pyobjc exposes them (Foundation and
+#: Core Foundation, which the app's macOS code loads): loading URLs, resolving host
+#: names, Bonjour, sockets to hosts. The names are unique to Apple's frameworks, so
+#: they are flagged wherever they appear, however the module was reached.
+MACOS_NETWORK_NAMES: frozenset[str] = frozenset(
+    {
+        "NSHost",
+        "NSMutableURLRequest",
+        "NSNetService",
+        "NSNetServiceBrowser",
+        "NSURLConnection",
+        "NSURLDownload",
+        "NSURLRequest",
+        "NSURLSession",
+        "CFHostCreateWithName",
+        "CFHostStartInfoResolution",
+        "CFReadStreamCreateForHTTPRequest",
+        "CFReadStreamCreateForStreamedHTTPRequest",
+        "CFSocketConnectToAddress",
+        "CFStreamCreatePairWithSocketToHost",
+        "CFURLCreateDataAndPropertiesFromResource",
+    }
+)
+#: Families of the classes above (``NSURLSessionConfiguration``, ``NSURLSessionDataTask``,
+#: ``NSURLConnectionDelegate``...).
+_MACOS_NETWORK_PREFIXES: tuple[str, ...] = ("NSURLSession", "NSURLConnection")
+#: Selectors (pyobjc spelling) that read whatever a URL names, a web address as
+#: readily as a file: ``NSData.dataWithContentsOfURL_``,
+#: ``NSString.stringWithContentsOfURL_encoding_error_``, ``initWithContentsOfURL_``,
+#: ``NSImage.initByReferencingURL_``... They are allowed with a file URL made in place.
+_MACOS_URL_READ = re.compile(r"[a-z](?:WithContentsOfURL|ByReferencingURL)_")
+#: ``NSURL`` constructors that can only make a file URL (``fileURLWithPath_``...).
+_FILE_URL_PREFIX = "fileURLWith"
+#: ``NSURL`` constructors from a string: a file URL when the literal says ``file:``.
+_URL_FROM_STRING: frozenset[str] = frozenset(
+    {"URLWithString_", "URLWithString_relativeToURL_", "initWithString_"}
+)
+#: How pyobjc code reaches a class or a framework by name.
+_OBJC_CLASS_LOOKUPS: frozenset[str] = frozenset(
+    {"lookUpClass", "NSClassFromString", "objc_getClass", "objc_lookUpClass"}
+)
+_OBJC_BUNDLE_LOADERS: frozenset[str] = frozenset(
+    {"loadBundle", "bundleWithPath_", "bundleWithIdentifier_"}
+)
+#: Frameworks that ``objc.loadBundle`` must not load (by name, path or identifier).
+MACOS_NETWORK_BUNDLES: frozenset[str] = frozenset({"CFNetwork", "Network", "WebKit"})
+
 #: Standard-library functions and classes that open connections or servers.
 #: asyncio's live on loops, streams and the package, so they are matched by name.
 NETWORK_APIS: frozenset[str] = frozenset(
@@ -348,9 +418,10 @@ POSIX_NETWORK_LIBRARIES: tuple[str, ...] = (
     "libwebsockets",
     "libzmq",
 )
-#: Apple's networking frameworks, and the counterparts of libgssapi, libkrb5 and libldap.
+#: Apple's networking frameworks, the counterparts of libgssapi, libkrb5 and libldap,
+#: and WebKit (a web browser engine).
 MACOS_NETWORK_FRAMEWORKS: frozenset[str] = frozenset(
-    {"CFNetwork", "GSS", "Kerberos", "LDAP", "Network"}
+    {"CFNetwork", "GSS", "Kerberos", "LDAP", "Network", "WebKit"}
 )
 
 #: Library names the source check refuses to load through ctypes.
@@ -636,12 +707,28 @@ def _is_native_network_lib(text: str) -> bool:
     stem = _native_lib_stem(text)
     if stem in NATIVE_NETWORK_LIBS or stem.startswith(POSIX_NETWORK_LIBRARIES):
         return True
-    # macOS frameworks: ".../Network.framework/Network", ".../CFNetwork.framework/..."
-    return "network.framework" in text.replace("\\", "/").lower()
+    # macOS frameworks: ".../Network.framework/Network", ".../CFNetwork.framework/...",
+    # ".../WebKit.framework/WebKit"
+    path = text.replace("\\", "/").lower()
+    return "network.framework" in path or "/webkit.framework" in path
 
 
 def _is_native_network_function(name: str) -> bool:
     return name in NATIVE_NETWORK_FUNCTIONS or name.startswith(_NATIVE_NETWORK_FUNCTION_PREFIXES)
+
+
+def _is_macos_network_name(name: str) -> bool:
+    return name in MACOS_NETWORK_NAMES or name.startswith(_MACOS_NETWORK_PREFIXES)
+
+
+def _is_macos_network_bundle(text: str) -> bool:
+    """``"CFNetwork"``, ``".../WebKit.framework"`` or ``"com.apple.Network"``."""
+    lowered = text.lower()
+    return any(
+        lowered in (name.lower(), f"com.apple.{name.lower()}")
+        or f"/{name.lower()}.framework" in lowered
+        for name in MACOS_NETWORK_BUNDLES
+    )
 
 
 # --------------------------------------------------------------------------- scanner
@@ -658,6 +745,10 @@ class _ModuleScanner:
         # ("libc", "self._ws2"), and functions that return one.
         self.library_handles: set[str] = set()
         self.handle_functions: set[str] = set()
+        # Names and attribute chains that only ever hold a file URL ("url = NSURL.
+        # fileURLWithPath_(path)"), and the attributes that are called directly.
+        self.file_urls: set[str] = set()
+        self.called: set[int] = set()
 
     def report(self, node: ast.AST, rule: str, message: str) -> None:
         line = getattr(node, "lineno", 0)
@@ -673,6 +764,8 @@ class _ModuleScanner:
             elif isinstance(node, ast.ImportFrom):
                 self._check_import_from(node)
         self._collect_library_handles()
+        self._collect_file_urls()
+        self.called = {id(n.func) for n in ast.walk(self.tree) if isinstance(n, ast.Call)}
 
         exempt: set[int] = set()
         for node in ast.walk(self.tree):
@@ -722,6 +815,8 @@ class _ModuleScanner:
                 self.report(node, "network-import", f"import of networking module '{full}'")
             if alias.name in NETWORK_APIS or full in NETWORK_DOTTED_NAMES:
                 self.report(node, "network-api", f"import of '{alias.name}' from '{module}'")
+            if _is_macos_network_name(alias.name):
+                self.report(node, "macos-network", f"import of '{alias.name}' from '{module}'")
         parts = module.split(".")
         if parts[0] not in QT_BINDINGS:
             return
@@ -783,6 +878,55 @@ class _ModuleScanner:
             if (len(self.library_handles), len(self.handle_functions)) == before:
                 break
 
+    # --------------------------------------------------------------- file URLs
+    def _is_file_url(self, node: ast.AST | None) -> bool:
+        """Whether ``node`` is certainly a file URL: ``NSURL.fileURLWithPath_(...)``,
+        ``NSURL.URLWithString_("file:...")``, or a name that only ever holds one."""
+        if isinstance(node, ast.Call):
+            name = _call_name(node) or ""
+            if name.startswith(_FILE_URL_PREFIX):
+                return True
+            literal = _string(node.args[0]) if node.args else None
+            return name in _URL_FROM_STRING and (literal or "").lower().startswith("file:")
+        dotted = _dotted_name(node) if node is not None else None
+        return dotted is not None and dotted in self.file_urls
+
+    def _collect_file_urls(self) -> None:
+        """Names (and attribute chains) every assignment of which is a file URL."""
+        values: dict[str, list[ast.expr]] = {}
+        for node in ast.walk(self.tree):
+            targets: list[ast.expr]
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr) and node.value:
+                targets, value = [node.target], node.value
+            else:
+                continue
+            for target in targets:
+                dotted = _dotted_name(target)
+                if dotted is not None:
+                    values.setdefault(dotted, []).append(value)
+        # A name assigned from another file-URL name: a few rounds reach the fixpoint.
+        for _ in range(4):
+            before = len(self.file_urls)
+            self.file_urls |= {
+                name
+                for name, assigned in values.items()
+                if all(self._is_file_url(value) for value in assigned)
+            }
+            if len(self.file_urls) == before:
+                break
+
+    def _check_url_read(self, node: ast.Call, name: str) -> None:
+        """``NSData.dataWithContentsOfURL_(url)`` and its kind, unless ``url`` is a file URL."""
+        if not self._is_file_url(node.args[0] if node.args else None):
+            self.report(
+                node,
+                "macos-network",
+                f"'{name}' reads whatever its URL names, a web address too "
+                "(pass a file URL made with NSURL.fileURLWithPath_)",
+            )
+
     # --------------------------------------------------------------- references
     def _check_attribute(self, node: ast.Attribute) -> set[int]:
         """Check one attribute access; returns ids of child nodes to skip."""
@@ -806,6 +950,11 @@ class _ModuleScanner:
             self.report(node, "qt-network", f"use of Qt network class '{attr}'{_LOCAL_ONLY}")
         if attr in NETWORK_APIS:
             self.report(node, "network-api", f"use of '{attr}' (opens a network connection)")
+        if _is_macos_network_name(attr):
+            self.report(node, "macos-network", f"use of '{attr}' (macOS networking)")
+        elif _MACOS_URL_READ.search(attr) and id(node) not in self.called:
+            # Called directly, the URL it is given is checked (see _check_call).
+            self.report(node, "macos-network", f"'{attr}' reads whatever its URL names")
         dotted = _dotted_name(node)
         if dotted is not None:
             if dotted in NETWORK_DOTTED_NAMES:
@@ -828,6 +977,8 @@ class _ModuleScanner:
             self.report(node, "qt-network", f"use of Qt network class '{name}'{_LOCAL_ONLY}")
         if name in NETWORK_APIS:
             self.report(node, "network-api", f"use of '{name}' (opens a network connection)")
+        if _is_macos_network_name(name):
+            self.report(node, "macos-network", f"use of '{name}' (macOS networking)")
 
     # -------------------------------------------------------------------- calls
     def _check_call(self, node: ast.Call) -> None:
@@ -853,6 +1004,18 @@ class _ModuleScanner:
             if tool is not None:
                 self.report(node, "network-command", f"runs network tool {tool!r}")
 
+        if name is not None and _MACOS_URL_READ.search(name):
+            self._check_url_read(node, name)
+        if name in _OBJC_CLASS_LOOKUPS and literal is not None and _is_macos_network_name(literal):
+            self.report(node, "macos-network", f"{name}({literal!r}) (macOS networking)")
+        if name in _OBJC_BUNDLE_LOADERS:
+            # objc.loadBundle("CFNetwork", globals(), bundle_path="/System/.../CFNetwork.framework")
+            texts = [_string(arg) for arg in node.args] + [_string(k.value) for k in node.keywords]
+            for text in texts:
+                if text is not None and _is_macos_network_bundle(text):
+                    self.report(node, "macos-network", f"{name} loads {text!r}")
+                    break
+
     def _check_getattr(self, node: ast.Call, target_node: ast.AST, attr: str | None) -> None:
         target = _dotted_name(target_node)
         if target is not None and target in self.qt_network_aliases:
@@ -866,6 +1029,8 @@ class _ModuleScanner:
             self.report(node, "qt-network", f"getattr(..., {attr!r}){_LOCAL_ONLY}")
         if attr in NETWORK_APIS:
             self.report(node, "network-api", f"getattr(..., {attr!r}) opens a network connection")
+        if _is_macos_network_name(attr) or _MACOS_URL_READ.search(attr):
+            self.report(node, "macos-network", f"getattr(..., {attr!r}) (macOS networking)")
         if _is_native_network_function(attr) or (
             attr in NATIVE_SOCKET_CALLS and self._is_handle_expr(target_node)
         ):
@@ -998,12 +1163,21 @@ QT_NETWORK_PLUGINS: tuple[tuple[str, str, str], ...] = (
 
 #: Imported functions (ELF / Mach-O) that resolve host names or open remote
 #: connections. Plain ``socket``/``connect`` are omitted on purpose: they are
-#: also how local (AF_UNIX) IPC works.
+#: also how local (AF_UNIX) IPC works. On macOS, Foundation does HTTP(S) without
+#: CFNetwork being linked: a binary that uses NSURLSession (or the older
+#: NSURLConnection and NSURLDownload) imports its class symbol, stored here, like
+#: every symbol, without the leading underscore.
 NETWORK_SYMBOLS: frozenset[str] = frozenset(
     {
         "CFHostStartInfoResolution",
+        "CFReadStreamCreateForHTTPRequest",
+        "CFReadStreamCreateForStreamedHTTPRequest",
         "CFSocketConnectToAddress",
         "CFStreamCreatePairWithSocketToHost",
+        "OBJC_CLASS_$_NSURLConnection",
+        "OBJC_CLASS_$_NSURLDownload",
+        "OBJC_CLASS_$_NSURLSession",
+        "OBJC_CLASS_$_NSURLSessionConfiguration",
         "DNSServiceGetAddrInfo",
         "DNSServiceQueryRecord",
         "gethostbyaddr",

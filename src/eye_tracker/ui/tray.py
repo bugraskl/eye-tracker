@@ -531,7 +531,12 @@ class TrayIcon(QObject):
         return True
 
     def _messages_available(self) -> bool:
-        return self.tray.isVisible() and QSystemTrayIcon.supportsMessages()
+        # Qt on Linux claims to support messages even when there is no tray to
+        # show them from (GNOME without an AppIndicator extension, a bare window
+        # manager, the offscreen platform) and then drops them silently. Callers
+        # must learn that nothing was shown: an unseen calibration hint, for
+        # instance, must not count as given.
+        return self.tray.isVisible() and self.available and QSystemTrayIcon.supportsMessages()
 
     def _show_message(self, title: str, message: str, critical: bool) -> None:
         if critical:

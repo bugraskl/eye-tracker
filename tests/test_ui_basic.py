@@ -857,6 +857,27 @@ def test_tray_notify_without_tray_is_quiet(controller: FakeController, cleanup: 
     tray.hide()
 
 
+def test_tray_notify_needs_a_tray_area_even_when_qt_claims_message_support(
+    controller: FakeController, cleanup: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Qt on Linux supports messages "without a tray" by dropping them silently."""
+    tray = _tray(controller, cleanup)
+    tray.show()
+    shown: list[str] = []
+    monkeypatch.setattr(tray, "_show_message", lambda t, m, c: shown.append(t))
+    monkeypatch.setattr(tray.tray, "isVisible", lambda: True)
+    monkeypatch.setattr(QSystemTrayIcon, "supportsMessages", staticmethod(lambda: True))
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: False))
+    assert not tray.available
+    # Not reported as shown: an unseen calibration hint must not count as given.
+    assert tray.notify("lost", "nobody sees this") is False
+    assert tray.notify("lost", "nor this", force=True) is False
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    assert tray.notify("shown", "message") is True
+    assert shown == ["shown"]
+    tray.hide()
+
+
 def test_tray_dispose_is_final_and_idempotent(
     controller: FakeController, cleanup: list[Any]
 ) -> None:

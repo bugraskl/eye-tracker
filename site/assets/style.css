@@ -44,7 +44,6 @@ body {
   color: var(--text);
   font: 400 17px/1.65 var(--font);
   -webkit-font-smoothing: antialiased;
-  overflow-x: hidden;
 }
 
 img,
@@ -83,7 +82,7 @@ h2 {
 }
 
 h3 {
-  font-size: 18px;
+  font-size: 20px;
   font-weight: 650;
   letter-spacing: -0.01em;
 }
@@ -129,6 +128,10 @@ kbd {
 
 .skip-link:focus {
   left: 8px;
+}
+
+.skip-link:hover {
+  color: var(--bg);
 }
 
 .accent-text {
@@ -332,10 +335,8 @@ kbd {
   border-radius: 999px;
   background: rgba(99, 102, 241, 0.12);
   color: #c7d2fe;
-  font-size: 13px;
-  font-weight: 650;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-size: 14px;
+  font-weight: 600;
 }
 
 .eyebrow::before {
@@ -566,7 +567,14 @@ kbd {
   gap: 16px;
 }
 
+/* The icon sits beside the heading, in flow; the heading carries the card. */
 .feature {
+  display: grid;
+  grid-template-columns: 24px 1fr;
+  column-gap: 14px;
+  align-items: start;
+  /* Cards in a row share one height; keep the extra space below the text. */
+  align-content: start;
   padding: 24px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -580,27 +588,28 @@ kbd {
   transform: translateY(-2px);
 }
 
+/* Only in the heading's row, so a one-line heading keeps the text close. */
 .feature .icon {
-  display: grid;
-  place-items: center;
-  width: 40px;
-  height: 40px;
-  margin-bottom: 16px;
-  border-radius: 11px;
-  background: rgba(99, 102, 241, 0.14);
-  border: 1px solid rgba(129, 140, 248, 0.3);
+  grid-row: 1;
+  align-self: start;
   color: #a5b4fc;
 }
 
 .feature .icon svg {
-  width: 21px;
-  height: 21px;
+  width: 24px;
+  height: 24px;
+}
+
+.feature h3 {
+  grid-column: 2;
 }
 
 .feature p {
+  grid-column: 2;
+  grid-row: 2;
   margin-top: 8px;
   color: var(--muted);
-  font-size: 15.5px;
+  font-size: 16px;
   line-height: 1.6;
 }
 
@@ -955,7 +964,7 @@ td.us {
   gap: 32px;
 }
 
-.footer-grid h4 {
+.footer-title {
   margin: 0 0 12px;
   color: var(--heading);
   font-size: 14px;

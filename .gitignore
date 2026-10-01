@@ -33,3 +33,6 @@ Thumbs.db
 
 # Website build output (scripts/build_site.py)
 _site/
+
+# Local design-checker state
+.impeccable/

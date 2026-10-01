@@ -1290,6 +1290,28 @@ class SettingsDialog(QDialog):
             [target, focus, dwell, cooldown, mouse, typing, reading, smoothing, hysteresis, margin],
         )
 
+        panes = self._group(layout, "Split panes (experimental)")
+        follow = self._check(
+            panes, "panes.enabled", "Also move keyboard focus to the split pane I look at"
+        )
+        if not self._caps.get("panes", True):
+            follow.setText(follow.text() + " (not supported on this system)")
+        precision = self._float(
+            panes,
+            "panes.precision",
+            "Only panes at least",
+            decimals=1,
+            step=0.5,
+            suffix=" × my gaze error",
+        )
+        panes.addRow(
+            self._hint(
+                "Works with tmux and WezTerm panes on the monitor you are on. Small panes are "
+                "left alone: how small depends on how accurate your calibration is."
+            )
+        )
+        self._depends(follow, [precision])
+
         learn = self._group(layout, "Adaptive accuracy")
         adaptive = self._check(learn, "learning.adaptive", "Learn from how I use the mouse")
         max_samples = self._int(

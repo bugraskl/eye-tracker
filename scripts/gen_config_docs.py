@@ -28,6 +28,7 @@ SECTION_TITLES = {
     "camera": "Camera",
     "performance": "Performance",
     "switching": "Switching",
+    "panes": "Split panes (experimental)",
     "presence": "Walk-away (presence)",
     "privacy": "Privacy",
     "hotkeys": "Hotkeys",
@@ -63,7 +64,17 @@ def section_notes() -> dict[str, str]:
     presence = config.PresenceSettings()
     countdown_starts = presence.away_timeout_s - presence.warning_s
     example = config.HotkeySettings().toggle_tracking
+    panes = config.PaneSettings()
+    pane_example = max(panes.precision * 120, panes.min_pane_px)
     return {
+        "panes": (
+            "Off by default. Pane focus follows only on the monitor the cursor is already on, "
+            f"at the earliest {panes.after_monitor_switch_ms} ms after a monitor switch, and the "
+            "mouse grace of the switching settings applies too. A pane takes part when it is "
+            "at least `precision` times the calibration's gaze error and at least "
+            "`min_pane_px` wide (panes side by side) or tall (stacked panes): with the defaults "
+            f"and a gaze error of 120 px that is {pane_example:.0f} px."
+        ),
         "presence": (
             "The countdown is part of the away time: with the defaults it appears after "
             f"{countdown_starts} s without you, and the action follows at "

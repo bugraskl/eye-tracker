@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-02
+
 ### Added
 
 - Update check and in-app update (Windows, opt in, **off by default**): turn on **Settings → General →
@@ -115,7 +117,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - A privacy gate that fails CI on networking or frame-writing code and scans every bundled native
   library and Python module of the release builds.
 
-[Unreleased]: https://github.com/bugraskl/eye-tracker/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/bugraskl/eye-tracker/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/bugraskl/eye-tracker/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/bugraskl/eye-tracker/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bugraskl/eye-tracker/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bugraskl/eye-tracker/releases/tag/v0.1.0

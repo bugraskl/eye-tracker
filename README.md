@@ -6,14 +6,14 @@
 
 <p align="center">
   Look at a monitor. Your cursor and keyboard focus follow.<br>
-  Any webcam, fully offline, on Windows, macOS and Linux.
+  Any webcam, offline by default, on Windows, macOS and Linux.
 </p>
 
 <p align="center">
   <a href="https://github.com/bugraskl/eye-tracker/actions/workflows/ci.yml"><img src="https://github.com/bugraskl/eye-tracker/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/bugraskl/eye-tracker/releases"><img src="https://img.shields.io/github/v/release/bugraskl/eye-tracker" alt="Latest release"></a>
   <a href="docs/platform-support.md"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-6366F1" alt="Windows, macOS, Linux"></a>
-  <a href="docs/privacy.md"><img src="https://img.shields.io/badge/network-none%20(verified%20in%20CI)-22D3EE" alt="No network access, verified in CI"></a>
+  <a href="docs/privacy.md"><img src="https://img.shields.io/badge/network-off%20by%20default%20(verified%20in%20CI)-22D3EE" alt="No network access by default, verified in CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License"></a>
 </p>
 
@@ -71,6 +71,12 @@ Every release ships `SHA256SUMS.txt` and GitHub build-provenance attestations. B
 code-signed yet; see [platform notes](docs/platform-support.md) for the one-time Gatekeeper and
 SmartScreen steps. The portable ZIP keeps its settings in your user profile like the installed app;
 start it with `--config-dir FOLDER` to keep everything in a folder of your choice.
+
+**Updating.** On Windows, an installed copy can update itself: turn on **Settings → General → Updates**
+and it checks GitHub once a day, tells you about a new version and installs it when you agree
+(**Check for updates…** in the tray menu works with that off). It is off by default because it is the
+only thing that uses the network; [what it sends](docs/privacy.md#the-update-check-opt-in). Elsewhere,
+take new versions from the releases page.
 
 ## Quick start
 
@@ -130,7 +136,7 @@ Deeper dive: [architecture](docs/architecture.md).
 
 | Promise | Verified by |
 |---|---|
-| No network access at all: no telemetry, no update checks, no accounts. | A source scan fails CI on networking code. Every release build, and every pull request that changes the packaging or the dependencies, is scanned too: each bundled native library and Python module. |
+| No network access by default: no telemetry, no accounts. The one thing that can use the network is the update check, which you turn on yourself (Windows, off by default): one HTTPS request a day to `api.github.com` that carries no identifier. | A source scan fails CI on networking code, with that single reviewed exception. Every release build, and every pull request that changes the packaging or the dependencies, is scanned too: each bundled native library and Python module. |
 | Camera frames are analysed in memory and never saved. | The source scan fails CI on OpenCV's image and video writers (`imwrite`, `imencode`, `VideoWriter`); anything else is left to code review. |
 | Only numbers are stored: head angles, iris ratios, screen points. | `calibration.json` is plain JSON. |
 | Privacy mode, pause and a locked screen release the camera. | The webcam light goes out. |
@@ -220,7 +226,7 @@ Glance Switch inspired this project. This comparison uses the features listed on
 | Platforms | Windows, macOS 14+ (Apple silicon; Intel from source), Linux | macOS 14+ (Apple silicon & Intel) |
 | Price | Free, MIT licence | $14.99 one-time |
 | Source code | Open | Closed |
-| Network use | None | Licence key check + daily update check |
+| Network use | None by default; an update check only if you turn it on | Licence key check + daily update check |
 | Tracking | Head pose + iris landmarks | Head pose (+ eye position for panes) |
 | Split-pane focus in terminals and editors | Experimental: terminals, Claude and ChatGPT/Codex desktop apps | ✅ |
 | Learns from your mouse use | ✅ | ✅ (from clicks) |

@@ -184,6 +184,9 @@ uv run python -m http.server 8000 --directory _site
 1. Update `__version__` in `src/eye_tracker/__init__.py` and move the **Unreleased** notes in
    `CHANGELOG.md` under a new `## [x.y.z] - YYYY-MM-DD` heading, leaving `## [Unreleased]` empty.
 2. Commit, then tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
+   The installed apps look for `EyeTracker-<version>-windows-x64-setup.exe` and `SHA256SUMS.txt` in
+   the latest release to update themselves ([`update/release.py`](../src/eye_tracker/update/release.py),
+   checked by `tests/test_update_release.py`): keep those two names when you change `release.yml`.
 3. The release workflow builds and tests every package as described above and publishes the GitHub
    release with the notes from `CHANGELOG.md`. It fails before building anything when the tag does
    not match `__version__`, when `CHANGELOG.md` has no section for the version, or when notes are

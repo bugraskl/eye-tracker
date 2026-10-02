@@ -68,7 +68,9 @@ if TYPE_CHECKING:
     from .ui.preview import PreviewWindow
     from .ui.settings_dialog import SettingsDialog
     from .ui.tray import TrayIcon
+    from .ui.update_dialog import UpdateDialog
     from .ui.wizard import FirstRunWizard
+    from .update.service import UpdateService
 
     ControllerFactory = Callable[[Settings, PlatformServices], Controller]
 
@@ -92,10 +94,12 @@ STARTUP_QUIET_S = 20.0
 #: this does nothing.
 PROMPT_CLICK_WINDOW_S = 600.0
 #: Kinds of notifications that do something when clicked: open the calibration,
-#: the setup assistant, or the OS privacy settings of a missing permission.
+#: the setup assistant, the OS privacy settings of a missing permission, or the
+#: update window.
 PROMPT_CALIBRATE = "calibrate"
 PROMPT_SETUP = "setup"
 PROMPT_PERMISSION = "permission"
+PROMPT_UPDATE = "update"
 #: A ``permission_needed`` belongs to the controller notification emitted this
 #: recently (the controller emits both back to back).
 _PERMISSION_NOTICE_S = 1.0
@@ -422,6 +426,8 @@ class EyeTrackerApp(QObject):
         self._preview: PreviewWindow | None = None
         self._about: AboutDialog | None = None
         self._wizard: FirstRunWizard | None = None
+        self._updates: UpdateService | None = None
+        self._update_dialog: UpdateDialog | None = None
         #: Reasons announced with a "calibration needed" notification since the
         #: calibration was last usable (cleared when it is usable again).
         self._announced: set[str] = set()
@@ -514,6 +520,7 @@ class EyeTrackerApp(QObject):
         tray.open_calibration.connect(self._on_tray_calibrate)
         tray.open_preview.connect(self.open_preview)
         tray.open_about.connect(self.open_about)
+        tray.open_update.connect(self.open_update)
         tray.quit_requested.connect(self.quit)
         tray.tray.messageClicked.connect(self._on_message_clicked)
         # Esc or the button on the curtain: switching resumes (the guard stays on).
@@ -526,6 +533,7 @@ class EyeTrackerApp(QObject):
         self._quit_hooked = True
 
         controller.start()
+        self._start_updates(tray)
         # Windows open once the event loop runs, so the tray is already in place.
         QTimer.singleShot(0, self, self._after_start)
 
@@ -545,15 +553,18 @@ class EyeTrackerApp(QObject):
             with contextlib.suppress(Exception):
                 calibration.cancel()
             calibration.deleteLater()
+        if self._updates is not None:
+            self._updates.shutdown()
         widgets: list[QWidget | None] = [
             self._wizard,
             self._settings_dialog,
             self._about,
             self._preview,
             self._countdown,
+            self._update_dialog,
         ]
         self._wizard = self._settings_dialog = self._about = self._preview = None
-        self._countdown = None
+        self._countdown = self._update_dialog = None
         for widget in widgets:
             if widget is not None:
                 _dispose_widget(widget)
@@ -670,6 +681,17 @@ class EyeTrackerApp(QObject):
             self._about = AboutDialog()
         _present(self._about)
 
+    def open_update(self) -> None:
+        """Show the update window (it looks for an update unless one is known)."""
+        updates = self._updates
+        if self._closed or updates is None or self._raise_calibration():
+            return
+        if self._update_dialog is None:
+            from .ui.update_dialog import UpdateDialog
+
+            self._update_dialog = UpdateDialog(updates)
+        self._update_dialog.present()
+
     def open_wizard(self) -> None:
         """Show the first-run wizard."""
         if self._closed or self._controller is None or self._raise_calibration():
@@ -767,6 +789,8 @@ class EyeTrackerApp(QObject):
         self._settings = settings
         if not self._options.log_level_locked:
             set_level(settings.general.log_level)
+        if self._updates is not None:
+            self._updates.set_auto(settings.updates.check)
         self._save_without_overrides(settings)
 
     def _on_ui_requested(self, command: str) -> None:
@@ -875,6 +899,49 @@ class EyeTrackerApp(QObject):
             self.open_calibration("notification")
         elif kind == PROMPT_PERMISSION and permission:
             self._open_permission_settings(permission)
+        elif kind == PROMPT_UPDATE:
+            self.open_update()
+
+    def _start_updates(self, tray: TrayIcon) -> None:
+        """Create the update service (it looks for updates only if the user turned
+        that on, or asks) and connect it to the tray."""
+        from .update.service import UpdateService
+
+        updates = UpdateService(self)
+        self._updates = updates
+        updates.state_changed.connect(self._on_update_state)
+        updates.announce.connect(self._on_update_announced)
+        updates.start(self._settings.updates.check)
+
+    def _on_update_state(self, state: object) -> None:
+        from .update.service import Phase, UpdateState
+
+        tray = self._tray
+        if tray is None or not isinstance(state, UpdateState):
+            return
+        release = state.release
+        if state.phase is Phase.UP_TO_DATE:
+            tray.set_update_available(None)
+        elif release is not None and state.phase in (
+            Phase.AVAILABLE,
+            Phase.DOWNLOADING,
+            Phase.INSTALLING,
+            Phase.FAILED,
+        ):
+            tray.set_update_available(release.version)
+
+    def _on_update_announced(self, release: object) -> None:
+        """A newer version was found by the daily check: say so once."""
+        tray = self._tray
+        version = getattr(release, "version", None)
+        if tray is None or not version:
+            return
+        shown = tray.notify(
+            "Update available",
+            f"{APP_NAME} {version} is available. Click here to update.",
+        )
+        if shown:
+            self._prompt = (PROMPT_UPDATE, self._clock())
 
     # ------------------------------------------------------------------ helpers
     def _make_controller(self) -> Controller:

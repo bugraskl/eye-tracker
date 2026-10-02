@@ -23,6 +23,7 @@ feature matrix for your machine. Commands on this page are written as `eye-track
 | Global hotkeys | ✅ | ✅ | ✅ | ➖ bind `eye-tracker ctl` in your desktop |
 | Start at login | ✅ | ✅ | ✅ | ✅ |
 | Tray icon | ✅ | ✅ menu bar | ✅ | ✅ (StatusNotifier) |
+| Update check and in-app update (opt in)⁵ | ✅ | ➖ release page | ➖ release page | ➖ release page |
 
 ¹ Apps that capture through PipeWire's camera portal (some Flatpak apps) cannot be seen. Add them
 to **Settings → Presence & privacy → Pause while these apps run**.
@@ -33,6 +34,12 @@ to **Settings → Presence & privacy → Pause while these apps run**.
 you are there; see [Wayland](#wayland).
 
 ⁴ Off by default. Which terminals, and how small panes are kept out: [split-pane focus](panes.md).
+
+⁵ Off by default, and Windows only for now: the app looks for a newer release once a day and installs
+it when you agree, only when it was installed with the setup program. On the other platforms (and for the
+portable ZIP) nothing uses the network; take new versions from the
+[releases page](https://github.com/bugraskl/eye-tracker/releases). What the check sends:
+[privacy](privacy.md#the-update-check-opt-in).
 
 ## Downloads
 

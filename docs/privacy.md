@@ -7,11 +7,11 @@ checkable by anyone.
 
 | Promise | How it is kept | How you can check |
 |---|---|---|
-| **Nothing leaves your computer.** | There is no networking code in the application. The only socket it listens on is a local, per-user IPC channel (a named pipe on Windows, a Unix socket elsewhere) used by `eye-tracker ctl`, and it accepts only your own user account. On Linux the app also talks to your desktop over the local D-Bus and X11 sockets. None of them reaches the network. | `scripts/check_privacy.py` fails CI on any networking import. Every release build, and every pull request that changes the packaging or the dependencies, is scanned as well: every bundled native library and every bundled Python module. Run a firewall or `strace -f -e trace=connect` yourself. |
+| **Nothing leaves your computer.** | Apart from the update check you can turn on (next section), there is no networking code in the application. The only socket it listens on is a local, per-user IPC channel (a named pipe on Windows, a Unix socket elsewhere) used by `eye-tracker ctl`, and it accepts only your own user account. On Linux the app also talks to your desktop over the local D-Bus and X11 sockets. None of them reaches the network. | `scripts/check_privacy.py` fails CI on any networking import or call, with one reviewed exception: `update/winhttp.py`, which it reports on every run. Every release build, and every pull request that changes the packaging or the dependencies, is scanned as well: every bundled native library and every bundled Python module. Run a firewall or `strace -f -e trace=connect` yourself. |
 | **Frames are never stored.** | Camera frames live in memory for one analysis step. No image or video is written anywhere. | The privacy check fails CI on `imwrite`, `imencode` and `VideoWriter` under `src/`; other image APIs (such as Qt's `QImage.save`) are left to code review. |
 | **Only numbers are kept.** | The calibration file holds head angles, iris ratios and the screen points they map to. | Open `calibration.json`; it is plain JSON. |
 | **The camera is really off when it says so.** | Privacy mode, pause and the locked screen *release* the camera device (the webcam light goes out); they do not just ignore frames. Privacy mode stays on after Eye Tracker or the computer restarts, also after an update, until you turn it off, so the camera never comes back on by itself (**Keep privacy mode on after a restart** in Settings → Presence & privacy). | Watch the webcam LED. |
-| **No telemetry, no accounts, no update checks.** | There is nothing to phone home to. | See the first row. |
+| **No telemetry and no accounts. Update checks only if you turn them on.** | There is nothing to phone home to. The update check is off by default and is the only thing that can use the network ([below](#the-update-check-opt-in)). | See the first row. |
 
 ## Why not the MediaPipe runtime
 
@@ -27,10 +27,61 @@ runtime is not installed, imported or shipped.
 [`src/eye_tracker/vision/models/NOTICE.md`](../src/eye_tracker/vision/models/NOTICE.md) lists the
 exact model files, their licences and checksums; the licence texts ship next to the models.
 
+## The update check (opt in)
+
+Eye Tracker can look for a newer version of itself. It is **off by default**, so the app never
+touches the network unless you ask. Turn it on in **Settings → General → Updates** (or
+`updates.check` in [`settings.json`](configuration.md#updates)); it is available on Windows only
+for now. **Check for updates…** in the tray menu looks once, when you click it, with the setting off.
+
+**What is sent.** One HTTPS `GET` to
+`https://api.github.com/repos/bugraskl/eye-tracker/releases/latest`: once a day when the setting is
+on (the first one about a minute and a half after the app starts), and when you click **Check for
+updates…**. The request carries a `User-Agent` that names the app and its version
+(`EyeTracker/0.2.1 (+https://github.com/bugraskl/eye-tracker)`) and an `Accept` header. Nothing
+else: no identifier, no cookie, no settings, no calibration, no information about your computer.
+GitHub sees your IP address, as any web server does.
+
+**What it does with the answer.** It reads the version number and the names of the release's
+files. If the version is newer, the tray menu says **Update to X.Y.Z…** and you get one notification
+per version. Nothing is downloaded until you press **Install and restart**.
+
+**Installing.** Only for a copy installed with the setup program (the portable ZIP, macOS and Linux
+get the release page instead). It downloads that release's `…-windows-x64-setup.exe` and
+`SHA256SUMS.txt` from `github.com` (GitHub redirects the file to its own download hosts), checks
+the file's size and SHA-256, and only then starts the setup program silently, the way
+`winget upgrade` would: it closes Eye Tracker, replaces its files in your profile (no administrator
+rights) and starts it again. A file that fails a check is deleted. Downloads live in the `updates`
+folder next to your data and are cleared at the next start.
+
+**What it may talk to.** The check refuses every address that is not `https://` on `api.github.com`,
+`github.com`, `objects.githubusercontent.com` or `release-assets.githubusercontent.com`, and checks
+every redirect hop the same way. Each request has a size limit (1 MB for the answer, 64 KB for the
+checksums, the announced size for the installer), and the installer's address must be exactly the
+one GitHub derives from the repository, the release tag and the file name.
+
+**How it connects.** Through Windows' own WinHTTP, from one module
+([`update/winhttp.py`](../src/eye_tracker/update/winhttp.py)), which is the only exception in
+`scripts/check_privacy.py` and is printed in its output on every run. Windows checks the
+certificates against its root store and the proxy settings are the system's. No OpenSSL or Python
+`ssl` is added to the app.
+
+**What it cannot promise.** The checksum list sits on the same release as the installer, so it
+guards against a damaged or truncated download, not against someone who can replace both files on
+GitHub. Every release also carries a Sigstore build attestation that you can check yourself with
+`gh attestation verify <file> --repo bugraskl/eye-tracker`; the app does not run that check. The
+installer is not code-signed yet (see [platform notes](platform-support.md)).
+
+**What it keeps.** `updates.json` in the data folder: the time of the last check and the version
+you were told about, so that it asks at most once a day and tells you once.
+
+**See it yourself.** Leave the setting off and run a firewall; or turn it on and watch that
+`EyeTracker.exe` only ever contacts the hosts above.
+
 ## Networking code inside the libraries it ships
 
-Eye Tracker's own code contains no networking code, but some libraries it ships do, because they can
-do more than Eye Tracker asks of them:
+Apart from that update check, Eye Tracker's own code contains no networking code, but some
+libraries it ships do, because they can do more than Eye Tracker asks of them:
 
 - Qt's network module provides the local IPC channel; its TCP, TLS and HTTP parts are never used, and
   Qt's network plugins are not shipped.

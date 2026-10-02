@@ -33,6 +33,7 @@ SECTION_TITLES = {
     "privacy": "Privacy",
     "hotkeys": "Hotkeys",
     "learning": "Learning",
+    "updates": "Updates",
     "ui": "Interface",
 }
 

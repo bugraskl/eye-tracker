@@ -25,6 +25,7 @@ import ctypes
 import functools
 import sys
 from ctypes import wintypes
+from typing import Any
 
 from .. import REPO_URL, __version__
 from .fetch import NetworkError
@@ -45,7 +46,7 @@ _TIMEOUTS = (10_000, 10_000, 15_000, 30_000)
 
 
 @functools.cache
-def _winhttp() -> ctypes.WinDLL:
+def _winhttp() -> Any:
     """The WinHTTP library with typed signatures (loaded on first use)."""
     if sys.platform != "win32":  # pragma: no cover - guarded by fetch.supported()
         raise NetworkError("WinHTTP exists on Windows only.")
@@ -75,8 +76,9 @@ def _winhttp() -> ctypes.WinDLL:
 
 
 def _fail(what: str) -> NetworkError:
-    code = ctypes.get_last_error()
-    return NetworkError(f"{what} (Windows error {code}).")
+    if sys.platform != "win32":  # pragma: no cover - guarded by fetch.supported()
+        return NetworkError(what + ".")
+    return NetworkError(f"{what} (Windows error {ctypes.get_last_error()}).")
 
 
 class _WinHttpResponse:

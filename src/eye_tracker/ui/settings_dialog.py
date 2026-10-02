@@ -1193,16 +1193,20 @@ class SettingsDialog(QDialog):
         self._check(form, "general.notifications", "Show notifications")
         self._check(form, "ui.show_gaze_overlay", "Show a dot where I am looking (testing aid)")
 
-        if update_supported():
-            form = self._group(layout, "Updates")
-            self._check(form, "updates.check", "Look for a new version once a day")
-            form.addRow(
-                self._hint(
-                    "Off by default: then the app never uses the network. It only tells you "
-                    "when there is a new version and installs it when you agree. "
-                    "“Check for updates…” in the tray menu works either way."
-                )
+        form = self._group(layout, "Updates")
+        updates = self._check(form, "updates.check", "Look for a new version once a day")
+        supported = update_supported()
+        updates.setEnabled(supported)
+        form.addRow(
+            self._hint(
+                "Off by default: then the app never uses the network. It only tells you "
+                "when there is a new version and installs it when you agree. "
+                "“Check for updates…” in the tray menu works either way."
+                if supported
+                else "Checking for updates is not available on this system yet: nothing uses "
+                "the network. Take new versions from the releases page."
             )
+        )
 
         form = self._group(layout, "Calibration")
         row = QWidget()

@@ -288,3 +288,20 @@ def test_the_window_opens_once_and_is_closed_with_the_app(
     settle(qapp)
     assert h.app._update_dialog is None
     assert app_module.PROMPT_UPDATE == "update"
+
+
+def test_where_updates_cannot_be_checked_the_switch_is_shown_but_disabled(
+    controller: FakeController,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from eye_tracker.ui import settings_dialog as settings_module
+
+    monkeypatch.setattr(settings_module, "update_supported", lambda: False)
+    dialog_ = settings_module.SettingsDialog(controller)
+    try:
+        box = dialog_.widget_for("updates.check")
+        assert not box.isEnabled()
+        assert not box.isChecked()
+    finally:
+        dialog_.close()
+        dialog_.deleteLater()

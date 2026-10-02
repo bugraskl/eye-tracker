@@ -67,6 +67,98 @@ def test_source_tree_is_clean() -> None:
     assert result.ok, "privacy violations:\n" + "\n".join(str(v) for v in result.violations)
 
 
+# ------------------------------------------------------------- the one reviewed exception
+WINHTTP_LOAD = textwrap.dedent(
+    """\
+    import ctypes
+    lib = ctypes.WinDLL("winhttp")
+    lib.WinHttpOpen(None)
+    """
+)
+
+
+def _app_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A stand-in for src/eye_tracker, so the allowlist can be tried on any file."""
+    root = tmp_path / "eye_tracker"
+    (root / "update").mkdir(parents=True)
+    monkeypatch.setattr(check_privacy, "DEFAULT_TARGET", root)
+    return root
+
+
+def test_the_only_exception_is_the_update_connection() -> None:
+    assert [(rule.path, rule.rules) for rule in check_privacy.SOURCE_ALLOWLIST] == [
+        ("update/winhttp.py", frozenset({"native-network"}))
+    ]
+
+
+def test_the_real_exception_is_reported_not_hidden() -> None:
+    result = check_privacy.scan_paths([check_privacy.DEFAULT_TARGET])
+    assert result.ok
+    assert {rule.path for _, rule in result.notices} == {"update/winhttp.py"}
+    assert {v.rule for v, _ in result.notices} == {"native-network"}
+
+
+def test_the_exception_is_printed_on_every_run(capsys: pytest.CaptureFixture[str]) -> None:
+    assert check_privacy.main([]) == 0
+    out = capsys.readouterr().out
+    assert "allowed: update/winhttp.py" in out
+    assert "update check" in out
+
+
+def test_winhttp_is_allowed_in_that_file_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _app_tree(tmp_path, monkeypatch)
+    (root / "update" / "winhttp.py").write_text(WINHTTP_LOAD)
+    (root / "update" / "other.py").write_text(WINHTTP_LOAD)
+    (root / "winhttp.py").write_text(WINHTTP_LOAD)
+    result = check_privacy.scan_paths([root])
+    flagged = {Path(v.path).relative_to(root).as_posix() for v in result.violations}
+    assert flagged == {"update/other.py", "winhttp.py"}
+    assert {Path(v.path).name for v, _ in result.notices} == {"winhttp.py"}
+
+
+def test_a_copy_outside_the_app_is_not_excused(tmp_path: Path) -> None:
+    elsewhere = tmp_path / "update"
+    elsewhere.mkdir()
+    (elsewhere / "winhttp.py").write_text(WINHTTP_LOAD)
+    result = check_privacy.scan_paths([elsewhere])
+    assert not result.ok
+    assert result.notices == []
+
+
+def test_the_excused_file_still_answers_to_every_other_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _app_tree(tmp_path, monkeypatch)
+    (root / "update" / "winhttp.py").write_text(
+        WINHTTP_LOAD + "import socket\nimport urllib.request\ncv2.imwrite('a.png', frame)\n"
+    )
+    result = check_privacy.scan_paths([root])
+    assert {v.rule for v in result.violations} == {"network-import", "frame-write"}
+    assert {v.rule for v, _ in result.notices} == {"native-network"}
+
+
+def test_scan_source_itself_stays_strict() -> None:
+    # The allowance belongs to the file, never to a snippet or a different path.
+    assert _rules(WINHTTP_LOAD) == ["native-network", "native-network"]
+
+
+def test_only_the_fetch_rules_import_winhttp() -> None:
+    import re
+
+    pattern = re.compile(
+        r"^\s*(from\s+\S*winhttp\S*\s+import|from\s+\S+\s+import\s+.*\bwinhttp\b|import\s+\S*winhttp)",
+        re.M,
+    )
+    importers = [
+        path.relative_to(check_privacy.DEFAULT_TARGET).as_posix()
+        for path in check_privacy.DEFAULT_TARGET.rglob("*.py")
+        if pattern.search(path.read_text(encoding="utf-8"))
+    ]
+    assert importers == ["update/fetch.py"]
+
+
 def test_default_target_is_the_package() -> None:
     assert check_privacy.DEFAULT_TARGET == REPO_ROOT / "src" / "eye_tracker"
     assert (check_privacy.DEFAULT_TARGET / "__init__.py").is_file()

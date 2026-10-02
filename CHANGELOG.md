@@ -6,6 +6,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+
+- Update check and in-app update (Windows, opt in, **off by default**): turn on **Settings → General →
+  Updates** and Eye Tracker asks GitHub once a day whether there is a newer release (one HTTPS
+  request to `api.github.com` that carries no identifier), tells you once per version, and puts
+  **Update to X.Y.Z…** in the tray menu. **Check for updates…** looks once, when you click it, with
+  the setting off. Nothing is downloaded until you press **Install and restart**; then the setup
+  program of that release is downloaded from GitHub, its size and SHA-256 are checked against the
+  release's `SHA256SUMS.txt`, and it is run silently: it closes Eye Tracker, replaces its files and
+  starts it again. Only a copy installed with the setup program updates itself; the portable ZIP, macOS
+  and Linux get a notice and the release page. See [privacy](docs/privacy.md#the-update-check-opt-in).
+
+### Changed
+
+- The privacy promise now reads "no network access by default": the update check is the one
+  reviewed exception of `scripts/check_privacy.py` (`update/winhttp.py`, which reports it on every
+  run). The connection uses Windows' own WinHTTP, so no OpenSSL or Python `ssl` is added to the app.
+
 ## [0.2.1] - 2026-10-02
 
 ### Fixed

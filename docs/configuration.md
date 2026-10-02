@@ -135,6 +135,12 @@ A hotkey is written as modifiers and a key joined by `+`, in any case: `ctrl`, `
 | `learning.max_samples` | `400` | 0 – 5000 | Maximum number of learned samples kept. |
 | `learning.drift_alerts` | `true` |  | Suggest recalibration when accuracy drops. |
 
+## Updates
+
+| Key | Default | Allowed | Description |
+|---|---|---|---|
+| `updates.check` | `false` |  | Look for a newer release once a day and say so in the tray menu. Off by default: this is the only thing the app ever sends over the network, one HTTPS request to api.github.com that carries no identifier (see docs/privacy.md). It never installs anything without asking. Checking by hand (tray menu) works with this off. Windows only for now. |
+
 ## Interface
 
 | Key | Default | Allowed | Description |

@@ -24,6 +24,7 @@ from ..cli import cli_command_text
 from ..config import Settings
 from ..platform.hotkeys import Hotkey, format_hotkey
 from ..types import TrackingState
+from ..update.fetch import supported as update_supported
 from . import icons, util
 
 log = logging.getLogger(__name__)
@@ -140,6 +141,7 @@ class TrayIcon(QObject):
     open_calibration = Signal()
     open_preview = Signal()
     open_about = Signal()
+    open_update = Signal()
     quit_requested = Signal()
 
     NOTIFICATION_MS = 6000
@@ -349,6 +351,8 @@ class TrayIcon(QObject):
             "Start at login", self._on_autostart, checkable=True
         )
         menu.addSeparator()
+        self.action_update = self._add_action("Check for updates…", self._on_update)
+        self.action_update.setVisible(update_supported())
         self.action_about = self._add_action(f"About {APP_NAME}", self._on_about)
         self.action_quit = self._add_action(f"Quit {APP_NAME}", self._on_quit)
         menu.setToolTipsVisible(True)
@@ -640,6 +644,15 @@ class TrayIcon(QObject):
 
     def _on_about(self) -> None:
         self.open_about.emit()
+
+    def _on_update(self) -> None:
+        self.open_update.emit()
+
+    def set_update_available(self, version: str | None) -> None:
+        """Name a newer version in the menu (``None``: back to "Check for updates…")."""
+        if self._disposed:
+            return
+        self.action_update.setText("Check for updates…" if not version else f"Update to {version}…")
 
     def _on_quit(self) -> None:
         self.quit_requested.emit()

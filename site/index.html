@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Eye Tracker: look at a monitor, your cursor follows</title>
-  <meta name="description" content="Free, open-source app that moves your mouse cursor and keyboard focus to the monitor you look at, using any webcam. Fully offline, for Windows, macOS and Linux.">
+  <meta name="description" content="Free, open-source app that moves your mouse cursor and keyboard focus to the monitor you look at, using any webcam. Offline by default, for Windows, macOS and Linux.">
   <link rel="canonical" href="{{SITE_URL}}">
   <link rel="alternate" hreflang="en" href="{{SITE_URL}}">
   <link rel="alternate" hreflang="tr" href="{{SITE_URL}}tr/">
@@ -16,7 +16,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="Eye Tracker">
   <meta property="og:title" content="Eye Tracker: look at a monitor, your cursor follows">
-  <meta property="og:description" content="Free, open-source glance-to-switch for multi-monitor setups. Any webcam, fully offline, Windows, macOS and Linux.">
+  <meta property="og:description" content="Free, open-source glance-to-switch for multi-monitor setups. Any webcam, offline by default, Windows, macOS and Linux.">
   <meta property="og:url" content="{{SITE_URL}}">
   <meta property="og:image" content="{{SITE_URL}}assets/og.png">
   <meta property="og:image:width" content="1920">
@@ -34,7 +34,7 @@
     "applicationCategory": "UtilitiesApplication",
     "operatingSystem": "Windows 10, Windows 11, macOS 14+, Linux",
     "softwareVersion": "{{VERSION}}",
-    "description": "Moves the mouse cursor and keyboard focus to the monitor you look at, using any webcam. Fully offline.",
+    "description": "Moves the mouse cursor and keyboard focus to the monitor you look at, using any webcam. Offline by default.",
     "url": "{{SITE_URL}}",
     "downloadUrl": "{{RELEASE_URL}}",
     "license": "https://opensource.org/licenses/MIT",
@@ -121,7 +121,7 @@
               <svg aria-hidden="true"><use href="#i-github"/></svg>Star on GitHub
             </a>
           </div>
-          <p class="hero-meta">Version {{VERSION}} · Free and open source, <a href="https://github.com/bugraskl/eye-tracker/blob/main/LICENSE">MIT licence</a> · Windows 10/11, macOS 14+, Linux · Works fully offline</p>
+          <p class="hero-meta">Version {{VERSION}} · Free and open source, <a href="https://github.com/bugraskl/eye-tracker/blob/main/LICENSE">MIT licence</a> · Windows 10/11, macOS 14+, Linux · Offline by default</p>
         </div>
 
         <figure class="arrange" data-arrange
@@ -173,7 +173,7 @@
           <div class="prop"><dt>CPU, whole machine</dt><dd><strong>0.55%</strong>8.8% of one core</dd></div>
           <div class="prop"><dt>Memory</dt><dd><strong>~200 MB</strong>resident</dd></div>
           <div class="prop"><dt>Analysis per frame</dt><dd><strong>11 ms</strong>face, irises, head pose</dd></div>
-          <div class="prop"><dt>Network connections</dt><dd><strong>0</strong>enforced in CI</dd></div>
+          <div class="prop"><dt>Network connections</dt><dd><strong>0</strong>unless you turn on update checks</dd></div>
           <div class="prop"><dt>Face landmarks</dt><dd><strong>478</strong>both irises included</dd></div>
           <div class="prop"><dt>Calibration</dt><dd><strong>~15 s</strong>per monitor</dd></div>
         </dl>
@@ -263,7 +263,7 @@
           </div>
         </div>
         <ul class="rows joined">
-          <li class="row"><svg aria-hidden="true"><use href="#i-shield"/></svg><div><strong>Network access</strong><p>No telemetry, no update checks, no accounts. CI fails on any networking code, in the source and in every bundled library.</p></div><span class="value"><strong>None</strong></span></li>
+          <li class="row"><svg aria-hidden="true"><use href="#i-shield"/></svg><div><strong>Network access</strong><p>No telemetry, no accounts. The only thing that can use the network is the update check you turn on yourself (off by default). CI fails on any other networking code, in the source and in every bundled library.</p></div><span class="value"><strong>None by default</strong></span></li>
           <li class="row"><svg aria-hidden="true"><use href="#i-camera"/></svg><div><strong>Camera frames</strong><p>Analysed in memory for a few milliseconds and never written to disk.</p></div><span class="value"><strong>Never stored</strong></span></li>
           <li class="row"><svg aria-hidden="true"><use href="#i-book"/></svg><div><strong>Calibration file</strong><p>Head angles, iris ratios and screen points in plain JSON you can read. No images.</p></div><span class="value"><strong>Numbers only</strong></span></li>
           <li class="row"><svg aria-hidden="true"><use href="#i-eye-off"/></svg><div><strong>Privacy mode, pause, locked screen</strong><p>The camera device is released, so the webcam light goes out.</p></div><span class="value"><strong>Camera off</strong></span></li>
@@ -285,7 +285,7 @@
               <tr><th scope="row">Platforms</th><td class="us">Windows, macOS 14+ (Apple silicon; Intel from source), Linux</td><td>macOS 14+ (Apple silicon and Intel)</td></tr>
               <tr><th scope="row">Price</th><td class="us">Free, MIT licence</td><td>$14.99 one-time</td></tr>
               <tr><th scope="row">Source code</th><td class="us">Open</td><td>Closed</td></tr>
-              <tr><th scope="row">Network use</th><td class="us">None</td><td>Licence key check and daily update check</td></tr>
+              <tr><th scope="row">Network use</th><td class="us">None by default</td><td>Licence key check and daily update check</td></tr>
               <tr><th scope="row">Tracking</th><td class="us">Head pose + iris landmarks</td><td>Head pose (+ eye position for panes)</td></tr>
               <tr><th scope="row">Split-pane focus in terminals and editors</th><td class="us"><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Experimental: Windows Terminal, tmux, WezTerm, Claude and ChatGPT/Codex desktop apps (code editors next)</span></td><td><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Yes</span></td></tr>
               <tr><th scope="row">Learns from your mouse use</th><td class="us"><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Yes</span></td><td><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Yes (from clicks)</span></td></tr>

@@ -59,6 +59,11 @@ reports:
 ``syntax-error``
     A file that cannot be parsed, and therefore cannot be verified.
 
+The one reviewed exception is the opt-in update check: ``update/winhttp.py`` may
+load ``winhttp.dll`` through ctypes (``native-network`` only; see
+:data:`SOURCE_ALLOWLIST`). Every other rule still applies to that file, and the
+rule applies to no other file. It is reported as a notice on every run.
+
 Frozen bundle (``--bundle DIR``)
 ================================
 
@@ -158,6 +163,34 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TARGET = REPO_ROOT / "src" / "eye_tracker"
+
+
+@dataclass(frozen=True)
+class SourceAllowRule:
+    """A source file that may break specific rules, and why.
+
+    ``path`` is relative to ``src/eye_tracker`` (POSIX separators) and must match
+    exactly. Only the listed ``rules`` are allowed there; every other rule is still
+    enforced for the file, and no other file gets the exception.
+    """
+
+    path: str
+    rules: frozenset[str]
+    reason: str
+
+
+#: The reviewed exceptions of the source check. Keep this list as short as it is:
+#: each entry is a place where the app talks to the network, which its privacy
+#: promise (README, docs/privacy.md) has to name.
+SOURCE_ALLOWLIST: tuple[SourceAllowRule, ...] = (
+    SourceAllowRule(
+        "update/winhttp.py",
+        frozenset({"native-network"}),
+        "the opt-in update check (off by default): one HTTPS GET a day to GitHub's release "
+        "address through Windows' own WinHTTP, with the host and the size of every request "
+        "checked by update/fetch.py; sends no identifier",
+    ),
+)
 
 #: Top-level modules that exist to talk to the network (or only wrap it).
 NETWORK_MODULES: frozenset[str] = frozenset(
@@ -619,6 +652,8 @@ class ScanResult:
 
     files: list[Path] = field(default_factory=list)
     violations: list[Violation] = field(default_factory=list)
+    #: Findings that a :data:`SOURCE_ALLOWLIST` entry allows (always reported).
+    notices: list[tuple[Violation, SourceAllowRule]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -1091,12 +1126,27 @@ def iter_python_files(paths: Iterable[Path]) -> Iterator[Path]:
                     yield Path(dirpath) / filename
 
 
+def _source_allowance(path: Path) -> SourceAllowRule | None:
+    """The :data:`SOURCE_ALLOWLIST` entry for exactly this file of the app, if any."""
+    try:
+        relative = path.resolve().relative_to(DEFAULT_TARGET.resolve()).as_posix()
+    except ValueError:
+        return None
+    return next((rule for rule in SOURCE_ALLOWLIST if rule.path == relative), None)
+
+
 def scan_paths(paths: Iterable[Path]) -> ScanResult:
-    """Scan every Python file under ``paths``."""
+    """Scan every Python file under ``paths``; findings the allowlist covers are
+    kept apart as notices."""
     result = ScanResult()
     for path in iter_python_files(paths):
         result.files.append(path)
-        result.violations.extend(scan_file(path))
+        allowance = _source_allowance(path)
+        for violation in scan_file(path):
+            if allowance is not None and violation.rule in allowance.rules:
+                result.notices.append((violation, allowance))
+            else:
+                result.violations.append(violation)
     return result
 
 
@@ -2120,6 +2170,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     result = scan_paths(targets)
+    allowed: dict[str, list[Violation]] = {}
+    for violation, rule in result.notices:
+        allowed.setdefault(rule.path, []).append(violation)
+    for rule in SOURCE_ALLOWLIST:
+        found = allowed.get(rule.path, [])
+        if found:
+            kinds = ", ".join(sorted({v.rule for v in found}))
+            line = f"allowed: {rule.path}: {len(found)} {kinds} finding(s): {rule.reason}"
+            print(f"::notice title=Privacy check (source)::{_escape(line)}" if annotate else line)
     for violation in result.violations:
         print(_github_annotation(violation) if annotate else violation)
 

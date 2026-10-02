@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Eye Tracker: bir monitöre bakın, imleç peşinizden gelsin</title>
-  <meta name="description" content="Herhangi bir webcam ile fare imlecini ve klavye odağını baktığınız monitöre taşıyan ücretsiz, açık kaynak uygulama. Tamamen çevrimdışı; Windows, macOS ve Linux için.">
+  <meta name="description" content="Herhangi bir webcam ile fare imlecini ve klavye odağını baktığınız monitöre taşıyan ücretsiz, açık kaynak uygulama. Varsayılan olarak çevrimdışı; Windows, macOS ve Linux için.">
   <link rel="canonical" href="{{SITE_URL}}tr/">
   <link rel="alternate" hreflang="en" href="{{SITE_URL}}">
   <link rel="alternate" hreflang="tr" href="{{SITE_URL}}tr/">
@@ -16,7 +16,7 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="Eye Tracker">
   <meta property="og:title" content="Eye Tracker: bir monitöre bakın, imleç peşinizden gelsin">
-  <meta property="og:description" content="Çok monitörlü kurulumlar için ücretsiz, açık kaynak bakarak geçiş. Herhangi bir webcam, tamamen çevrimdışı; Windows, macOS ve Linux.">
+  <meta property="og:description" content="Çok monitörlü kurulumlar için ücretsiz, açık kaynak bakarak geçiş. Herhangi bir webcam, varsayılan olarak çevrimdışı; Windows, macOS ve Linux.">
   <meta property="og:url" content="{{SITE_URL}}tr/">
   <meta property="og:image" content="{{SITE_URL}}assets/og.png">
   <meta property="og:image:width" content="1920">
@@ -34,7 +34,7 @@
     "applicationCategory": "UtilitiesApplication",
     "operatingSystem": "Windows 10, Windows 11, macOS 14+, Linux",
     "softwareVersion": "{{VERSION}}",
-    "description": "Herhangi bir webcam ile fare imlecini ve klavye odağını baktığınız monitöre taşır. Tamamen çevrimdışı.",
+    "description": "Herhangi bir webcam ile fare imlecini ve klavye odağını baktığınız monitöre taşır. Varsayılan olarak çevrimdışı.",
     "url": "{{SITE_URL}}tr/",
     "downloadUrl": "{{RELEASE_URL}}",
     "inLanguage": "tr",
@@ -122,7 +122,7 @@
               <svg aria-hidden="true"><use href="#i-github"/></svg>GitHub'da yıldız verin
             </a>
           </div>
-          <p class="hero-meta">Sürüm {{VERSION}} · Ücretsiz ve açık kaynak, <a href="https://github.com/bugraskl/eye-tracker/blob/main/LICENSE">MIT lisansı</a> · Windows 10/11, macOS 14+, Linux · Tamamen çevrimdışı çalışır</p>
+          <p class="hero-meta">Sürüm {{VERSION}} · Ücretsiz ve açık kaynak, <a href="https://github.com/bugraskl/eye-tracker/blob/main/LICENSE">MIT lisansı</a> · Windows 10/11, macOS 14+, Linux · Varsayılan olarak çevrimdışı</p>
         </div>
 
         <figure class="arrange" data-arrange
@@ -174,7 +174,7 @@
           <div class="prop"><dt>CPU, tüm makine</dt><dd><strong>%0,55</strong>tek çekirdeğin %8,8'i</dd></div>
           <div class="prop"><dt>Bellek</dt><dd><strong>~200 MB</strong>kullanımda</dd></div>
           <div class="prop"><dt>Kare başına analiz</dt><dd><strong>11 ms</strong>yüz, irisler, baş pozu</dd></div>
-          <div class="prop"><dt>Ağ bağlantısı</dt><dd><strong>0</strong>CI'da zorunlu</dd></div>
+          <div class="prop"><dt>Ağ bağlantısı</dt><dd><strong>0</strong>güncelleme kontrolünü açmadıkça</dd></div>
           <div class="prop"><dt>Yüz noktası</dt><dd><strong>478</strong>iki iris dahil</dd></div>
           <div class="prop"><dt>Kalibrasyon</dt><dd><strong>~15 sn</strong>monitör başına</dd></div>
         </dl>
@@ -264,7 +264,7 @@
           </div>
         </div>
         <ul class="rows joined">
-          <li class="row"><svg aria-hidden="true"><use href="#i-shield"/></svg><div><strong>Ağ erişimi</strong><p>Telemetri, güncelleme kontrolü ve hesap yok. Kaynak kodda ve paketlenen her kütüphanede ağ kodu bulunursa CI başarısız olur.</p></div><span class="value"><strong>Yok</strong></span></li>
+          <li class="row"><svg aria-hidden="true"><use href="#i-shield"/></svg><div><strong>Ağ erişimi</strong><p>Telemetri ve hesap yok. Ağı kullanabilen tek şey, kendinizin açtığınız güncelleme kontrolüdür (varsayılan olarak kapalı). Kaynak kodda ve paketlenen her kütüphanede başka bir ağ kodu bulunursa CI başarısız olur.</p></div><span class="value"><strong>Varsayılan olarak yok</strong></span></li>
           <li class="row"><svg aria-hidden="true"><use href="#i-camera"/></svg><div><strong>Kamera kareleri</strong><p>Birkaç milisaniye bellekte analiz edilir ve asla diske yazılmaz.</p></div><span class="value"><strong>Saklanmaz</strong></span></li>
           <li class="row"><svg aria-hidden="true"><use href="#i-book"/></svg><div><strong>Kalibrasyon dosyası</strong><p>Baş açıları, iris oranları ve ekran noktaları; okuyabileceğiniz düz JSON. Görüntü yok.</p></div><span class="value"><strong>Sadece sayılar</strong></span></li>
           <li class="row"><svg aria-hidden="true"><use href="#i-eye-off"/></svg><div><strong>Gizlilik modu, duraklatma, kilitli ekran</strong><p>Kamera aygıtı bırakılır, webcam ışığı söner.</p></div><span class="value"><strong>Kamera kapalı</strong></span></li>
@@ -286,7 +286,7 @@
               <tr><th scope="row">Platformlar</th><td class="us">Windows, macOS 14+ (Apple silicon; Intel kaynaktan), Linux</td><td>macOS 14+ (Apple silicon ve Intel)</td></tr>
               <tr><th scope="row">Fiyat</th><td class="us">Ücretsiz, MIT lisansı</td><td>14,99 $ tek seferlik</td></tr>
               <tr><th scope="row">Kaynak kod</th><td class="us">Açık</td><td>Kapalı</td></tr>
-              <tr><th scope="row">Ağ kullanımı</th><td class="us">Yok</td><td>Lisans anahtarı ve günlük güncelleme kontrolü</td></tr>
+              <tr><th scope="row">Ağ kullanımı</th><td class="us">Varsayılan olarak yok</td><td>Lisans anahtarı ve günlük güncelleme kontrolü</td></tr>
               <tr><th scope="row">İzleme</th><td class="us">Baş pozu + iris noktaları</td><td>Baş pozu (+ paneller için göz konumu)</td></tr>
               <tr><th scope="row">Terminal ve editörlerde bölünmüş panel odağı</th><td class="us"><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Deneysel: Windows Terminal, tmux, WezTerm, Claude ve ChatGPT/Codex masaüstü uygulamaları (kod editörleri sırada)</span></td><td><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Var</span></td></tr>
               <tr><th scope="row">Fare kullanımından öğrenme</th><td class="us"><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Var</span></td><td><span class="mark yes"><svg aria-hidden="true"><use href="#i-yes"/></svg>Var (tıklamalardan)</span></td></tr>

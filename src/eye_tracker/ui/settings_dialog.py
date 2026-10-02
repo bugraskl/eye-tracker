@@ -71,6 +71,7 @@ from ..platform import autostart
 from ..platform.base import PlatformServices
 from ..platform.hotkeys import Hotkey, HotkeyManager, format_hotkey, parse_hotkey
 from ..types import TrackingState
+from ..update.fetch import supported as update_supported
 from . import util
 from .icons import app_icon
 from .util import ACCENT, DANGER, WARNING, ui_scale
@@ -1191,6 +1192,17 @@ class SettingsDialog(QDialog):
         form = self._group(layout, "Interface")
         self._check(form, "general.notifications", "Show notifications")
         self._check(form, "ui.show_gaze_overlay", "Show a dot where I am looking (testing aid)")
+
+        if update_supported():
+            form = self._group(layout, "Updates")
+            self._check(form, "updates.check", "Look for a new version once a day")
+            form.addRow(
+                self._hint(
+                    "Off by default: then the app never uses the network. It only tells you "
+                    "when there is a new version and installs it when you agree. "
+                    "“Check for updates…” in the tray menu works either way."
+                )
+            )
 
         form = self._group(layout, "Calibration")
         row = QWidget()

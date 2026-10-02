@@ -141,8 +141,12 @@ def claude_tree(
     secondary: bool = True,
     messages: int = 3,
     sidebar_chats: int = 50,
+    empty_document_first: bool = False,
 ) -> ClaudeTree:
-    """The Claude window as measured (native views down to the web content)."""
+    """The Claude window as measured (native views down to the web content).
+
+    ``empty_document_first`` puts a second, nearly empty ``RootWebArea`` before the
+    one with the sessions, as newer builds of the app do."""
     primary, primary_composer = session(PRIMARY_CLASS, PRIMARY_RECT, PRIMARY_ID, messages=messages)
     extra, extra_composer = session(
         SECONDARY_CLASS, SECONDARY_RECT, SECONDARY_ID, messages=messages
@@ -164,12 +168,18 @@ def claude_tree(
     views = innermost
     for _ in range(3):
         views = Node(NATIVE, "View").add(views)
+    client_view = Node(NATIVE, "ClientView")
+    if empty_document_first:
+        empty = Node(DOCUMENT, aid="RootWebArea", rect=AREA, focusable=True)
+        empty.add(Node(GROUP, aid="root"))
+        client_view.add(Node(NATIVE, "View").add(empty))
+    client_view.add(views)
     window = Node(WINDOW_TYPE, "Chrome_WidgetWin_1", rect=AREA).add(
         Node(NATIVE, "RootView").add(
             Node(NATIVE, "NonClientView").add(
                 Node(NATIVE, "WinFrameView").add(
                     Node(NATIVE, "TitleBar").add(Node(BUTTON), Node(BUTTON), Node(BUTTON)),
-                    Node(NATIVE, "ClientView").add(views),
+                    client_view,
                 )
             )
         )
@@ -421,6 +431,23 @@ def test_class_tokens_are_whole_words() -> None:
 
 
 # ------------------------------------------------------------------- detect
+def test_finds_the_sessions_behind_an_empty_first_document() -> None:
+    client = FakeClient(claude_tree(empty_document_first=True))
+    snapshot = provider(client).detect(WINDOW, APP)
+    assert snapshot is not None
+    assert [p.rect for p in snapshot.panes] == [PRIMARY_RECT, SECONDARY_RECT]
+    assert client.all_closed
+
+
+def test_focuses_a_session_behind_an_empty_first_document() -> None:
+    client = FakeClient(claude_tree(empty_document_first=True))
+    p = provider(client)
+    snapshot = p.detect(WINDOW, APP)
+    assert snapshot is not None
+    assert p.focus(WINDOW, snapshot.panes[1])
+    assert client.focus_set == [client.tree.secondary_composer]
+
+
 def test_detects_the_two_sessions_and_the_focused_one() -> None:
     client = FakeClient()
     snapshot = provider(client).detect(WINDOW, APP)

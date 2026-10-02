@@ -6,9 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-02
+
 ### Fixed
 
 - The website now rebuilds with the new download links as soon as a release is published.
+- Split-pane focus in the Claude desktop app found no sessions in current builds of the app: its
+  window holds a second, nearly empty web document in front of the one with the sessions, and only
+  the first was searched. Every web document of the window is now tried until one has panes.
 
 ## [0.2.0] - 2026-10-01
 
@@ -92,6 +97,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - A privacy gate that fails CI on networking or frame-writing code and scans every bundled native
   library and Python module of the release builds.
 
-[Unreleased]: https://github.com/bugraskl/eye-tracker/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/bugraskl/eye-tracker/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/bugraskl/eye-tracker/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bugraskl/eye-tracker/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bugraskl/eye-tracker/releases/tag/v0.1.0

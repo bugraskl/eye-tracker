@@ -36,7 +36,9 @@ window in ~0.7 s, ~420 of the ChatGPT window in ~0.33 s.
 1. From the window element, depth first through the native views (any control
    type except ``Document``, at most :data:`NATIVE_DEPTH` levels) to the
    ``Document`` whose automation id is ``RootWebArea``: the web content. Other
-   documents are not entered.
+   documents are not entered. A window may hold more than one such document
+   (the Claude app does, the first one nearly empty): they are tried in tree
+   order until one has panes.
 2. From there through ``Group`` elements only, at most :data:`WEB_DEPTH` levels
    below the document. A group whose class has the profile's pane token is a
    pane: it is not entered. A group with a token starting with the profile's
@@ -271,22 +273,23 @@ def _children(
         child = view.previous_sibling(child) if backwards else view.next_sibling(child)
 
 
-def find_document(view: ElementView, root: Any, budget: _Budget) -> Any:
-    """The ``RootWebArea`` document below ``root`` (``None`` if not reached)."""
+def find_documents(view: ElementView, root: Any, budget: _Budget) -> Iterator[Any]:
+    """The ``RootWebArea`` documents below ``root``, in tree order, one at a time.
 
-    def visit(node: Any, depth: int) -> Any:
+    A window can hold several (the Claude app has an empty one in front of the
+    one with the sessions), so the caller walks on only while it has found no panes.
+    """
+
+    def visit(node: Any, depth: int) -> Iterator[Any]:
         for child in _children(view, node, budget):
             if view.control_type(child) == UIA_DOCUMENT_CONTROL_TYPE_ID:
                 if view.automation_id(child) == ROOT_WEB_AREA:
-                    return child
+                    yield child
                 continue  # another document's web content is not ours to walk
             if depth < NATIVE_DEPTH:
-                found = visit(child, depth + 1)
-                if found is not None:
-                    return found
-        return None
+                yield from visit(child, depth + 1)
 
-    return visit(root, 1)
+    yield from visit(root, 1)
 
 
 def find_panes(view: ElementView, document: Any, profile: AppProfile, budget: _Budget) -> list[Any]:
@@ -457,11 +460,16 @@ class ChromiumAppProvider:
         if root is None:
             return []
         budget = _Budget(NODE_BUDGET)
-        document = find_document(view, root, budget)
-        if document is None:
+        nodes: list[Any] = []
+        saw_document = False
+        for document in find_documents(view, root, budget):
+            saw_document = True
+            nodes = find_panes(view, document, profile, budget)
+            if nodes:
+                break
+        if not saw_document:
             log.debug("No web content in the %s window (yet)", profile.name)
             return []
-        nodes = find_panes(view, document, profile, budget)
         if budget.exhausted:
             log.debug("Walk of the %s window stopped after %d elements", profile.name, NODE_BUDGET)
         bounds = self._client_rect(ref) or ref.rect
